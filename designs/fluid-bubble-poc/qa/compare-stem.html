@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stem Geometry QA Comparison</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 20px;
+        color: #fff;
+        background: #25211f;
+        font: 14px system-ui, sans-serif;
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(280px, 0.72fr) minmax(600px, 1.28fr);
+        gap: 20px;
+        align-items: start;
+      }
+      figure { margin: 0; }
+      figcaption { margin-bottom: 8px; font-weight: 650; }
+      img {
+        display: block;
+        width: 100%;
+        max-height: calc(100vh - 70px);
+        object-fit: contain;
+        object-position: top center;
+        background: #fbf8f3;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <figure>
+        <figcaption>Reference — tangential, filleted stem</figcaption>
+        <img
+          src="/@fs//Users/max_rubin/code/oai/projects/thoughtform/designs/stem-.png"
+          alt="Stem connector reference"
+        />
+      </figure>
+      <figure>
+        <figcaption>Implementation — revised bubble webs</figcaption>
+        <img src="./final-stem-geometry.png" alt="Revised fluid bubble connector geometry" />
+      </figure>
+    </main>
+  </body>
+</html>
