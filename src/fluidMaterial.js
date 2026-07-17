@@ -1,0 +1,490 @@
+// Adapted from sites/fluid-bubble-lab/app/BubblePrototype.jsx.
+// The lab remains the source of truth for the fused material geometry.
+
+const MIN_CROWDED_HALF_ANGLE = 8 * (Math.PI / 180);
+const CREATE_DURATION = 460;
+const WOBBLE_DURATION = 640;
+
+export const DEFAULT_MATERIAL_SETTINGS = {
+  viscosity: 0.8,
+  elasticity: 0.05,
+  repulsion: 0.95,
+  minimumDistance: 0.8,
+  maximumDistance: 1.2,
+  damping: 0.6,
+  bridgeWidth: 0.38,
+  flare: 0.23,
+  filletReach: 0.16,
+  slenderSpan: 1,
+  flareEnabled: true,
+  filletReachEnabled: true,
+  slenderSpanEnabled: false,
+};
+
+export function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function smoothstep(value) {
+  const t = clamp(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function lerp(start, end, amount) {
+  return start + (end - start) * clamp(amount, 0, 1);
+}
+
+function easeOutBack(value) {
+  const t = clamp(value, 0, 1);
+  const overshoot = 1.78;
+  return 1 + (overshoot + 1) * ((t - 1) ** 3) + overshoot * ((t - 1) ** 2);
+}
+
+function linkEnds(link) {
+  return { a: link.a ?? link.from, b: link.b ?? link.to };
+}
+
+function segmentsIntersect(a, b, c, d) {
+  const cross = (p, q, r) => (
+    (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)
+  );
+  const abC = cross(a, b, c);
+  const abD = cross(a, b, d);
+  const cdA = cross(c, d, a);
+  const cdB = cross(c, d, b);
+  return abC * abD < 0 && cdA * cdB < 0;
+}
+
+function distanceToSegment(point, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (!lengthSquared) {
+    return { distance: Math.hypot(point.x - a.x, point.y - a.y), t: 0 };
+  }
+  const t = clamp(((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared, 0, 1);
+  const x = a.x + dx * t;
+  const y = a.y + dy * t;
+  return { distance: Math.hypot(point.x - x, point.y - y), t };
+}
+
+function segmentClearance(a, b, c, d) {
+  if (segmentsIntersect(a, b, c, d)) return 0;
+  return Math.min(
+    distanceToSegment(a, c, d).distance,
+    distanceToSegment(b, c, d).distance,
+    distanceToSegment(c, a, b).distance,
+    distanceToSegment(d, a, b).distance,
+  );
+}
+
+function angleSeparation(a, b) {
+  return Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+}
+
+function nearestIncidentAngle(node, other, links, nodes) {
+  const targetAngle = Math.atan2(other.y - node.y, other.x - node.x);
+  let nearest = Math.PI;
+
+  links.forEach((link) => {
+    const { a, b } = linkEnds(link);
+    const neighborId = a === node.id ? b : b === node.id ? a : null;
+    if (neighborId == null || neighborId === other.id) return;
+    const neighbor = nodes.find((candidate) => candidate.id === neighborId);
+    if (!neighbor) return;
+    const neighborAngle = Math.atan2(neighbor.y - node.y, neighbor.x - node.x);
+    nearest = Math.min(nearest, angleSeparation(targetAngle, neighborAngle));
+  });
+
+  return nearest;
+}
+
+function attachmentAngleLimits(a, b, links, nodes) {
+  return {
+    a: Math.max(MIN_CROWDED_HALF_ANGLE, nearestIncidentAngle(a, b, links, nodes) * 0.45),
+    b: Math.max(MIN_CROWDED_HALF_ANGLE, nearestIncidentAngle(b, a, links, nodes) * 0.45),
+  };
+}
+
+function distanceAttenuation(normalizedGap) {
+  return 1 / (1 + Math.max(0, normalizedGap) * 0.9);
+}
+
+function enabledSettings(settings) {
+  return {
+    ...settings,
+    flare: settings.flareEnabled === false ? -0.5 : settings.flare,
+    filletReach: settings.filletReachEnabled === false ? -0.5 : settings.filletReach,
+    slenderSpan: settings.slenderSpanEnabled === false ? 0 : settings.slenderSpan,
+  };
+}
+
+function bridgeMetrics(a, b, settings, angleLimits) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance < 0.001) return null;
+
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const px = -uy;
+  const py = ux;
+  const gap = Math.max(0, distance - a.radius - b.radius);
+  const normalizedGap = gap / Math.max(a.radius + b.radius, 1);
+  const flare = clamp(settings.flare, -0.5, 1);
+  const desiredHalfAngleDegrees = flare < 0
+    ? lerp(6, 18, (flare + 0.5) / 0.5)
+    : lerp(18, 46, flare);
+  const desiredHalfAngle = desiredHalfAngleDegrees * (Math.PI / 180);
+  const halfAngleA = Math.min(desiredHalfAngle, angleLimits?.a ?? desiredHalfAngle);
+  const halfAngleB = Math.min(desiredHalfAngle, angleLimits?.b ?? desiredHalfAngle);
+  const endpointHalfWidthA = clamp(a.radius * Math.sin(halfAngleA), 3, a.radius * 0.8);
+  const endpointHalfWidthB = clamp(b.radius * Math.sin(halfAngleB), 3, b.radius * 0.8);
+  const smallestEndpoint = Math.min(endpointHalfWidthA, endpointHalfWidthB);
+  const waistScale = lerp(0.15, 0.42, settings.bridgeWidth);
+  const minimumWaist = Math.min(3, smallestEndpoint * 0.45);
+  const waistHalfWidth = clamp(
+    smallestEndpoint * waistScale * distanceAttenuation(normalizedGap),
+    minimumWaist,
+    smallestEndpoint * 0.52,
+  );
+  const edgeA = Math.sqrt(Math.max(a.radius ** 2 - endpointHalfWidthA ** 2, 0));
+  const edgeB = Math.sqrt(Math.max(b.radius ** 2 - endpointHalfWidthB ** 2, 0));
+  const start = { x: a.x + ux * edgeA, y: a.y + uy * edgeA };
+  const end = { x: b.x - ux * edgeB, y: b.y - uy * edgeB };
+  const bridgeLength = (end.x - start.x) * ux + (end.y - start.y) * uy;
+  if (bridgeLength <= 0.5) return null;
+  const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+  const halfSlenderSpan = settings.slenderSpanEnabled === false
+    ? 0
+    : bridgeLength * (0.025 + clamp(settings.slenderSpan, 0, 1) * 0.24);
+
+  return {
+    distance,
+    ux,
+    uy,
+    px,
+    py,
+    start,
+    end,
+    leftWaist: {
+      x: midpoint.x - ux * halfSlenderSpan,
+      y: midpoint.y - uy * halfSlenderSpan,
+    },
+    rightWaist: {
+      x: midpoint.x + ux * halfSlenderSpan,
+      y: midpoint.y + uy * halfSlenderSpan,
+    },
+    edgeA,
+    edgeB,
+    endpointHalfWidthA,
+    endpointHalfWidthB,
+    waistHalfWidth,
+  };
+}
+
+function traceFluidBridge(path, a, b, settings, angleLimits) {
+  const metrics = bridgeMetrics(a, b, settings, angleLimits);
+  if (!metrics) return false;
+
+  const {
+    ux,
+    uy,
+    px,
+    py,
+    start,
+    end,
+    leftWaist,
+    rightWaist,
+    edgeA,
+    edgeB,
+    endpointHalfWidthA,
+    endpointHalfWidthB,
+    waistHalfWidth,
+  } = metrics;
+  const leftLength = Math.hypot(leftWaist.x - start.x, leftWaist.y - start.y);
+  const rightLength = Math.hypot(end.x - rightWaist.x, end.y - rightWaist.y);
+  const filletReach = clamp(settings.filletReach, -0.5, 1);
+  const negativeFilletProgress = (filletReach + 0.5) / 0.5;
+  const endpointTangentFactor = filletReach < 0
+    ? lerp(0.08, 0.34, negativeFilletProgress)
+    : 0.34 + filletReach * 1.08;
+  const sourceAcrossComponent = Math.max(edgeA / a.radius, 0.001);
+  const targetAcrossComponent = Math.max(edgeB / b.radius, 0.001);
+  const sourceTangentLength = Math.min(
+    leftLength * 0.82,
+    a.radius * endpointTangentFactor,
+    (endpointHalfWidthA / sourceAcrossComponent) * 0.88,
+  );
+  const targetTangentLength = Math.min(
+    rightLength * 0.82,
+    b.radius * endpointTangentFactor,
+    (endpointHalfWidthB / targetAcrossComponent) * 0.88,
+  );
+  const waistHandleFactor = filletReach < 0
+    ? lerp(0.04, 0.12, negativeFilletProgress)
+    : 0.12 + filletReach * 0.22;
+  const slenderLength = Math.hypot(
+    rightWaist.x - leftWaist.x,
+    rightWaist.y - leftWaist.y,
+  );
+  const slenderHandleLength = slenderLength / 3;
+  const tangent = (along, across) => ({
+    x: ux * along + px * across,
+    y: uy * along + py * across,
+  });
+  const aTopTangent = tangent(endpointHalfWidthA / a.radius, -edgeA / a.radius);
+  const aBottomTangent = tangent(endpointHalfWidthA / a.radius, edgeA / a.radius);
+  const bTopTangent = tangent(endpointHalfWidthB / b.radius, edgeB / b.radius);
+  const bBottomTangent = tangent(endpointHalfWidthB / b.radius, -edgeB / b.radius);
+  const aTop = { x: start.x + px * endpointHalfWidthA, y: start.y + py * endpointHalfWidthA };
+  const aBottom = { x: start.x - px * endpointHalfWidthA, y: start.y - py * endpointHalfWidthA };
+  const bTop = { x: end.x + px * endpointHalfWidthB, y: end.y + py * endpointHalfWidthB };
+  const bBottom = { x: end.x - px * endpointHalfWidthB, y: end.y - py * endpointHalfWidthB };
+  const leftWaistTop = { x: leftWaist.x + px * waistHalfWidth, y: leftWaist.y + py * waistHalfWidth };
+  const rightWaistTop = { x: rightWaist.x + px * waistHalfWidth, y: rightWaist.y + py * waistHalfWidth };
+  const leftWaistBottom = { x: leftWaist.x - px * waistHalfWidth, y: leftWaist.y - py * waistHalfWidth };
+  const rightWaistBottom = { x: rightWaist.x - px * waistHalfWidth, y: rightWaist.y - py * waistHalfWidth };
+
+  path.moveTo(aTop.x, aTop.y);
+  path.bezierCurveTo(
+    aTop.x + aTopTangent.x * sourceTangentLength,
+    aTop.y + aTopTangent.y * sourceTangentLength,
+    leftWaistTop.x - ux * leftLength * waistHandleFactor,
+    leftWaistTop.y - uy * leftLength * waistHandleFactor,
+    leftWaistTop.x,
+    leftWaistTop.y,
+  );
+  path.bezierCurveTo(
+    leftWaistTop.x + ux * slenderHandleLength,
+    leftWaistTop.y + uy * slenderHandleLength,
+    rightWaistTop.x - ux * slenderHandleLength,
+    rightWaistTop.y - uy * slenderHandleLength,
+    rightWaistTop.x,
+    rightWaistTop.y,
+  );
+  path.bezierCurveTo(
+    rightWaistTop.x + ux * rightLength * waistHandleFactor,
+    rightWaistTop.y + uy * rightLength * waistHandleFactor,
+    bTop.x - bTopTangent.x * targetTangentLength,
+    bTop.y - bTopTangent.y * targetTangentLength,
+    bTop.x,
+    bTop.y,
+  );
+  path.lineTo(bBottom.x, bBottom.y);
+  path.bezierCurveTo(
+    bBottom.x - bBottomTangent.x * targetTangentLength,
+    bBottom.y - bBottomTangent.y * targetTangentLength,
+    rightWaistBottom.x + ux * rightLength * waistHandleFactor,
+    rightWaistBottom.y + uy * rightLength * waistHandleFactor,
+    rightWaistBottom.x,
+    rightWaistBottom.y,
+  );
+  path.bezierCurveTo(
+    rightWaistBottom.x - ux * slenderHandleLength,
+    rightWaistBottom.y - uy * slenderHandleLength,
+    leftWaistBottom.x + ux * slenderHandleLength,
+    leftWaistBottom.y + uy * slenderHandleLength,
+    leftWaistBottom.x,
+    leftWaistBottom.y,
+  );
+  path.bezierCurveTo(
+    leftWaistBottom.x - ux * leftLength * waistHandleFactor,
+    leftWaistBottom.y - uy * leftLength * waistHandleFactor,
+    aBottom.x + aBottomTangent.x * sourceTangentLength,
+    aBottom.y + aBottomTangent.y * sourceTangentLength,
+    aBottom.x,
+    aBottom.y,
+  );
+  path.closePath();
+  return true;
+}
+
+function nodeVisualState(node, now, reducedMotion) {
+  if (reducedMotion) return { scale: 1, scaleX: 1, scaleY: 1, rotation: 0, offsetX: 0, offsetY: 0 };
+  let scale = 1;
+  let scaleX = 1;
+  let scaleY = 1;
+  let rotation = 0;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (node.createdAt != null) {
+    const createProgress = (now - node.createdAt) / CREATE_DURATION;
+    if (createProgress < 0) scale = 0;
+    else if (createProgress < 0.7) scale = Math.max(0, easeOutBack(createProgress / 0.7));
+    else if (createProgress < 1) {
+      const settleProgress = (createProgress - 0.7) / 0.3;
+      const settleWave = Math.sin(settleProgress * Math.PI * 2.25)
+        * 0.052
+        * ((1 - settleProgress) ** 1.8);
+      scaleX += settleWave;
+      scaleY -= settleWave * 0.56;
+    }
+  }
+
+  if (node.wobbleStart != null) {
+    const wobbleProgress = (now - node.wobbleStart) / WOBBLE_DURATION;
+    if (wobbleProgress < 1) {
+      const t = clamp(wobbleProgress, 0, 1);
+      const envelope = (1 - t) ** 2.45;
+      const amplitude = node.wobbleAmplitude ?? 0.1;
+      const impactCompression = -Math.exp(-10 * t) * amplitude * 0.48;
+      const wave = impactCompression + Math.sin(t * Math.PI * 4.4) * amplitude * envelope;
+      scaleX += wave;
+      scaleY -= wave * 0.52;
+      rotation = Math.atan2(node.wobbleForceY ?? 0, node.wobbleForceX ?? 1);
+      const shove = (
+        Math.exp(-8 * t) * 0.62
+        + Math.sin(t * Math.PI * 3.6) * envelope * 0.38
+      ) * node.r * amplitude * (node.wobbleTravel ?? 0.18);
+      offsetX += (node.wobbleForceX ?? 1) * shove;
+      offsetY += (node.wobbleForceY ?? 0) * shove;
+    }
+  }
+
+  return { scale: Math.max(0, scale), scaleX, scaleY, rotation, offsetX, offsetY };
+}
+
+export function buildFluidVisualNodes(nodes, now, reducedMotion = false) {
+  const visuals = new Map();
+  nodes.forEach((node) => {
+    const visual = nodeVisualState(node, now, reducedMotion);
+    const speed = Math.hypot(node.vx ?? 0, node.vy ?? 0);
+    const stretch = node.dragging
+      ? 0
+      : clamp(speed * 0.008 * DEFAULT_MATERIAL_SETTINGS.viscosity, 0, 0.14);
+    const movementAngle = speed > 0.08 ? Math.atan2(node.vy ?? 0, node.vx ?? 0) : 0;
+    const radiusX = Math.max(
+      0.01,
+      node.r * visual.scale * (1 + stretch) * visual.scaleX,
+    );
+    const radiusY = Math.max(
+      0.01,
+      node.r * visual.scale * (1 - stretch * 0.52) * visual.scaleY,
+    );
+    visuals.set(node.id, {
+      ...node,
+      x: node.x + visual.offsetX,
+      y: node.y + visual.offsetY,
+      radius: Math.max(0.01, Math.min(radiusX, radiusY) * 0.98),
+      radiusX,
+      radiusY,
+      rotation: visual.rotation || movementAngle,
+    });
+  });
+  return visuals;
+}
+
+export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
+  const settings = enabledSettings(options.settings ?? DEFAULT_MATERIAL_SETTINGS);
+  const nodes = [...visualNodes.values()];
+  const materialPaths = [];
+
+  links.forEach((link) => {
+    if (link.ghost) return;
+    const { a: aId, b: bId } = linkEnds(link);
+    const a = visualNodes.get(aId);
+    const b = visualNodes.get(bId);
+    if (!a || !b || a.ghost || b.ghost) return;
+    const path = new Path2D();
+    const angleLimits = attachmentAngleLimits(a, b, links, nodes);
+    if (traceFluidBridge(path, a, b, settings, angleLimits)) materialPaths.push(path);
+  });
+
+  nodes.forEach((node) => {
+    if (node.ghost) return;
+    const path = new Path2D();
+    path.ellipse(node.x, node.y, node.radiusX, node.radiusY, node.rotation, 0, Math.PI * 2);
+    materialPaths.push(path);
+  });
+
+  ctx.fillStyle = options.color ?? "#ed765d";
+  materialPaths.forEach((path) => ctx.fill(path));
+}
+
+export function withWobble(node, forceX = 1, forceY = 0, amplitude = 0.1) {
+  const length = Math.max(Math.hypot(forceX, forceY), 0.001);
+  return {
+    ...node,
+    wobbleStart: performance.now(),
+    wobbleAmplitude: amplitude,
+    wobbleForceX: forceX / length,
+    wobbleForceY: forceY / length,
+    wobbleTravel: 0.18,
+  };
+}
+
+export function findGrowthPlacement(parentNode, radius, nodeList, links, width, height) {
+  const parentById = new Map(links.map((link) => [link.to ?? link.b, link.from ?? link.a]));
+  const nodes = nodeList.map((node) => ({
+    ...node,
+    radius: node.r,
+    parentId: node.parentId ?? parentById.get(node.id),
+  }));
+  const parent = { ...parentNode, radius: parentNode.r };
+  const angles = [0, -0.18, 0.48, -0.9, 0.78, -1.22, 1.15, -Math.PI / 2, Math.PI / 2, Math.PI];
+  const distances = [
+    parent.radius + radius + 54,
+    parent.radius + radius + 92,
+    parent.radius + radius + 132,
+  ];
+  let best = null;
+
+  distances.forEach((distance, ringIndex) => {
+    angles.forEach((angle, angleIndex) => {
+      const rawX = parent.x + Math.cos(angle) * distance;
+      const rawY = parent.y + Math.sin(angle) * distance;
+      const x = clamp(rawX, radius + 12, width - radius - 12);
+      const y = clamp(rawY, radius + 12, height - radius - 54);
+      let score = ringIndex * 24 + angleIndex * 2.5 + Math.abs(angle) ** 1.35 * 18;
+      score += Math.abs(rawX - x) * 90 + Math.abs(rawY - y) * 90;
+      if (x < parent.x + parent.radius * 0.45) score += (parent.x - x + 72) * 180;
+
+      nodes.forEach((node) => {
+        const clearance = radius + node.radius + 24;
+        const distanceToNode = Math.hypot(x - node.x, y - node.y);
+        if (distanceToNode < clearance) score += (clearance - distanceToNode) ** 2 * 42;
+        if (node.id !== parent.id) {
+          const webClearance = node.radius + Math.min(parent.radius, radius) * 0.12 + 18;
+          const nearest = distanceToSegment(node, parent, { x, y });
+          if (nearest.t > 0.12 && nearest.t < 0.9 && nearest.distance < webClearance) {
+            score += (webClearance - nearest.distance) ** 2 * 36;
+          }
+        }
+      });
+
+      nodes.forEach((node) => {
+        if (node.parentId !== parent.id || node.id === parent.id) return;
+        const siblingAngle = Math.atan2(node.y - parent.y, node.x - parent.x);
+        const separation = angleSeparation(angle, siblingAngle);
+        if (separation < 0.44) score += 180 + (0.44 - separation) ** 2 * 4200;
+        if (angle * siblingAngle < 0 && Math.abs(angle + siblingAngle) < 0.18) score += 70;
+      });
+
+      links.forEach((link) => {
+        const { a: aId, b: bId } = linkEnds(link);
+        const a = nodes.find((node) => node.id === aId);
+        const b = nodes.find((node) => node.id === bId);
+        if (!a || !b || a.id === parent.id || b.id === parent.id) return;
+        const nearest = distanceToSegment({ x, y }, a, b);
+        const clearance = radius + 22;
+        if (nearest.t > 0.08 && nearest.t < 0.92 && nearest.distance < clearance) {
+          score += (clearance - nearest.distance) ** 2 * 28;
+        }
+        const proposedClearance = segmentClearance(parent, { x, y }, a, b);
+        const desiredWebClearance = Math.min(parent.radius, radius) * 0.18 + 10;
+        if (proposedClearance < desiredWebClearance) {
+          score += (desiredWebClearance - proposedClearance) ** 2 * 34;
+        }
+      });
+
+      if (!best || score < best.score) best = { x, y, score };
+    });
+  });
+
+  return best ?? {
+    x: clamp(parent.x + parent.radius + radius + 54, radius + 12, width - radius - 12),
+    y: clamp(parent.y, radius + 12, height - radius - 54),
+  };
+}
