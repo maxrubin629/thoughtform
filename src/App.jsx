@@ -31,10 +31,14 @@ import {
 } from "@tabler/icons-react";
 import paperTextureUrl from "./assets/paper-texture.png";
 import {
+  CONNECTION_CREATE_DURATION,
+  CONNECTION_POP_DURATION,
   DEFAULT_MATERIAL_SETTINGS,
   buildFluidVisualNodes,
   clamp,
+  drawFluidConnectionPop,
   drawFluidMaterial,
+  findFluidConnectionHit,
   findGrowthPlacement,
   withWobble,
 } from "./fluidMaterial.js";
@@ -53,6 +57,9 @@ import {
 } from "./mapData.js";
 
 const initialFluidEdges = captureFluidRestLengths(initialNodes, initialEdges, { reset: true });
+const MIN_ZOOM = 0.72;
+const MAX_ZOOM = 1.36;
+const ZOOM_STEP = 0.08;
 
 const paperMaterialSettings = {
   ...DEFAULT_MATERIAL_SETTINGS,
@@ -63,13 +70,15 @@ const paperMaterialSettings = {
 
 const palettes = {
   paper: {
-    material: "#ff735b",
+    material: "#f78269",
+    materialByDepth: ["#f5795c", "#f8846b", "#f9937d", "#f9a08c", "#f5aa98"],
     ink: "#251d1a",
     ghost: "#dc6d58",
     ghostFill: "rgba(245, 132, 109, 0.08)",
   },
   nocturne: {
     material: "#cc5d4b",
+    materialByDepth: ["#d85e4c", "#d96552", "#dc6d59", "#df7560", "#e27d68"],
     ink: "#fff1df",
     ghost: "#e47b62",
     ghostFill: "rgba(228, 123, 98, 0.08)",
@@ -101,7 +110,7 @@ function nodeLabel(node) {
   return node?.lines?.join(" ") ?? "Thought";
 }
 
-function wrapThought(value, maxLength = 20) {
+function wrapThought(value, maxLength = 18) {
   const words = value.trim().split(/\s+/).filter(Boolean);
   if (!words.length) return ["New thought"];
   const lines = [];
@@ -116,7 +125,19 @@ function wrapThought(value, maxLength = 20) {
     }
   });
   if (current) lines.push(current);
-  return lines.slice(0, 4);
+  return lines;
+}
+
+function radiusForThought(lines, fallbackRadius, ghost = false) {
+  const longestLine = Math.max(...lines.map((line) => line.length), 1);
+  const characterCount = lines.reduce((sum, line) => sum + line.length, 0);
+  const contentRadius = Math.max(
+    ghost ? 52 : 36,
+    longestLine * 3.55,
+    Math.sqrt(characterCount) * 10.5,
+    22 + lines.length * 8,
+  );
+  return clamp(Math.max(fallbackRadius, contentRadius), ghost ? 52 : 36, ghost ? 78 : 82);
 }
 
 function formatTimer(seconds) {
@@ -137,7 +158,9 @@ function getFocusIds(focusId, edges) {
     });
   }
   let cursor = focusId;
-  while (cursor) {
+  const visitedAncestors = new Set();
+  while (cursor && !visitedAncestors.has(cursor)) {
+    visitedAncestors.add(cursor);
     const incoming = edges.find((edge) => edge.to === cursor);
     cursor = incoming?.from;
     if (cursor) included.add(cursor);
@@ -145,7 +168,7 @@ function getFocusIds(focusId, edges) {
   return included;
 }
 
-function layoutHierarchy(nodes) {
+function layoutHierarchy(nodes, edges) {
   const committed = nodes.filter((node) => !node.ghost);
   const byDepth = new Map();
   committed.forEach((node) => {
@@ -154,8 +177,8 @@ function layoutHierarchy(nodes) {
   });
   const positions = new Map();
   byDepth.forEach((items, depth) => {
-    const top = depth === 0 ? 300 : 105;
-    const bottom = depth === 0 ? 760 : 905;
+    const top = depth === 0 ? 300 : 175;
+    const bottom = depth === 0 ? 720 : 805;
     const step = items.length <= 1 ? 0 : (bottom - top) / (items.length - 1);
     items.forEach((node, index) => {
       positions.set(node.id, {
@@ -166,9 +189,20 @@ function layoutHierarchy(nodes) {
   });
   return nodes.map((node) => {
     if (!node.ghost) return { ...node, ...(positions.get(node.id) ?? {}) };
-    const incoming = initialEdges.find((edge) => edge.to === node.id);
+    const incoming = edges.find((edge) => edge.to === node.id);
     const parent = positions.get(incoming?.from);
-    return parent ? { ...node, x: parent.x + 150, y: parent.y - 80 } : node;
+    const parentNode = nodes.find((candidate) => candidate.id === incoming?.from);
+    if (!parent || !parentNode) return node;
+    const siblings = nodes.filter((candidate) => (
+      candidate.ghost && edges.some((edge) => edge.from === parentNode.id && edge.to === candidate.id)
+    ));
+    const siblingIndex = Math.max(siblings.findIndex((candidate) => candidate.id === node.id), 0);
+    const siblingOffset = (siblingIndex - (siblings.length - 1) / 2) * (node.r * 1.7 + 22);
+    return {
+      ...node,
+      x: clamp(parent.x + parentNode.r + node.r + 48, node.r + 20, BASE_WIDTH - node.r - 20),
+      y: clamp(parent.y + siblingOffset, 175 + node.r, 805 - node.r),
+    };
   });
 }
 
@@ -269,7 +303,9 @@ function drawGhostTether(ctx, from, to, bend, color) {
 
 function drawWrappedText(ctx, node, x, y, palette, showProvenance) {
   const root = node.r > 100;
-  const size = root ? 22 : node.r > 58 ? 15.5 : node.r > 43 ? 11.5 : 10.2;
+  const baseSize = root ? 22 : node.r > 72 ? 13.5 : node.r > 58 ? 12.5 : node.r > 43 ? 11.5 : 10.2;
+  const verticalFit = (node.r * 1.48) / Math.max(node.lines.length * 1.22, 1);
+  const size = root ? baseSize : clamp(Math.min(baseSize, verticalFit), 9.2, baseSize);
   const weight = root ? 400 : 500;
   ctx.fillStyle = node.ghost ? palette.ghost : palette.ink;
   ctx.font = `${weight} ${size}px Manrope, sans-serif`;
@@ -379,6 +415,7 @@ function MindMap({
   onDelete,
   onAcceptGhost,
   onDismissGhost,
+  onRemoveConnection,
   connectFromId,
   zoom,
   setZoom,
@@ -394,7 +431,8 @@ function MindMap({
   const textureRef = useRef(null);
   const dragRef = useRef(null);
   const activePointersRef = useRef(new Map());
-  const panRef = useRef(pan);
+  const interactionRef = useRef(null);
+  const poppingConnectionsRef = useRef([]);
   const [viewport, setViewport] = useState({ width: BASE_WIDTH, height: BASE_HEIGHT });
   const [fontReady, setFontReady] = useState(false);
   const [textureReady, setTextureReady] = useState(false);
@@ -409,10 +447,6 @@ function MindMap({
     () => edges.filter((edge) => renderedIds.has(edge.from) && renderedIds.has(edge.to)),
     [edges, renderedIds],
   );
-
-  useEffect(() => {
-    panRef.current = pan;
-  }, [pan]);
 
   useEffect(() => {
     const shell = shellRef.current;
@@ -448,6 +482,51 @@ function MindMap({
   }, [pan, viewport, zoom]);
 
   useEffect(() => {
+    interactionRef.current = { pan, transform, viewport, zoom };
+  }, [pan, transform, viewport, zoom]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const handleNativeWheel = (event) => {
+      event.preventDefault();
+      const current = interactionRef.current;
+      if (!current) return;
+      if (event.ctrlKey) {
+        const rect = canvas.getBoundingClientRect();
+        const screenX = event.clientX - rect.left;
+        const screenY = event.clientY - rect.top;
+        const worldX = (screenX - current.transform.offsetX) / current.transform.scale;
+        const worldY = (screenY - current.transform.offsetY) / current.transform.scale;
+        const nextZoom = clamp(
+          current.zoom + (event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP),
+          MIN_ZOOM,
+          MAX_ZOOM,
+        );
+        const fit = Math.min(current.viewport.width / BASE_WIDTH, current.viewport.height / BASE_HEIGHT);
+        const nextScale = fit * nextZoom;
+        const centeredX = (current.viewport.width - BASE_WIDTH * nextScale) / 2;
+        const centeredY = (current.viewport.height - BASE_HEIGHT * nextScale) / 2;
+        setPan({
+          x: screenX - centeredX - worldX * nextScale,
+          y: screenY - centeredY - worldY * nextScale,
+        });
+        setZoom(nextZoom);
+        return;
+      }
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? current.viewport.height : 1;
+      const deltaX = event.shiftKey && event.deltaX === 0 ? event.deltaY : event.deltaX;
+      const deltaY = event.shiftKey && event.deltaX === 0 ? 0 : event.deltaY;
+      setPan((value) => ({
+        x: value.x - deltaX * unit,
+        y: value.y - deltaY * unit,
+      }));
+    };
+    canvas.addEventListener("wheel", handleNativeWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", handleNativeWheel);
+  }, [setPan, setZoom]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -472,8 +551,25 @@ function MindMap({
         if (from && to) drawGhostTether(ctx, from, to, edge.bend ?? 0, palette.ghost);
       });
 
+      if (concept === "nocturne") {
+        const root = visualNodes.get("root");
+        if (root) {
+          const halo = ctx.createRadialGradient(root.x, root.y, root.r * 0.72, root.x, root.y, root.r * 1.48);
+          halo.addColorStop(0, "rgba(255, 112, 82, 0.22)");
+          halo.addColorStop(0.58, "rgba(255, 94, 68, 0.09)");
+          halo.addColorStop(1, "rgba(255, 78, 55, 0)");
+          ctx.fillStyle = halo;
+          ctx.beginPath();
+          ctx.arc(root.x, root.y, root.r * 1.48, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
       drawFluidMaterial(ctx, visualNodes, renderedEdges, {
         color: palette.material,
+        colorForNode: (node) => palette.materialByDepth[clamp(node.depth ?? 0, 0, palette.materialByDepth.length - 1)],
+        now,
+        reducedMotion,
         settings: paperMaterialSettings,
       });
 
@@ -488,6 +584,18 @@ function MindMap({
           ctx.restore();
         }
       }
+
+      poppingConnectionsRef.current = poppingConnectionsRef.current.filter((pop) => {
+        const progress = clamp((now - pop.start) / pop.duration, 0, 1);
+        if (progress >= 1) return false;
+        const a = visualNodes.get(pop.aId) ?? pop.a;
+        const b = visualNodes.get(pop.bId) ?? pop.b;
+        const fill = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+        fill.addColorStop(0, palette.materialByDepth[clamp(a.depth ?? 0, 0, palette.materialByDepth.length - 1)]);
+        fill.addColorStop(1, palette.materialByDepth[clamp(b.depth ?? 0, 0, palette.materialByDepth.length - 1)]);
+        drawFluidConnectionPop(ctx, a, b, paperMaterialSettings, pop, progress, fill);
+        return true;
+      });
 
       renderedNodes.filter((node) => node.ghost).forEach((node) => {
         drawWobblyCircle(ctx, node);
@@ -520,7 +628,9 @@ function MindMap({
       const animatingMaterial = !reducedMotion && renderedNodes.some((node) => (
         (node.createdAt != null && now - node.createdAt < 900)
         || (node.wobbleStart != null && now - node.wobbleStart < 760)
-      ));
+      )) || (!reducedMotion && renderedEdges.some((edge) => (
+        edge.createdAt != null && now - edge.createdAt < CONNECTION_CREATE_DURATION + 80
+      ))) || poppingConnectionsRef.current.length > 0;
       if (animatingMaterial) frame = window.requestAnimationFrame(draw);
     };
 
@@ -553,6 +663,27 @@ function MindMap({
     .reverse()
     .find((node) => Math.hypot(node.x - point.x, node.y - point.y) <= node.r + 4);
 
+  const hitConnection = (point) => findFluidConnectionHit(point, renderedNodes, renderedEdges);
+
+  const popConnection = (connection) => {
+    const now = performance.now();
+    const seedText = `${connection.link.from}:${connection.link.to}`;
+    const seed = [...seedText].reduce((value, character) => (
+      ((value * 31) + character.charCodeAt(0)) >>> 0
+    ), Math.round(now));
+    poppingConnectionsRef.current.push({
+      aId: connection.a.id,
+      bId: connection.b.id,
+      a: { ...connection.a, radius: connection.a.radius ?? connection.a.r },
+      b: { ...connection.b, radius: connection.b.radius ?? connection.b.r },
+      hitT: connection.hit.t,
+      seed,
+      start: now,
+      duration: reducedMotion ? 1 : CONNECTION_POP_DURATION,
+    });
+    onRemoveConnection(connection.link);
+  };
+
   const touchPointers = () => [...activePointersRef.current.values()]
     .filter((pointer) => pointer.pointerType === "touch");
 
@@ -560,6 +691,23 @@ function MindMap({
     x: pointers.reduce((sum, pointer) => sum + pointer.x, 0) / pointers.length,
     y: pointers.reduce((sum, pointer) => sum + pointer.y, 0) / pointers.length,
   });
+
+  const touchDistance = (pointers) => {
+    if (pointers.length < 2) return 1;
+    return Math.max(Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y), 1);
+  };
+
+  const beginTouchGesture = (pointers) => {
+    const centroid = touchCentroid(pointers);
+    const rect = canvasRef.current.getBoundingClientRect();
+    return {
+      type: "touch-gesture",
+      startDistance: touchDistance(pointers),
+      startZoom: zoom,
+      worldX: (centroid.x - rect.left - transform.offsetX) / transform.scale,
+      worldY: (centroid.y - rect.top - transform.offsetY) / transform.scale,
+    };
+  };
 
   const handlePointerDown = (event) => {
     if (event.button !== 0) return;
@@ -571,22 +719,15 @@ function MindMap({
     const touches = touchPointers();
     if (event.pointerType === "touch" && touches.length >= 2) {
       if (dragRef.current?.type === "node") onMoveCancel(dragRef.current.id);
-      const centroid = touchCentroid(touches);
-      dragRef.current = {
-        type: "touch-pan",
-        startX: centroid.x,
-        startY: centroid.y,
-        panX: panRef.current.x,
-        panY: panRef.current.y,
-      };
+      dragRef.current = beginTouchGesture(touches);
       event.currentTarget.setPointerCapture(event.pointerId);
       event.preventDefault();
       return;
     }
     const point = screenToWorld(event.clientX, event.clientY);
     const hit = hitNode(point);
-    if (connectFromId && hit && hit.id !== connectFromId) {
-      onConnectTarget(hit.id);
+    if (connectFromId && hit) {
+      if (!hit.ghost && hit.id !== connectFromId) onConnectTarget(hit.id);
       return;
     }
     if (hit) {
@@ -608,7 +749,8 @@ function MindMap({
         moved: false,
       };
     } else {
-      onSelect(null);
+      const connectionHit = hitConnection(point);
+      if (!connectionHit) onSelect(null);
       dragRef.current = {
         type: "pan",
         pointerId: event.pointerId,
@@ -616,6 +758,8 @@ function MindMap({
         startY: event.clientY,
         panX: pan.x,
         panY: pan.y,
+        moved: false,
+        connectionHit,
       };
     }
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -631,19 +775,33 @@ function MindMap({
     }
     const drag = dragRef.current;
     if (!drag) return;
-    if (drag.type === "touch-pan") {
+    if (drag.type === "touch-gesture") {
       const touches = touchPointers();
       if (touches.length < 2) return;
       const centroid = touchCentroid(touches);
+      const rect = canvasRef.current.getBoundingClientRect();
+      const nextZoom = clamp(
+        drag.startZoom * (touchDistance(touches) / drag.startDistance),
+        MIN_ZOOM,
+        MAX_ZOOM,
+      );
+      const fit = Math.min(viewport.width / BASE_WIDTH, viewport.height / BASE_HEIGHT);
+      const nextScale = fit * nextZoom;
+      const centeredX = (viewport.width - BASE_WIDTH * nextScale) / 2;
+      const centeredY = (viewport.height - BASE_HEIGHT * nextScale) / 2;
       setPan({
-        x: drag.panX + centroid.x - drag.startX,
-        y: drag.panY + centroid.y - drag.startY,
+        x: centroid.x - rect.left - centeredX - drag.worldX * nextScale,
+        y: centroid.y - rect.top - centeredY - drag.worldY * nextScale,
       });
+      setZoom(nextZoom);
       event.preventDefault();
       return;
     }
     if (drag.pointerId !== event.pointerId) return;
     if (drag.type === "pan") {
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 5) {
+        drag.moved = true;
+      }
       setPan({
         x: drag.panX + event.clientX - drag.startX,
         y: drag.panY + event.clientY - drag.startY,
@@ -673,40 +831,24 @@ function MindMap({
     }
     activePointersRef.current.delete(event.pointerId);
     if (!drag) return;
-    if (drag.type === "touch-pan") {
+    if (drag.type === "touch-gesture") {
       const touches = touchPointers();
       if (touches.length >= 2) {
-        const centroid = touchCentroid(touches);
-        drag.startX = centroid.x;
-        drag.startY = centroid.y;
-        drag.panX = panRef.current.x;
-        drag.panY = panRef.current.y;
+        dragRef.current = beginTouchGesture(touches);
       } else {
         dragRef.current = null;
       }
       return;
     }
     if (drag.pointerId !== event.pointerId) return;
+    if (drag.type === "pan" && drag.connectionHit && !drag.moved && event.type !== "pointercancel") {
+      popConnection(drag.connectionHit);
+    }
     if (drag.type === "node") {
       if (event.type === "pointercancel") onMoveCancel(drag.id);
       else onMoveEnd(drag.id, drag.vx, drag.vy, drag.moved);
     }
     dragRef.current = null;
-  };
-
-  const handleWheel = (event) => {
-    event.preventDefault();
-    if (event.ctrlKey) {
-      setZoom((value) => clamp(value + (event.deltaY < 0 ? 0.06 : -0.06), 0.72, 1.36));
-      return;
-    }
-    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.height : 1;
-    const deltaX = event.shiftKey && event.deltaX === 0 ? event.deltaY : event.deltaX;
-    const deltaY = event.shiftKey && event.deltaX === 0 ? 0 : event.deltaY;
-    setPan((current) => ({
-      x: current.x - deltaX * unit,
-      y: current.y - deltaY * unit,
-    }));
   };
 
   const handleDoubleClick = (event) => {
@@ -732,7 +874,6 @@ function MindMap({
         onPointerUp={handlePointerEnd}
         onPointerCancel={handlePointerEnd}
         onDoubleClick={handleDoubleClick}
-        onWheel={handleWheel}
       />
 
       {renderedNodes.filter((node) => node.ghost).map((node) => (
@@ -821,7 +962,7 @@ export function App() {
   const [connectFromId, setConnectFromId] = useState(null);
   const [favorite, setFavorite] = useState(true);
   const [listening, setListening] = useState(false);
-  const [seconds, setSeconds] = useState(62);
+  const [seconds, setSeconds] = useState(0);
   const [voiceIndex, setVoiceIndex] = useState(0);
   const [toast, setToast] = useState("");
   const [history, setHistory] = useState(() => [{
@@ -839,6 +980,11 @@ export function App() {
     let animationFrame;
     let lastTime = performance.now();
     const animatePhysics = (now) => {
+      if (viewModeRef.current !== "clusters") {
+        lastTime = now;
+        animationFrame = window.requestAnimationFrame(animatePhysics);
+        return;
+      }
       const frameStep = clamp((now - lastTime) / 16.67, 0.35, 2);
       lastTime = now;
       const result = stepFluidPhysics(nodesRef.current, edgesRef.current, {
@@ -871,22 +1017,6 @@ export function App() {
     const timer = window.setTimeout(() => setToast(""), 2800);
     return () => window.clearTimeout(timer);
   }, [toast]);
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (event.key === "Escape") {
-        setActivePanel(null);
-        setConnectFromId(null);
-      }
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        if (event.shiftKey) redo();
-        else undo();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  });
-
   const selected = nodes.find((node) => node.id === selectedId);
   const visibleNodes = showPrivateIsland ? nodes : nodes.filter((node) => !node.island);
   const searchResults = useMemo(() => {
@@ -942,6 +1072,22 @@ export function App() {
   function redo() {
     if (historyIndex < history.length - 1) restoreHistory(historyIndex + 1);
   }
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setActivePanel(null);
+        setConnectFromId(null);
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redo();
+        else undo();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [history, historyIndex, selectedId]);
 
   const togglePanel = (panel) => {
     setActivePanel((current) => current === panel ? null : panel);
@@ -1008,31 +1154,35 @@ export function App() {
       ?? nodesRef.current.find((node) => node.id === "root");
     if (!parent) return null;
     const id = `${options.ghost ? "ghost" : "thought"}-${Date.now()}-${nextIdRef.current++}`;
-    const radius = options.ghost ? 52 : clamp(parent.r * 0.52, 36, 58);
+    const lines = wrapThought(text);
+    const baseRadius = options.ghost ? 52 : clamp(parent.r * 0.52, 36, 58);
+    const radius = radiusForThought(lines, baseRadius, Boolean(options.ghost));
     const placement = findGrowthPlacement(parent, radius, nodesRef.current, edgesRef.current, BASE_WIDTH, BASE_HEIGHT);
+    const createdAt = performance.now();
     const node = {
       id,
       x: placement.x,
       y: placement.y,
       r: radius,
       depth: clamp((parent.depth ?? 0) + 1, 1, 4),
-      lines: wrapThought(text),
+      lines,
       ghost: Boolean(options.ghost),
       provenance: options.provenance,
-      createdAt: performance.now(),
+      createdAt,
     };
     const edge = {
       from: parent.id,
       to: id,
       bend: 0,
       ghost: Boolean(options.ghost),
+      createdAt,
     };
     const nextNodes = [...nodesRef.current, node];
     const nextEdges = [...edgesRef.current, edge];
     applyGraph(nextNodes, nextEdges, options.ghost ? "AI proposed a thought" : "Added a thought");
     if (viewMode === "clusters") organicPositionsRef.current.set(id, { x: node.x, y: node.y });
     setSelectedId(id);
-    setShowSuggestions(true);
+    if (options.ghost) setShowSuggestions(true);
     return id;
   };
 
@@ -1055,7 +1205,11 @@ export function App() {
     const value = composerValue.trim();
     if (!value || !composer) return;
     if (composer.mode === "edit") {
-      const next = nodesRef.current.map((node) => node.id === composer.id ? { ...node, lines: wrapThought(value) } : node);
+      const next = nodesRef.current.map((node) => {
+        if (node.id !== composer.id) return node;
+        const lines = wrapThought(value);
+        return { ...node, lines, r: radiusForThought(lines, node.r, false) };
+      });
       applyGraph(next, edgesRef.current, "Edited a thought");
       setSelectedId(composer.id);
       showToast("Thought updated");
@@ -1079,10 +1233,13 @@ export function App() {
   };
 
   const acceptGhost = (id) => {
+    const createdAt = performance.now();
     const nextNodes = nodesRef.current.map((node) => node.id === id
-      ? { ...node, ghost: false, provenance: "AI suggestion · accepted", createdAt: performance.now() }
+      ? { ...node, ghost: false, provenance: "AI suggestion · accepted", createdAt }
       : node);
-    const nextEdges = edgesRef.current.map((edge) => edge.to === id ? { ...edge, ghost: false } : edge);
+    const nextEdges = edgesRef.current.map((edge) => edge.to === id
+      ? { ...edge, ghost: false, createdAt }
+      : edge);
     applyGraph(nextNodes, nextEdges, "Accepted an AI suggestion");
     setSelectedId(id);
     showToast("Suggestion accepted");
@@ -1115,6 +1272,13 @@ export function App() {
 
   const connectTarget = (targetId) => {
     if (!connectFromId || connectFromId === targetId) return;
+    const source = nodesRef.current.find((node) => node.id === connectFromId);
+    const target = nodesRef.current.find((node) => node.id === targetId);
+    if (!source || !target || source.ghost || target.ghost) {
+      setConnectFromId(null);
+      showToast("Accept a proposal before connecting it");
+      return;
+    }
     const exists = edgesRef.current.some((edge) => (
       (edge.from === connectFromId && edge.to === targetId)
       || (edge.from === targetId && edge.to === connectFromId)
@@ -1124,22 +1288,45 @@ export function App() {
       showToast("Those thoughts are already connected");
       return;
     }
-    const source = nodesRef.current.find((node) => node.id === connectFromId);
-    const target = nodesRef.current.find((node) => node.id === targetId);
     const dx = (target?.x ?? 0) - (source?.x ?? 0);
     const dy = (target?.y ?? 0) - (source?.y ?? 0);
     const nextNodes = nodesRef.current.map((node) => (
       node.id === connectFromId || node.id === targetId ? withWobble(node, dx, dy, 0.07) : node
     ));
-    const nextEdges = [...edgesRef.current, { from: connectFromId, to: targetId, bend: 0 }];
+    const nextEdges = [...edgesRef.current, {
+      from: connectFromId,
+      to: targetId,
+      bend: 0,
+      createdAt: performance.now(),
+    }];
     applyGraph(nextNodes, nextEdges, "Connected two thoughts");
     setConnectFromId(null);
     setSelectedId(targetId);
     showToast("Thoughts connected");
   };
 
+  const removeConnection = (targetEdge) => {
+    const source = nodesRef.current.find((node) => node.id === targetEdge.from);
+    const target = nodesRef.current.find((node) => node.id === targetEdge.to);
+    if (!source || !target) return;
+    const matches = (edge) => (
+      (edge.from === targetEdge.from && edge.to === targetEdge.to)
+      || (edge.from === targetEdge.to && edge.to === targetEdge.from)
+    );
+    const nextEdges = edgesRef.current.filter((edge) => !matches(edge));
+    const nextNodes = nodesRef.current.map((node) => {
+      if (node.id === source.id) return withWobble(node, source.x - target.x, source.y - target.y, 0.045);
+      if (node.id === target.id) return withWobble(node, target.x - source.x, target.y - source.y, 0.045);
+      return node;
+    });
+    applyGraph(nextNodes, nextEdges, "Removed a connection");
+    setConnectFromId(null);
+    showToast("Connection popped");
+  };
+
   const toggleVoice = () => {
     if (!listening) {
+      setSeconds(0);
       setListening(true);
       showToast("Listening for a complete thought…");
       return;
@@ -1160,7 +1347,7 @@ export function App() {
     let nextNodes;
     if (nextMode === "hierarchy") {
       nodesRef.current.forEach((node) => organicPositionsRef.current.set(node.id, { x: node.x, y: node.y }));
-      nextNodes = layoutHierarchy(nodesRef.current);
+      nextNodes = layoutHierarchy(nodesRef.current, edgesRef.current);
     } else {
       nextNodes = nodesRef.current.map((node) => ({ ...node, ...(organicPositionsRef.current.get(node.id) ?? {}) }));
     }
@@ -1346,6 +1533,7 @@ export function App() {
         onDelete={deleteThought}
         onAcceptGhost={acceptGhost}
         onDismissGhost={dismissGhost}
+        onRemoveConnection={removeConnection}
         connectFromId={connectFromId}
         zoom={zoom}
         setZoom={setZoom}
@@ -1359,21 +1547,33 @@ export function App() {
 
       <nav className="side-rail" aria-label="Workspace tools">
         <IconButton label="Maps" active={activePanel === "maps"} onClick={() => togglePanel("maps")} testId="maps-tool"><IconAffiliate /></IconButton>
+        {concept === "nocturne" && (
+          <>
+            <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
+            <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconHierarchy2 /></IconButton>
+          </>
+        )}
         <IconButton label="Search" active={activePanel === "search"} onClick={() => togglePanel("search")} testId="search-tool"><IconSearch /></IconButton>
         <IconButton label={focusId ? "Show full map" : "Focus selected branch"} active={Boolean(focusId)} onClick={toggleFocus} testId="focus-tool"><IconFocusCentered /></IconButton>
         <IconButton label="History" active={activePanel === "history"} onClick={() => togglePanel("history")} testId="history-tool"><IconClock /></IconButton>
-        <IconButton label={favorite ? "Remove favorite" : "Add favorite"} pressed={favorite} onClick={() => { setFavorite((value) => !value); showToast(favorite ? "Removed from favorites" : "Added to favorites"); }} testId="favorite-tool"><IconStar /></IconButton>
-        <IconButton label="Account" active={activePanel === "profile"} onClick={() => togglePanel("profile")} className="avatar-button rail-bottom" testId="profile-tool">MR</IconButton>
-        <IconButton label="Settings" active={activePanel === "settings"} onClick={() => togglePanel("settings")} testId="settings-tool"><IconSettings /></IconButton>
+        {concept === "paper" && (
+          <>
+            <IconButton label={favorite ? "Remove favorite" : "Add favorite"} pressed={favorite} onClick={() => { setFavorite((value) => !value); showToast(favorite ? "Removed from favorites" : "Added to favorites"); }} testId="favorite-tool"><IconStar /></IconButton>
+            <IconButton label="Account" active={activePanel === "profile"} onClick={() => togglePanel("profile")} className="avatar-button rail-bottom" testId="profile-tool">MR</IconButton>
+          </>
+        )}
+        <IconButton label="Settings" active={activePanel === "settings"} onClick={() => togglePanel("settings")} className={concept === "nocturne" ? "rail-bottom" : ""} testId="settings-tool"><IconSettings /></IconButton>
       </nav>
 
-      <div className="top-dock" aria-label="Canvas modes">
-        <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
-        <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconAffiliate /></IconButton>
-        <IconButton label="Map overview and synthesis" active={activePanel === "overview"} onClick={() => togglePanel("overview")} testId="overview-tool"><IconGridDots /></IconButton>
-        <IconButton label="Layers" active={activePanel === "layers"} onClick={() => togglePanel("layers")} testId="layers-tool"><IconStack2 /></IconButton>
-        <IconButton label="Canvas settings" active={activePanel === "settings"} onClick={() => togglePanel("settings")} testId="canvas-settings-tool"><IconSettings /></IconButton>
-      </div>
+      {concept === "paper" && (
+        <div className="top-dock" aria-label="Canvas modes">
+          <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
+          <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconAffiliate /></IconButton>
+          <IconButton label="Map overview and synthesis" active={activePanel === "overview"} onClick={() => togglePanel("overview")} testId="overview-tool"><IconGridDots /></IconButton>
+          <IconButton label="Layers" active={activePanel === "layers"} onClick={() => togglePanel("layers")} testId="layers-tool"><IconStack2 /></IconButton>
+          <IconButton label="Canvas settings" active={activePanel === "settings"} onClick={() => togglePanel("settings")} testId="canvas-settings-tool"><IconSettings /></IconButton>
+        </div>
+      )}
 
       {activePanel && (
         <FloatingPanel panel={activePanel} onClose={() => { setActivePanel(null); setComposer(null); }}>
@@ -1386,6 +1586,13 @@ export function App() {
           <span />
           <p>Listening for a complete thought…</p>
           <small>{voiceThoughts[voiceIndex % voiceThoughts.length]}</small>
+        </div>
+      )}
+
+      {concept === "nocturne" && !listening && (
+        <div className="nocturne-companion-caption" aria-label="AI companion prompt">
+          <p><span />Keep going, this is getting interesting…</p>
+          <small>What if we explored the flow a bit more?</small>
         </div>
       )}
 
@@ -1403,13 +1610,13 @@ export function App() {
 
       <div className="zoom-controls" aria-label="Canvas zoom">
         <IconButton label="Center map" onClick={() => { setPan({ x: 0, y: 0 }); setZoom(1); }} testId="center-map"><IconFocusCentered /></IconButton>
-        <IconButton label="Zoom out" onClick={() => setZoom((value) => clamp(value - 0.08, 0.72, 1.36))} testId="zoom-out"><IconMinus /></IconButton>
+        <IconButton label="Zoom out" onClick={() => setZoom((value) => clamp(value - ZOOM_STEP, MIN_ZOOM, MAX_ZOOM))} testId="zoom-out"><IconMinus /></IconButton>
         <span>{Math.round(zoom * 100)}%</span>
-        <IconButton label="Zoom in" onClick={() => setZoom((value) => clamp(value + 0.08, 0.72, 1.36))} testId="zoom-in"><IconPlus /></IconButton>
+        <IconButton label="Zoom in" onClick={() => setZoom((value) => clamp(value + ZOOM_STEP, MIN_ZOOM, MAX_ZOOM))} testId="zoom-in"><IconPlus /></IconButton>
       </div>
 
       {connectFromId && (
-        <div className="connect-hint" role="status"><IconLink /><span>Select another lobe to connect</span><IconButton label="Cancel connection" onClick={() => setConnectFromId(null)}><IconX /></IconButton></div>
+        <div className={`connect-hint ${listening ? "is-raised" : ""}`} role="status"><IconLink /><span>Select another lobe to connect</span><IconButton label="Cancel connection" onClick={() => setConnectFromId(null)}><IconX /></IconButton></div>
       )}
 
       {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}

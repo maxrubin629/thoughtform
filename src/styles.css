@@ -151,8 +151,15 @@ button:disabled {
 
 .nocturne .side-rail {
   color: #fff1df;
-  background: rgba(9, 10, 20, 0.94);
-  border-right: 1px solid rgba(255, 241, 223, 0.12);
+  inset: 18px auto auto 14px;
+  height: 390px;
+  padding: 14px 9px;
+  gap: 10px;
+  border: 1px solid rgba(255, 241, 223, 0.18);
+  border-radius: 30px;
+  background: rgba(9, 10, 20, 0.82);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(16px);
 }
 
 .side-rail .icon-button {
@@ -1072,6 +1079,10 @@ button:disabled {
   font-weight: 600;
 }
 
+.connect-hint.is-raised {
+  bottom: 258px;
+}
+
 .connect-hint > svg {
   width: 16px;
   height: 16px;
@@ -1126,6 +1137,168 @@ button:disabled {
   color: #fff1df;
   background: rgba(17, 15, 25, 0.98);
   border-color: rgba(255, 241, 223, 0.14);
+}
+
+.nocturne .panel-left {
+  left: 84px;
+}
+
+.nocturne .panel-header,
+.nocturne .toggle-row {
+  border-color: rgba(255, 241, 223, 0.1);
+}
+
+.nocturne .panel-title-mark,
+.nocturne .map-row-icon {
+  color: #ff9278;
+  background: rgba(225, 100, 77, 0.18);
+}
+
+.nocturne .panel-header span,
+.nocturne .map-row > svg,
+.nocturne .panel-list button svg,
+.nocturne .prompt-list button svg,
+.nocturne .view-options button > svg,
+.nocturne .synthesis-card > div,
+.nocturne .connect-hint > svg {
+  color: #ef8068;
+}
+
+.nocturne .panel-description,
+.nocturne .map-row small,
+.nocturne .panel-list small,
+.nocturne .profile-card small,
+.nocturne .empty-state,
+.nocturne .composer-form label > span,
+.nocturne .composer-form small,
+.nocturne .view-options small,
+.nocturne .toggle-row small,
+.nocturne .map-stats small {
+  color: rgba(255, 241, 223, 0.58);
+}
+
+.nocturne .map-row,
+.nocturne .history-actions .icon-button,
+.nocturne .profile-card,
+.nocturne .prompt-list button,
+.nocturne .view-options button,
+.nocturne .search-field,
+.nocturne .ask-form,
+.nocturne .composer-form textarea,
+.nocturne .map-stats > span {
+  color: #fff1df;
+  border-color: rgba(255, 241, 223, 0.12);
+  background: rgba(30, 24, 36, 0.92);
+}
+
+.nocturne .search-field input,
+.nocturne .ask-form input,
+.nocturne .composer-form textarea {
+  color: #fff1df;
+}
+
+.nocturne .search-field input::placeholder,
+.nocturne .ask-form input::placeholder,
+.nocturne .composer-form textarea::placeholder {
+  color: rgba(255, 241, 223, 0.4);
+}
+
+.nocturne .panel-list button:hover,
+.nocturne .panel-list button.is-current,
+.nocturne .view-options button:hover,
+.nocturne .view-options button.is-current,
+.nocturne .prompt-list button:hover,
+.nocturne .map-row.is-current {
+  color: #fff1df;
+  border-color: rgba(239, 128, 104, 0.32);
+  background: rgba(225, 100, 77, 0.12);
+}
+
+.nocturne .panel-note,
+.nocturne .segmented-control,
+.nocturne .synthesis-card {
+  color: rgba(255, 241, 223, 0.78);
+  border-color: rgba(255, 241, 223, 0.1);
+  background: rgba(8, 9, 20, 0.58);
+}
+
+.nocturne .segmented-control button {
+  color: rgba(255, 241, 223, 0.58);
+}
+
+.nocturne .segmented-control button.is-active {
+  color: #fff1df;
+  background: rgba(225, 100, 77, 0.2);
+  box-shadow: none;
+}
+
+.nocturne .toggle-row > i {
+  background: #302a38;
+}
+
+.nocturne .toggle-row > i::after {
+  background: #fff1df;
+}
+
+.nocturne .toggle-row input:checked + i {
+  background: #dc6b55;
+}
+
+.nocturne .wide-action {
+  color: #ff9a82;
+  border-color: rgba(239, 128, 104, 0.24);
+  background: rgba(225, 100, 77, 0.1);
+}
+
+.nocturne .voice-caption {
+  left: 49px;
+  bottom: 72px;
+  width: min(420px, calc(100vw - 150px));
+  transform: none;
+  color: #fff1df;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.nocturne .voice-caption small {
+  color: rgba(255, 241, 223, 0.68);
+}
+
+.nocturne-companion-caption {
+  position: absolute;
+  z-index: 8;
+  left: 49px;
+  bottom: 67px;
+  color: rgba(255, 241, 223, 0.72);
+}
+
+.nocturne-companion-caption p,
+.nocturne-companion-caption small {
+  margin: 0;
+}
+
+.nocturne-companion-caption p {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.nocturne-companion-caption p span {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ef7059;
+  box-shadow: 0 0 15px rgba(239, 112, 89, 0.6);
+}
+
+.nocturne-companion-caption small {
+  display: block;
+  margin: 12px 0 0 21px;
+  color: rgba(255, 241, 223, 0.58);
+  font-size: 12px;
 }
 
 @media (max-width: 900px) {

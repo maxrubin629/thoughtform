@@ -33,10 +33,19 @@
 - Verified zoom, center, undo, and redo.
 - Verified horizontal and vertical two-finger trackpad panning in the live preview.
 - Verified the two-touch centroid gesture path moves the whole canvas without dragging a lobe.
+- Verified the native wheel path produces exact canvas pan deltas with stable page metrics; source-checked cursor-anchored canvas zoom and centroid-anchored two-touch distance zoom.
 - Dragged and released a leaf lobe; confirmed lab-matched inertia, motion deformation, linked spring recovery, unrelated-lobe repulsion, web clearance, damping, and edge bounds.
 - Exercised the 0.8-1.2x neutral spring band directly: linked nodes inside the band stayed force-free, stretched links restored, and overlapping unrelated lobes repelled.
 - Verified every ghost proposal tether is constructed exterior-to-exterior, reaches both outlines with explicit endpoint dots, and leaves no interior segment or loop at any proposal angle.
 - Verified the workspace rail resolves to the shared 60 px token, with desktop and compact panel offsets derived from that same value.
+- Connected a descendant back to the root, entered Focus mode, and confirmed the cyclic graph returns immediately instead of freezing.
+- Confirmed committed connection mode ignores ghost proposals and creates no invisible edge or false success state.
+- Captured a complete voice thought and confirmed its entire sentence remains visible in a content-sized lobe with a recording timer that starts at zero.
+- Hid AI proposals, added a manual thought, and confirmed the proposal layer remained hidden.
+- Switched a runtime proposal into hierarchy view and confirmed live-parent placement, stable rows, and clearance from the top dock and microphone cluster.
+- Verified simultaneous listening and connection guidance have non-overlapping bounding boxes.
+- Verified Nocturne uses the floating rail, lower-left companion prompt, root glow, and consistently dark panel controls without Paper-card leakage.
+- Added a new child and inspected slowed diagnostic frames for the source, traveling head, and final fused neck; the shipped motion matches the lab's 520 ms connection arrival and is keyed to the edge so accepted proposals and manual joins animate too.
 - Browser console warnings/errors checked after the final build: none.
 
 ## Comparison history
@@ -51,6 +60,11 @@
 - Finding: the first full comparison showed muted coral material, slightly narrow bridge waists, and a microphone pulse that was too faint.
 - Fix: reduced material texture blending, tuned the lab bridge width, restored the source coral saturation, and strengthened the pulse rings.
 - Post-fix evidence: `qa/paper-ui-final.png`, `qa/paper-ui-comparison.jpg`, and `qa/paper-ui-focus-comparison.jpg`.
+
+### Iteration 3
+
+- Finding: new lobes still popped, but their stems were committed at full length on the first frame, removing the lab's source-to-target arrival.
+- Fix: restored the lab's pending-head travel, fusion pulse, and 520 ms timing at the shared material-renderer layer; connection timestamps now cover new thoughts, accepted proposals, and manual joins.
 
 ## Follow-up polish
 

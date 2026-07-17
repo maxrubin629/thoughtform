@@ -23,3 +23,10 @@ When implementing from a selected generated mock, treat that image as the source
 - Map motion follows `sites/fluid-bubble-lab`: Jelly defaults, creation-time rest lengths, a 0.8-1.2x neutral spring band, lobe and web clearance, damped release inertia, and soft edge collisions.
 - Ghost-proposal tethers must be constructed from explicit exterior boundary anchors on both rendered shapes, with control handles that keep the path outside both interiors. Render the tether beneath solid material, use round dots with anchored endpoints, and never target either shape's center.
 - The workspace rail is a 60 px shared layout token; floating-panel offsets must derive from the same token at every breakpoint.
+- Complete thoughts are lossless: never truncate captured or typed text. Expand the lobe from content length and fit the full thought legibly inside it.
+- Graph focus traversal must be cycle-safe. Pending ghost proposals cannot receive committed connections until they are accepted.
+- Hierarchy mode uses the live graph, distributes proposal siblings outside their parent, reserves the fixed top and voice-control chrome, and does not run cluster spring physics.
+- Manual and voice thoughts preserve the user's proposal-layer visibility choice; only creating a new AI proposal may reveal that layer.
+- Nocturne uses its own floating tool rail, dark panel surfaces, lower-left companion prompt, and luminous root treatment rather than inheriting Paper chrome.
+- Newly committed stems grow from source to target with the lab's 520 ms pending-head motion. Reduced-motion mode may reveal the completed connection immediately.
+- The canvas keeps its grab cursor over lobes, empty space, and fused stems. Clicking a committed stem pops and removes that connection with the lab's 520 ms burst; dragging from the same stem pans instead.

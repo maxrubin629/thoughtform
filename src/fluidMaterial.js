@@ -3,6 +3,8 @@
 
 const MIN_CROWDED_HALF_ANGLE = 8 * (Math.PI / 180);
 const CREATE_DURATION = 460;
+export const CONNECTION_CREATE_DURATION = 520;
+export const CONNECTION_POP_DURATION = 520;
 const WOBBLE_DURATION = 640;
 
 export const DEFAULT_MATERIAL_SETTINGS = {
@@ -40,6 +42,21 @@ function easeOutBack(value) {
   return 1 + (overshoot + 1) * ((t - 1) ** 3) + overshoot * ((t - 1) ** 2);
 }
 
+function springProgress(value) {
+  const t = clamp(value, 0, 1);
+  return 1 - ((1 - t) ** 3);
+}
+
+function easeOutCubic(value) {
+  const t = clamp(value, 0, 1);
+  return 1 - ((1 - t) ** 3);
+}
+
+function seededUnit(seed) {
+  const value = Math.sin(seed * 12.9898) * 43758.5453;
+  return value - Math.floor(value);
+}
+
 function linkEnds(link) {
   return { a: link.a ?? link.from, b: link.b ?? link.to };
 }
@@ -66,6 +83,28 @@ function distanceToSegment(point, a, b) {
   const x = a.x + dx * t;
   const y = a.y + dy * t;
   return { distance: Math.hypot(point.x - x, point.y - y), t };
+}
+
+export function findFluidConnectionHit(point, visualNodes, links) {
+  const nodes = visualNodes instanceof Map
+    ? visualNodes
+    : new Map(visualNodes.map((node) => [node.id, node]));
+  for (let index = links.length - 1; index >= 0; index -= 1) {
+    const link = links[index];
+    if (link.ghost) continue;
+    const { a: aId, b: bId } = linkEnds(link);
+    const a = nodes.get(aId);
+    const b = nodes.get(bId);
+    if (!a || !b || a.ghost || b.ghost) continue;
+    const hit = distanceToSegment(point, a, b);
+    const aRadius = a.radius ?? a.r;
+    const bRadius = b.radius ?? b.r;
+    const hitWidth = Math.max(12, Math.min(aRadius, bRadius) * 0.26);
+    if (hit.t > 0.14 && hit.t < 0.86 && hit.distance <= hitWidth) {
+      return { link, a, b, hit };
+    }
+  }
+  return null;
 }
 
 function segmentClearance(a, b, c, d) {
@@ -380,6 +419,10 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
   const settings = enabledSettings(options.settings ?? DEFAULT_MATERIAL_SETTINGS);
   const nodes = [...visualNodes.values()];
   const materialPaths = [];
+  const fallbackColor = options.color ?? "#ed765d";
+  const colorForNode = options.colorForNode ?? (() => fallbackColor);
+  const now = options.now ?? performance.now();
+  const reducedMotion = Boolean(options.reducedMotion);
 
   links.forEach((link) => {
     if (link.ghost) return;
@@ -387,20 +430,152 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
     const a = visualNodes.get(aId);
     const b = visualNodes.get(bId);
     if (!a || !b || a.ghost || b.ghost) return;
+    let bridgeTarget = b;
+    let bridgeSettings = settings;
+    const connectionStart = link.createdAt;
+    if (!reducedMotion && connectionStart != null) {
+      const elapsedProgress = clamp(
+        (now - connectionStart) / CONNECTION_CREATE_DURATION,
+        0,
+        1,
+      );
+      if (elapsedProgress < 1) {
+        const progress = springProgress(elapsedProgress);
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const distance = Math.max(Math.hypot(dx, dy), 1);
+        const ux = dx / distance;
+        const uy = dy / distance;
+        const smallestRadius = Math.min(a.radius, b.radius);
+        const startDistance = a.radius * 0.72;
+        const travelDistance = startDistance + (distance - startDistance) * progress;
+        const fusionPulse = Math.sin(elapsedProgress * Math.PI) * 0.055;
+        bridgeTarget = {
+          x: a.x + ux * travelDistance,
+          y: a.y + uy * travelDistance,
+          radius: clamp(
+            smallestRadius * (0.04 + elapsedProgress * 0.015) * (1 + fusionPulse),
+            2.8,
+            4.8,
+          ),
+        };
+        bridgeSettings = {
+          ...settings,
+          bridgeWidth: clamp(settings.bridgeWidth + fusionPulse, 0, 1),
+          flare: settings.flare * (0.52 + elapsedProgress * 0.48),
+        };
+      }
+    }
     const path = new Path2D();
     const angleLimits = attachmentAngleLimits(a, b, links, nodes);
-    if (traceFluidBridge(path, a, b, settings, angleLimits)) materialPaths.push(path);
+    if (traceFluidBridge(path, a, bridgeTarget, bridgeSettings, angleLimits)) {
+      const gradient = ctx.createLinearGradient(a.x, a.y, bridgeTarget.x, bridgeTarget.y);
+      gradient.addColorStop(0, colorForNode(a));
+      gradient.addColorStop(1, colorForNode(b));
+      materialPaths.push({ path, fill: gradient });
+    }
   });
 
   nodes.forEach((node) => {
     if (node.ghost) return;
     const path = new Path2D();
     path.ellipse(node.x, node.y, node.radiusX, node.radiusY, node.rotation, 0, Math.PI * 2);
-    materialPaths.push(path);
+    materialPaths.push({ path, fill: colorForNode(node) });
   });
 
-  ctx.fillStyle = options.color ?? "#ed765d";
-  materialPaths.forEach((path) => ctx.fill(path));
+  materialPaths.forEach(({ path, fill }) => {
+    ctx.fillStyle = fill;
+    ctx.fill(path);
+  });
+}
+
+function fillFluidBridge(ctx, a, b, settings, angleLimits) {
+  const path = new Path2D();
+  if (!traceFluidBridge(path, a, b, settings, angleLimits)) return false;
+  ctx.fill(path, "nonzero");
+  return true;
+}
+
+export function drawFluidConnectionPop(ctx, a, b, rawSettings, pop, progress, fill) {
+  const settings = enabledSettings(rawSettings ?? DEFAULT_MATERIAL_SETTINGS);
+  const liveMetrics = bridgeMetrics(a, b, settings, pop.angleLimits);
+  if (!pop.particleMetrics) {
+    if (!liveMetrics) return;
+    pop.particleMetrics = {
+      distance: liveMetrics.distance,
+      ux: liveMetrics.ux,
+      uy: liveMetrics.uy,
+      px: liveMetrics.px,
+      py: liveMetrics.py,
+      start: { ...liveMetrics.start },
+      end: { ...liveMetrics.end },
+    };
+  }
+  const particleMetrics = pop.particleMetrics;
+  const pressureProgress = clamp(progress / 0.34, 0, 1);
+  const pressure = Math.sin(pressureProgress * Math.PI);
+  const membraneAlpha = 1 - smoothstep((progress - 0.17) / 0.25);
+  const inflatedSettings = {
+    ...settings,
+    bridgeWidth: clamp(settings.bridgeWidth + pressure * 0.34, 0, 1),
+    flare: clamp(settings.flare + pressure * 0.08, -0.5, 1),
+  };
+
+  ctx.save();
+  ctx.fillStyle = fill;
+  if (pressure > 0.01) {
+    ctx.globalAlpha = pressure * 0.22;
+    fillFluidBridge(ctx, a, b, {
+      ...inflatedSettings,
+      bridgeWidth: clamp(inflatedSettings.bridgeWidth + 0.24, 0, 1),
+    }, pop.angleLimits);
+  }
+  if (membraneAlpha > 0.01) {
+    ctx.globalAlpha = membraneAlpha;
+    fillFluidBridge(ctx, a, b, inflatedSettings, pop.angleLimits);
+  }
+
+  const particleCount = clamp(Math.round(particleMetrics.distance / 26), 8, 17);
+  const burstOrigin = pop.hitT ?? 0.5;
+  const seedBase = pop.seed ?? 1;
+  const centerLength = Math.hypot(
+    particleMetrics.end.x - particleMetrics.start.x,
+    particleMetrics.end.y - particleMetrics.start.y,
+  );
+
+  for (let index = 0; index < particleCount; index += 1) {
+    const pathT = (index + 0.5) / particleCount;
+    const seed = seededUnit(seedBase + index * 17.31);
+    const seedB = seededUnit(seedBase + index * 43.77 + 11);
+    const delay = 0.13 + Math.abs(pathT - burstOrigin) * 0.06 + seed * 0.02;
+    const particleProgress = clamp((progress - delay) / 0.7, 0, 1);
+    if (particleProgress <= 0 || particleProgress >= 1) continue;
+
+    const outward = easeOutCubic(particleProgress);
+    const side = seedB > 0.5 ? 1 : -1;
+    const normalTravel = side * (9 + seed * 19) * outward;
+    const alongTravel = (seedB - 0.5) * 15 * outward;
+    const startX = lerp(particleMetrics.start.x, particleMetrics.end.x, pathT);
+    const startY = lerp(particleMetrics.start.y, particleMetrics.end.y, pathT);
+    const pathJitter = (seed - 0.5) * Math.min(centerLength / particleCount, 12);
+    const x = startX
+      + particleMetrics.ux * (alongTravel + pathJitter)
+      + particleMetrics.px * normalTravel;
+    const y = startY
+      + particleMetrics.uy * (alongTravel + pathJitter)
+      + particleMetrics.py * normalTravel;
+    const fade = 1 - smoothstep((particleProgress - 0.5) / 0.5);
+    const arrival = smoothstep(particleProgress / 0.14);
+    const radius = (2.1 + seed * 2.8) * arrival * (1 - particleProgress * 0.52);
+    const rotation = Math.atan2(particleMetrics.py * side, particleMetrics.px * side)
+      + (seed - 0.5) * 0.7;
+
+    ctx.globalAlpha = fade * 0.96;
+    ctx.beginPath();
+    ctx.ellipse(x, y, radius * 1.45, radius * 0.72, rotation, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 export function withWobble(node, forceX = 1, forceY = 0, amplitude = 0.1) {
