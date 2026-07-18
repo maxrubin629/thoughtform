@@ -45,7 +45,11 @@
 - Switched a runtime proposal into hierarchy view and confirmed live-parent placement, stable rows, and clearance from the top dock and microphone cluster.
 - Verified simultaneous listening and connection guidance have non-overlapping bounding boxes.
 - Verified Nocturne uses the floating rail, lower-left companion prompt, root glow, and consistently dark panel controls without Paper-card leakage.
-- Added a new child and inspected slowed diagnostic frames for the source, traveling head, and final fused neck; the shipped motion matches the lab's 520 ms connection arrival and is keyed to the edge so accepted proposals and manual joins animate too.
+- Added a new child and inspected frame-synchronous diagnostics for the source, traveling head, exterior contact, and final fused neck. The shared renderer now reaches contact at 294 ms and expands into the final flare through 420 ms, so accepted proposals and manual joins use the same continuous material transition.
+- Recorded an off-center connection pop at animation speed. The membrane pinches at the exact click point, the rupture and droplets travel toward both exterior anchors, the nearer endpoint reacts first, and each endpoint's surviving stems deform on the same arrival frame as its lobe. Dragging from the same stem still pans without popping it.
+- Recorded an armed manual connection from launch through impact. The source lobe ripples along the stem axis on the first growth frame, the target remains undeformed until exterior contact at 294 ms, and the target compresses directionally while the head widens into the final flare. A smaller reverse impulse reaches the source 72 ms after contact while its existing stems follow the same deformation.
+- Re-recorded the new-child flow after changing the shared renderer; the lobe appeared, the narrow head reached it, and the final attachment widened over multiple rendered frames without a one-frame geometry swap.
+- Double-clicked an empty canvas region and confirmed a selected, unconnected `New thought` lobe appeared at the clicked world position. Repeated the gesture on an existing lobe and a committed stem; the lobe opened its editor, the stem retained its pop behavior, and neither spawned an extra thought.
 - Browser console warnings/errors checked after the final build: none.
 
 ## Comparison history
@@ -65,6 +69,26 @@
 
 - Finding: new lobes still popped, but their stems were committed at full length on the first frame, removing the lab's source-to-target arrival.
 - Fix: restored the lab's pending-head travel, fusion pulse, and 520 ms timing at the shared material-renderer layer; connection timestamps now cover new thoughts, accepted proposals, and manual joins.
+
+### Iteration 4
+
+- Finding: connection removal faded the whole membrane while both endpoint lobes began a generic wobble immediately; future-scheduled wobble states were also clamped into a visible pre-shake.
+- Fix: moved the pop to one shared 520 ms clock, mapped the click to the visible membrane span, propagated a split and particles outward from that origin, and scheduled each endpoint deformation for its actual rupture-arrival time.
+
+### Iteration 5
+
+- Finding: manually connecting two existing lobes assigned both endpoints the same wobble immediately, so the target reacted before the traveling stem reached it and the source motion did not read as launch recoil.
+- Fix: keyed both reactions to the edge's creation timestamp, constrained the pending head to first meet the target exterior on the 520 ms arrival frame, and used the lab's smaller directional source pulse at launch plus stronger directional target compression on contact.
+
+### Iteration 6
+
+- Finding: the source reacted at launch but received no return impulse after target contact, while the traveling head remained separate for too long and then swapped to a fully flared bridge in one frame.
+- Fix: shortened growth to 420 ms, moved exterior contact to 70% of that clock, expanded the contact head continuously into the target during the final 30%, and scheduled a smaller reverse-direction source impulse 72 ms after target impact.
+
+### Iteration 7
+
+- Finding: double-clicking empty canvas space only cleared selection because the handler recognized existing lobes but had no freeform creation branch.
+- Fix: added world-coordinate freeform creation with no parent edge, selected the new lobe immediately, exited branch focus so it remains visible, and guarded the gesture against lobes, proposals, armed-connection mode, committed stems, and recent stem-pop locations.
 
 ## Follow-up polish
 

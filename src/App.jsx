@@ -31,7 +31,9 @@ import {
 } from "@tabler/icons-react";
 import paperTextureUrl from "./assets/paper-texture.png";
 import {
+  CONNECTION_CREATE_CONTACT_PROGRESS,
   CONNECTION_CREATE_DURATION,
+  CONNECTION_CREATE_RETURN_DELAY,
   CONNECTION_POP_DURATION,
   DEFAULT_MATERIAL_SETTINGS,
   buildFluidVisualNodes,
@@ -40,6 +42,7 @@ import {
   drawFluidMaterial,
   findFluidConnectionHit,
   findGrowthPlacement,
+  getConnectionPopImpactTimes,
   withWobble,
 } from "./fluidMaterial.js";
 import {
@@ -412,6 +415,7 @@ function MindMap({
   onAskAI,
   onArmConnect,
   onConnectTarget,
+  onSpawnFreeform,
   onDelete,
   onAcceptGhost,
   onDismissGhost,
@@ -433,6 +437,7 @@ function MindMap({
   const activePointersRef = useRef(new Map());
   const interactionRef = useRef(null);
   const poppingConnectionsRef = useRef([]);
+  const lastConnectionPopRef = useRef(null);
   const [viewport, setViewport] = useState({ width: BASE_WIDTH, height: BASE_HEIGHT });
   const [fontReady, setFontReady] = useState(false);
   const [textureReady, setTextureReady] = useState(false);
@@ -627,7 +632,9 @@ function MindMap({
       ctx.restore();
       const animatingMaterial = !reducedMotion && renderedNodes.some((node) => (
         (node.createdAt != null && now - node.createdAt < 900)
-        || (node.wobbleStart != null && now - node.wobbleStart < 760)
+        || (node.wobbleEndAt != null
+          ? now < node.wobbleEndAt + 80
+          : node.wobbleStart != null && now - node.wobbleStart < 760)
       )) || (!reducedMotion && renderedEdges.some((edge) => (
         edge.createdAt != null && now - edge.createdAt < CONNECTION_CREATE_DURATION + 80
       ))) || poppingConnectionsRef.current.length > 0;
@@ -667,6 +674,15 @@ function MindMap({
 
   const popConnection = (connection) => {
     const now = performance.now();
+    const duration = reducedMotion ? 1 : CONNECTION_POP_DURATION;
+    const impacts = getConnectionPopImpactTimes(
+      now,
+      connection.hit.t,
+      duration,
+      connection.a,
+      connection.b,
+      paperMaterialSettings,
+    );
     const seedText = `${connection.link.from}:${connection.link.to}`;
     const seed = [...seedText].reduce((value, character) => (
       ((value * 31) + character.charCodeAt(0)) >>> 0
@@ -679,9 +695,13 @@ function MindMap({
       hitT: connection.hit.t,
       seed,
       start: now,
-      duration: reducedMotion ? 1 : CONNECTION_POP_DURATION,
+      duration,
     });
-    onRemoveConnection(connection.link);
+    onRemoveConnection(connection.link, {
+      hitT: connection.hit.t,
+      sourceImpactAt: impacts.source,
+      targetImpactAt: impacts.target,
+    });
   };
 
   const touchPointers = () => [...activePointersRef.current.values()]
@@ -842,6 +862,11 @@ function MindMap({
     }
     if (drag.pointerId !== event.pointerId) return;
     if (drag.type === "pan" && drag.connectionHit && !drag.moved && event.type !== "pointercancel") {
+      lastConnectionPopRef.current = {
+        x: event.clientX,
+        y: event.clientY,
+        at: performance.now(),
+      };
       popConnection(drag.connectionHit);
     }
     if (drag.type === "node") {
@@ -852,8 +877,20 @@ function MindMap({
   };
 
   const handleDoubleClick = (event) => {
-    const hit = hitNode(screenToWorld(event.clientX, event.clientY));
-    if (hit && !hit.ghost) onEdit(hit.id);
+    const point = screenToWorld(event.clientX, event.clientY);
+    const hit = hitNode(point);
+    if (hit) {
+      if (!hit.ghost) onEdit(hit.id);
+      return;
+    }
+    const recentPop = lastConnectionPopRef.current;
+    if (
+      recentPop
+      && performance.now() - recentPop.at < 500
+      && Math.hypot(event.clientX - recentPop.x, event.clientY - recentPop.y) < 14
+    ) return;
+    if (connectFromId || hitConnection(point)) return;
+    onSpawnFreeform(point.x, point.y);
   };
 
   const selected = renderedNodes.find((node) => node.id === selectedId);
@@ -868,7 +905,7 @@ function MindMap({
     <div className="map-shell" ref={shellRef}>
       <canvas
         ref={canvasRef}
-        aria-label="Interactive organic idea map. Drag thoughts to move them. Use two fingers, a trackpad, or the empty canvas to pan."
+        aria-label="Interactive organic idea map. Drag thoughts to move them. Double-click empty space to create a freeform thought. Use two fingers, a trackpad, or the empty canvas to pan."
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerEnd}
@@ -1186,6 +1223,31 @@ export function App() {
     return id;
   };
 
+  const spawnFreeformThought = (x, y) => {
+    const lines = ["New thought"];
+    const radius = radiusForThought(lines, 46, false);
+    const id = `thought-${Date.now()}-${nextIdRef.current++}`;
+    const node = {
+      id,
+      x: clamp(x, radius + 20, BASE_WIDTH - radius - 20),
+      y: clamp(y, radius + 20, BASE_HEIGHT - radius - 20),
+      r: radius,
+      depth: 0,
+      lines,
+      provenance: "You",
+      createdAt: performance.now(),
+      vx: 0,
+      vy: 0,
+      dragging: false,
+    };
+    const nextNodes = [...nodesRef.current, node];
+    applyGraph(nextNodes, edgesRef.current, "Added a freeform thought");
+    if (viewMode === "clusters") organicPositionsRef.current.set(id, { x: node.x, y: node.y });
+    setFocusId(null);
+    setSelectedId(id);
+    showToast("New thought added");
+  };
+
   const openComposer = (parentId) => {
     setComposer({ mode: "add", parentId });
     setComposerValue("");
@@ -1290,14 +1352,41 @@ export function App() {
     }
     const dx = (target?.x ?? 0) - (source?.x ?? 0);
     const dy = (target?.y ?? 0) - (source?.y ?? 0);
-    const nextNodes = nodesRef.current.map((node) => (
-      node.id === connectFromId || node.id === targetId ? withWobble(node, dx, dy, 0.07) : node
-    ));
+    const createdAt = performance.now();
+    const targetImpactAt = createdAt
+      + CONNECTION_CREATE_DURATION * CONNECTION_CREATE_CONTACT_PROGRESS;
+    const sourceReturnAt = targetImpactAt + CONNECTION_CREATE_RETURN_DELAY;
+    const nextNodes = reducedMotion ? nodesRef.current : nodesRef.current.map((node) => {
+      if (node.id === connectFromId) {
+        const launched = withWobble(
+          node,
+          dx,
+          dy,
+          0.064,
+          { startAt: createdAt, travel: 0.14 },
+        );
+        return withWobble(
+          launched,
+          -dx,
+          -dy,
+          0.038,
+          { startAt: sourceReturnAt, travel: 0.11, append: true },
+        );
+      }
+      if (node.id === targetId) return withWobble(
+        node,
+        dx,
+        dy,
+        0.105,
+        { startAt: targetImpactAt, travel: 0.32 },
+      );
+      return node;
+    });
     const nextEdges = [...edgesRef.current, {
       from: connectFromId,
       to: targetId,
       bend: 0,
-      createdAt: performance.now(),
+      createdAt,
     }];
     applyGraph(nextNodes, nextEdges, "Connected two thoughts");
     setConnectFromId(null);
@@ -1305,18 +1394,35 @@ export function App() {
     showToast("Thoughts connected");
   };
 
-  const removeConnection = (targetEdge) => {
+  const removeConnection = (targetEdge, motion = {}) => {
     const source = nodesRef.current.find((node) => node.id === targetEdge.from);
     const target = nodesRef.current.find((node) => node.id === targetEdge.to);
     if (!source || !target) return;
+    const hitT = clamp(motion.hitT ?? 0.5, 0, 1);
+    const hitX = source.x + (target.x - source.x) * hitT;
+    const hitY = source.y + (target.y - source.y) * hitT;
+    const sourceAmplitude = 0.036 + (1 - hitT) * 0.016;
+    const targetAmplitude = 0.036 + hitT * 0.016;
     const matches = (edge) => (
       (edge.from === targetEdge.from && edge.to === targetEdge.to)
       || (edge.from === targetEdge.to && edge.to === targetEdge.from)
     );
     const nextEdges = edgesRef.current.filter((edge) => !matches(edge));
     const nextNodes = nodesRef.current.map((node) => {
-      if (node.id === source.id) return withWobble(node, source.x - target.x, source.y - target.y, 0.045);
-      if (node.id === target.id) return withWobble(node, target.x - source.x, target.y - source.y, 0.045);
+      if (node.id === source.id) return withWobble(
+        node,
+        source.x - hitX,
+        source.y - hitY,
+        sourceAmplitude,
+        { startAt: motion.sourceImpactAt, travel: 0.13 },
+      );
+      if (node.id === target.id) return withWobble(
+        node,
+        target.x - hitX,
+        target.y - hitY,
+        targetAmplitude,
+        { startAt: motion.targetImpactAt, travel: 0.13 },
+      );
       return node;
     });
     applyGraph(nextNodes, nextEdges, "Removed a connection");
@@ -1530,6 +1636,7 @@ export function App() {
         onAskAI={(id) => { setSelectedId(id); setActivePanel("ai"); }}
         onArmConnect={armConnection}
         onConnectTarget={connectTarget}
+        onSpawnFreeform={spawnFreeformThought}
         onDelete={deleteThought}
         onAcceptGhost={acceptGhost}
         onDismissGhost={dismissGhost}

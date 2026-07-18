@@ -3,8 +3,12 @@
 
 const MIN_CROWDED_HALF_ANGLE = 8 * (Math.PI / 180);
 const CREATE_DURATION = 460;
-export const CONNECTION_CREATE_DURATION = 520;
+export const CONNECTION_CREATE_DURATION = 420;
+export const CONNECTION_CREATE_CONTACT_PROGRESS = 0.7;
+export const CONNECTION_CREATE_RETURN_DELAY = 72;
 export const CONNECTION_POP_DURATION = 520;
+const CONNECTION_POP_RUPTURE_PROGRESS = 0.12;
+const CONNECTION_POP_TRAVEL_PROGRESS = 0.24;
 const WOBBLE_DURATION = 640;
 
 export const DEFAULT_MATERIAL_SETTINGS = {
@@ -40,11 +44,6 @@ function easeOutBack(value) {
   const t = clamp(value, 0, 1);
   const overshoot = 1.78;
   return 1 + (overshoot + 1) * ((t - 1) ** 3) + overshoot * ((t - 1) ** 2);
-}
-
-function springProgress(value) {
-  const t = clamp(value, 0, 1);
-  return 1 - ((1 - t) ** 3);
 }
 
 function easeOutCubic(value) {
@@ -362,25 +361,40 @@ function nodeVisualState(node, now, reducedMotion) {
     }
   }
 
-  if (node.wobbleStart != null) {
-    const wobbleProgress = (now - node.wobbleStart) / WOBBLE_DURATION;
-    if (wobbleProgress < 1) {
+  const wobblePulses = Array.isArray(node.wobblePulses)
+    ? node.wobblePulses
+    : node.wobbleStart != null
+      ? [{
+        startAt: node.wobbleStart,
+        amplitude: node.wobbleAmplitude ?? 0.1,
+        forceX: node.wobbleForceX ?? 1,
+        forceY: node.wobbleForceY ?? 0,
+        travel: node.wobbleTravel ?? 0.18,
+      }]
+      : [];
+  let strongestWobble = 0;
+  wobblePulses.forEach((pulse) => {
+    const wobbleProgress = (now - pulse.startAt) / WOBBLE_DURATION;
+    if (wobbleProgress >= 0 && wobbleProgress < 1) {
       const t = clamp(wobbleProgress, 0, 1);
       const envelope = (1 - t) ** 2.45;
-      const amplitude = node.wobbleAmplitude ?? 0.1;
+      const amplitude = pulse.amplitude ?? 0.1;
       const impactCompression = -Math.exp(-10 * t) * amplitude * 0.48;
       const wave = impactCompression + Math.sin(t * Math.PI * 4.4) * amplitude * envelope;
       scaleX += wave;
       scaleY -= wave * 0.52;
-      rotation = Math.atan2(node.wobbleForceY ?? 0, node.wobbleForceX ?? 1);
+      if (Math.abs(wave) >= strongestWobble) {
+        strongestWobble = Math.abs(wave);
+        rotation = Math.atan2(pulse.forceY ?? 0, pulse.forceX ?? 1);
+      }
       const shove = (
         Math.exp(-8 * t) * 0.62
         + Math.sin(t * Math.PI * 3.6) * envelope * 0.38
-      ) * node.r * amplitude * (node.wobbleTravel ?? 0.18);
-      offsetX += (node.wobbleForceX ?? 1) * shove;
-      offsetY += (node.wobbleForceY ?? 0) * shove;
+      ) * node.r * amplitude * (pulse.travel ?? 0.18);
+      offsetX += (pulse.forceX ?? 1) * shove;
+      offsetY += (pulse.forceY ?? 0) * shove;
     }
-  }
+  });
 
   return { scale: Math.max(0, scale), scaleX, scaleY, rotation, offsetX, offsetY };
 }
@@ -440,7 +454,19 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
         1,
       );
       if (elapsedProgress < 1) {
-        const progress = springProgress(elapsedProgress);
+        const travelProgress = clamp(
+          elapsedProgress / CONNECTION_CREATE_CONTACT_PROGRESS,
+          0,
+          1,
+        );
+        const fusionProgress = clamp(
+          (elapsedProgress - CONNECTION_CREATE_CONTACT_PROGRESS)
+            / (1 - CONNECTION_CREATE_CONTACT_PROGRESS),
+          0,
+          1,
+        );
+        const travelEase = smoothstep(travelProgress);
+        const fusionEase = smoothstep(fusionProgress);
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const distance = Math.max(Math.hypot(dx, dy), 1);
@@ -448,21 +474,39 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
         const uy = dy / distance;
         const smallestRadius = Math.min(a.radius, b.radius);
         const startDistance = a.radius * 0.72;
-        const travelDistance = startDistance + (distance - startDistance) * progress;
-        const fusionPulse = Math.sin(elapsedProgress * Math.PI) * 0.055;
+        const flightPulse = Math.sin(travelProgress * Math.PI) * 0.045;
+        const contactPulse = Math.sin(fusionProgress * Math.PI) * 0.09;
+        const headRadius = clamp(
+          smallestRadius * (0.04 + travelProgress * 0.015) * (1 + flightPulse),
+          2.8,
+          4.8,
+        );
+        const impactDistance = Math.max(
+          startDistance,
+          distance - b.radius - headRadius,
+        );
+        const travelDistance = startDistance + (impactDistance - startDistance) * travelEase;
+        const contactX = a.x + ux * impactDistance;
+        const contactY = a.y + uy * impactDistance;
+        const flightX = a.x + ux * travelDistance;
+        const flightY = a.y + uy * travelDistance;
         bridgeTarget = {
-          x: a.x + ux * travelDistance,
-          y: a.y + uy * travelDistance,
-          radius: clamp(
-            smallestRadius * (0.04 + elapsedProgress * 0.015) * (1 + fusionPulse),
-            2.8,
-            4.8,
-          ),
+          x: lerp(flightX, b.x, fusionEase),
+          y: lerp(flightY, b.y, fusionEase),
+          radius: lerp(headRadius, b.radius, fusionEase),
         };
+        if (fusionProgress > 0) {
+          bridgeTarget.x = lerp(contactX, b.x, fusionEase);
+          bridgeTarget.y = lerp(contactY, b.y, fusionEase);
+        }
         bridgeSettings = {
           ...settings,
-          bridgeWidth: clamp(settings.bridgeWidth + fusionPulse, 0, 1),
-          flare: settings.flare * (0.52 + elapsedProgress * 0.48),
+          bridgeWidth: clamp(settings.bridgeWidth + flightPulse + contactPulse, 0, 1),
+          flare: settings.flare * (
+            0.52
+            + travelProgress * 0.22
+            + fusionEase * 0.26
+          ),
         };
       }
     }
@@ -496,6 +540,35 @@ function fillFluidBridge(ctx, a, b, settings, angleLimits) {
   return true;
 }
 
+function connectionPopOrigin(metrics, hitT) {
+  const centerOrigin = clamp(hitT, 0, 1);
+  if (!metrics) return centerOrigin;
+  const startT = metrics.startT ?? metrics.edgeA / metrics.distance;
+  const endT = metrics.endT ?? 1 - metrics.edgeB / metrics.distance;
+  return clamp((centerOrigin - startT) / Math.max(endT - startT, 0.001), 0, 1);
+}
+
+export function getConnectionPopImpactTimes(
+  start,
+  hitT,
+  duration = CONNECTION_POP_DURATION,
+  a,
+  b,
+  rawSettings = DEFAULT_MATERIAL_SETTINGS,
+) {
+  const settings = enabledSettings(rawSettings);
+  const popA = a ? { ...a, radius: a.radius ?? a.r } : null;
+  const popB = b ? { ...b, radius: b.radius ?? b.r } : null;
+  const metrics = popA && popB ? bridgeMetrics(popA, popB, settings) : null;
+  const origin = connectionPopOrigin(metrics, hitT);
+  const ruptureStart = start + duration * CONNECTION_POP_RUPTURE_PROGRESS;
+  const travelDuration = duration * CONNECTION_POP_TRAVEL_PROGRESS;
+  return {
+    source: ruptureStart + origin * travelDuration,
+    target: ruptureStart + (1 - origin) * travelDuration,
+  };
+}
+
 export function drawFluidConnectionPop(ctx, a, b, rawSettings, pop, progress, fill) {
   const settings = enabledSettings(rawSettings ?? DEFAULT_MATERIAL_SETTINGS);
   const liveMetrics = bridgeMetrics(a, b, settings, pop.angleLimits);
@@ -507,36 +580,83 @@ export function drawFluidConnectionPop(ctx, a, b, rawSettings, pop, progress, fi
       uy: liveMetrics.uy,
       px: liveMetrics.px,
       py: liveMetrics.py,
+      startT: liveMetrics.edgeA / liveMetrics.distance,
+      endT: 1 - liveMetrics.edgeB / liveMetrics.distance,
       start: { ...liveMetrics.start },
       end: { ...liveMetrics.end },
     };
   }
   const particleMetrics = pop.particleMetrics;
-  const pressureProgress = clamp(progress / 0.34, 0, 1);
+  const burstOrigin = connectionPopOrigin(particleMetrics, pop.hitT ?? 0.5);
+  const originX = lerp(particleMetrics.start.x, particleMetrics.end.x, burstOrigin);
+  const originY = lerp(particleMetrics.start.y, particleMetrics.end.y, burstOrigin);
+  const pressureProgress = clamp(progress / 0.28, 0, 1);
   const pressure = Math.sin(pressureProgress * Math.PI);
-  const membraneAlpha = 1 - smoothstep((progress - 0.17) / 0.25);
   const inflatedSettings = {
     ...settings,
-    bridgeWidth: clamp(settings.bridgeWidth + pressure * 0.34, 0, 1),
+    bridgeWidth: clamp(settings.bridgeWidth + pressure * 0.22, 0, 1),
     flare: clamp(settings.flare + pressure * 0.08, -0.5, 1),
   };
 
   ctx.save();
   ctx.fillStyle = fill;
-  if (pressure > 0.01) {
-    ctx.globalAlpha = pressure * 0.22;
+  if (progress < CONNECTION_POP_RUPTURE_PROGRESS) {
+    ctx.globalAlpha = 1;
+    fillFluidBridge(ctx, a, b, inflatedSettings, pop.angleLimits);
+  }
+  if (pressure > 0.01 && progress < 0.22) {
+    ctx.globalAlpha = pressure * 0.18;
     fillFluidBridge(ctx, a, b, {
       ...inflatedSettings,
-      bridgeWidth: clamp(inflatedSettings.bridgeWidth + 0.24, 0, 1),
+      bridgeWidth: clamp(inflatedSettings.bridgeWidth + 0.18, 0, 1),
     }, pop.angleLimits);
   }
-  if (membraneAlpha > 0.01) {
-    ctx.globalAlpha = membraneAlpha;
-    fillFluidBridge(ctx, a, b, inflatedSettings, pop.angleLimits);
+
+  const localPulse = Math.sin(clamp(progress / 0.25, 0, 1) * Math.PI);
+  if (localPulse > 0.01) {
+    ctx.globalAlpha = localPulse * 0.34;
+    ctx.beginPath();
+    ctx.ellipse(
+      originX,
+      originY,
+      4 + localPulse * 13,
+      3 + localPulse * 6,
+      Math.atan2(particleMetrics.uy, particleMetrics.ux),
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+  }
+
+  if (progress >= CONNECTION_POP_RUPTURE_PROGRESS) {
+    const ruptureProgress = smoothstep(
+      (progress - CONNECTION_POP_RUPTURE_PROGRESS) / 0.5,
+    );
+    const segmentAlpha = 1 - smoothstep((progress - 0.7) / 0.24);
+    const headRadius = clamp(Math.min(a.radius, b.radius) * 0.045, 2.8, 4.8);
+    const sourceHeadT = lerp(burstOrigin, 0, ruptureProgress);
+    const targetHeadT = lerp(burstOrigin, 1, ruptureProgress);
+    const sourceHead = {
+      x: lerp(particleMetrics.start.x, particleMetrics.end.x, sourceHeadT),
+      y: lerp(particleMetrics.start.y, particleMetrics.end.y, sourceHeadT),
+      radius: headRadius,
+    };
+    const targetHead = {
+      x: lerp(particleMetrics.start.x, particleMetrics.end.x, targetHeadT),
+      y: lerp(particleMetrics.start.y, particleMetrics.end.y, targetHeadT),
+      radius: headRadius,
+    };
+    const retractSettings = {
+      ...settings,
+      bridgeWidth: clamp(settings.bridgeWidth + pressure * 0.12, 0, 1),
+      flare: settings.flare * (0.78 + (1 - ruptureProgress) * 0.22),
+    };
+    ctx.globalAlpha = segmentAlpha;
+    fillFluidBridge(ctx, a, sourceHead, retractSettings, pop.angleLimits);
+    fillFluidBridge(ctx, b, targetHead, retractSettings, pop.angleLimits);
   }
 
   const particleCount = clamp(Math.round(particleMetrics.distance / 26), 8, 17);
-  const burstOrigin = pop.hitT ?? 0.5;
   const seedBase = pop.seed ?? 1;
   const centerLength = Math.hypot(
     particleMetrics.end.x - particleMetrics.start.x,
@@ -547,7 +667,9 @@ export function drawFluidConnectionPop(ctx, a, b, rawSettings, pop, progress, fi
     const pathT = (index + 0.5) / particleCount;
     const seed = seededUnit(seedBase + index * 17.31);
     const seedB = seededUnit(seedBase + index * 43.77 + 11);
-    const delay = 0.13 + Math.abs(pathT - burstOrigin) * 0.06 + seed * 0.02;
+    const delay = CONNECTION_POP_RUPTURE_PROGRESS
+      + Math.abs(pathT - burstOrigin) * CONNECTION_POP_TRAVEL_PROGRESS
+      + seed * 0.015;
     const particleProgress = clamp((progress - delay) / 0.7, 0, 1);
     if (particleProgress <= 0 || particleProgress >= 1) continue;
 
@@ -578,15 +700,30 @@ export function drawFluidConnectionPop(ctx, a, b, rawSettings, pop, progress, fi
   ctx.restore();
 }
 
-export function withWobble(node, forceX = 1, forceY = 0, amplitude = 0.1) {
+export function withWobble(node, forceX = 1, forceY = 0, amplitude = 0.1, options = {}) {
   const length = Math.max(Math.hypot(forceX, forceY), 0.001);
+  const startAt = options.startAt ?? performance.now();
+  const pulse = {
+    startAt,
+    amplitude,
+    forceX: forceX / length,
+    forceY: forceY / length,
+    travel: options.travel ?? 0.18,
+  };
+  const existingPulses = options.append && Array.isArray(node.wobblePulses)
+    ? node.wobblePulses
+    : [];
+  const wobblePulses = [...existingPulses, pulse]
+    .sort((a, b) => a.startAt - b.startAt);
   return {
     ...node,
-    wobbleStart: performance.now(),
+    wobbleStart: wobblePulses[0].startAt,
+    wobbleEndAt: Math.max(...wobblePulses.map((item) => item.startAt + WOBBLE_DURATION)),
     wobbleAmplitude: amplitude,
     wobbleForceX: forceX / length,
     wobbleForceY: forceY / length,
-    wobbleTravel: 0.18,
+    wobbleTravel: options.travel ?? 0.18,
+    wobblePulses,
   };
 }
 
