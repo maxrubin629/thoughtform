@@ -57,6 +57,7 @@
 - Pressed Escape after a transformed selection and confirmed the active tool, selection set, drag box, and contextual toolbar all cleared without resetting the 116% zoom or `(50, 40)` pan.
 - Double-clicked empty canvas while rectangle selection was active and confirmed map history remained only `Opened map`; after exiting the mode, the same gesture created and selected `New thought` and added one `Added a freeform thought` history entry.
 - Repeated the selection pass in Nocturne and confirmed the active tool lives in its floating rail, the contextual toolbar uses the dark panel surface, and the same five selected lobes use the luminous exterior ring treatment.
+- Inspected the supplied 120 Hz recording frame by frame and confirmed the reported shake was a two-frame rewind: adjacent frames differed sharply while frames two apart nearly matched. Added and then moved a connected lobe into a crowded region after the fix; the graph advanced toward rest without alternating layouts, and the console remained clear.
 - Browser console warnings/errors checked after the final build: none.
 
 ## Comparison history
@@ -101,6 +102,11 @@
 
 - Finding: the canvas only supported one selected lobe, so removing several related thoughts required repeated actions and repeated history entries.
 - Fix: added an explicit marquee mode with transform-correct intersection testing, selected-lobe rings, a root-aware bulk trash action, one-step graph/history deletion, and deterministic Escape cancellation without changing ordinary canvas gesture arbitration.
+
+### Iteration 9
+
+- Finding: at high refresh rates, the physics loop could advance its node ref and then have a lagging React effect overwrite it with an older committed snapshot, producing a rapid two-layout oscillation after node creation or movement.
+- Fix: made physics and graph actions the sole writers of the authoritative node and edge refs. React state remains the rendered mirror and can no longer rewind a newer simulation frame.
 
 ## Follow-up polish
 

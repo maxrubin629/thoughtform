@@ -1124,8 +1124,9 @@ export function App() {
     ));
   };
 
-  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
-  useEffect(() => { edgesRef.current = edges; }, [edges]);
+  // Physics and graph actions update these refs before mirroring into React state.
+  // Syncing them back from a committed render can rewind a newer animation frame,
+  // which becomes a visible two-frame shake on high-refresh displays.
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
   useEffect(() => {
     let animationFrame;
