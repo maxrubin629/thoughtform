@@ -112,4 +112,44 @@
 
 - P3: the source image contains small, naturally irregular paint variations that are not deterministic in the live canvas. The implemented paper grain and fused geometry preserve the intended material character without compromising interaction clarity.
 
+## Pearlescent liquid shader QA
+
+### Comparison target
+
+- Source visual truth for Paper material: `designs/pearlescent-liquid-paper.png`
+- Implementation screenshot: `qa/pearlescent-paper-final.png`
+- Reference viewport: 1487 × 1058
+- State: Paper canvas, cluster view, root selected, WebGL2 material renderer active
+- Full-view comparison evidence: `qa/pearlescent-paper-final-comparison.jpg`
+- Focused material comparison evidence: `qa/pearlescent-paper-material-detail-comparison.jpg`
+- Nocturne regression evidence: `qa/pearlescent-nocturne-regression-comparison.jpg`
+
+### Fidelity findings
+
+- No actionable P0, P1, or P2 differences remain.
+- The reference governs material appearance only. Existing graph positions, lobe geometry, text, controls, and interaction anatomy intentionally remain unchanged.
+- The connected committed Paper material now reads as one pearlescent liquid surface: broad top-left cream highlights continue through lobes and fused stems, coral body color stays legible behind text, and the paper contact shadow is soft rather than card-like.
+- The multi-scale mask treatment removes visible shading seams at lobe/stem junctions while preserving the existing `Path2D` outline and hit-test geometry.
+- Ghost proposals remain matte on the crisp 2D overlay, with tethers below the committed material. Selection rings, text, controls, and proposal copy receive no shader distortion.
+- Paper typography, iconography, spacing, layout, and visible copy are unchanged from the existing design system. Nocturne continues to use its original Canvas2D material and dark chrome.
+
+### Rendering and interaction verification
+
+- Confirmed `data-material-renderer="webgl2"` in Paper and `data-material-renderer="canvas2d"` in Nocturne.
+- Measured the ambient sheen across two captures 1.2 seconds apart; the mean absolute pixel delta stayed below 0.2 per RGB channel, making the motion visible but deliberately subtle.
+- Enabled reduced motion and repeated the same capture test; the two screenshots were pixel-identical, confirming the ambient shader clock freezes.
+- Dragged the root lobe through spring settling and confirmed fused necks stretch with continuous highlights and no geometry change.
+- Panned and zoomed the live map, switched to hierarchy mode, created an unconnected freeform lobe, added a full long thought, and verified all text remained complete and crisp.
+- Exercised rectangle selection and Escape cancellation; eleven lobes received exterior selection rings without changing shader geometry or canvas gesture ownership.
+- Created a committed connection and popped it from the stem; growth, contact flare, rupture, and droplets all inherited the pearlescent material while preserving the existing causal clocks.
+- Verified the Canvas2D initialization fallback directly with an unavailable WebGL2 context. Forced a live `WEBGL_lose_context` event as well: the app switched to Canvas2D during loss and returned to WebGL2 after restoration with no warning or error logs.
+- Browser console warnings/errors after sustained interaction: none.
+
+### Comparison history
+
+- Initial finding: the first shader pass was too matte, the main highlight was too narrow, and the paper shadow was heavier than the selected pearlescent reference.
+- Fix: raised diffuse fill, added a broader pearlescent shoulder around the top-left highlight, and softened contact-shadow opacity.
+- Post-fix evidence: `qa/pearlescent-paper-final-comparison.jpg` and `qa/pearlescent-paper-material-detail-comparison.jpg`.
+- P3: the generated reference uses painterly, non-deterministic micro-variation. The live procedural sheen is intentionally restrained so text and interaction feedback remain stable.
+
 final result: passed

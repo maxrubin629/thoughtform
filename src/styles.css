@@ -84,16 +84,35 @@ button:disabled {
 }
 
 .map-shell canvas {
-  cursor: grab;
+  pointer-events: none;
   touch-action: none;
 }
 
-.map-shell canvas:active {
+.map-underlay-canvas {
+  z-index: 0;
+}
+
+.material-shader-canvas {
+  z-index: 1;
+  opacity: 0;
+}
+
+.material-shader-canvas.is-active {
+  opacity: 1;
+}
+
+.map-shell .map-interaction-canvas {
+  z-index: 2;
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.map-shell .map-interaction-canvas:active {
   cursor: grabbing;
 }
 
-.map-shell.is-marquee canvas,
-.map-shell.is-marquee canvas:active {
+.map-shell.is-marquee .map-interaction-canvas,
+.map-shell.is-marquee .map-interaction-canvas:active {
   cursor: crosshair;
 }
 
