@@ -7,10 +7,15 @@ async function post(path, body) {
       body: JSON.stringify(body),
     });
   } catch {
-    throw new Error("AI server is not running (npm run server)");
+    throw new Error("AI server is unavailable — restart npm run dev");
   }
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(data?.error ?? `AI server error (${response.status})`);
+  if (!response.ok) {
+    if (response.status >= 500 && !data?.error) {
+      throw new Error("AI server is unavailable — restart npm run dev");
+    }
+    throw new Error(data?.error ?? `AI server error (${response.status})`);
+  }
   return data;
 }
 
