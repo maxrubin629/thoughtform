@@ -45,5 +45,8 @@ function stop(exitCode = 0) {
 process.once("SIGINT", () => stop(0));
 process.once("SIGTERM", () => stop(0));
 
-start("api", ["--watch", "--env-file-if-exists=.env", "server/index.mjs"]);
+// Keep the API process stable in the combined launcher. Node's recursive watch
+// mode can exhaust macOS file descriptors in larger workspaces (EMFILE), while
+// Vite already owns the frontend watch loop.
+start("api", ["--env-file-if-exists=.env", "server/index.mjs"]);
 start("vite", ["node_modules/vite/bin/vite.js"]);
