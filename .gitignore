@@ -3,3 +3,4 @@ dist/
 .npm-cache/
 .DS_Store
 qa/
+.env

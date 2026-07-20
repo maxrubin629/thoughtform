@@ -60,6 +60,8 @@ import {
   initialNodes,
   voiceThoughts,
 } from "./mapData.js";
+import { serializeGraph } from "./graphContext.js";
+import { requestCompanion, requestDictation, requestProposals, requestSynthesis } from "./aiClient.js";
 
 const initialFluidEdges = captureFluidRestLengths(initialNodes, initialEdges, { reset: true });
 const MIN_ZOOM = 0.72;
@@ -225,6 +227,92 @@ function drawWobblyCircle(ctx, node) {
     else ctx.lineTo(x, y);
   }
   ctx.closePath();
+}
+
+function auraSeed(id) {
+  return [...String(id)].reduce(
+    (value, character) => ((value * 31) + character.charCodeAt(0)) >>> 0,
+    17,
+  );
+}
+
+function fluidAuraPath(node, gap, phase) {
+  const points = 28;
+  const radiusX = node.radiusX ?? node.radius ?? node.r;
+  const radiusY = node.radiusY ?? node.radius ?? node.r;
+  const rotation = node.rotation ?? 0;
+  const path = new Path2D();
+  const samples = [];
+
+  for (let index = 0; index < points; index += 1) {
+    const angle = (index / points) * Math.PI * 2;
+    const drift = Math.sin(angle * 3 + phase) * gap * 0.22
+      + Math.sin(angle * 5 - phase * 0.72) * gap * 0.11;
+    const localX = Math.cos(angle) * (radiusX + gap + drift);
+    const localY = Math.sin(angle) * (radiusY + gap + drift * 0.8);
+    samples.push({
+      x: node.x + localX * Math.cos(rotation) - localY * Math.sin(rotation),
+      y: node.y + localX * Math.sin(rotation) + localY * Math.cos(rotation),
+    });
+  }
+
+  const midpoint = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const start = midpoint(samples[points - 1], samples[0]);
+  path.moveTo(start.x, start.y);
+  samples.forEach((point, index) => {
+    const next = samples[(index + 1) % points];
+    const end = midpoint(point, next);
+    path.quadraticCurveTo(point.x, point.y, end.x, end.y);
+  });
+  path.closePath();
+  return path;
+}
+
+function drawHoverGlow(ctx, node, concept, scale) {
+  const seed = auraSeed(node.id);
+  const phase = seed * 0.019;
+  const gap = 3.5 / scale;
+  const path = fluidAuraPath(node, gap, phase);
+  const colors = concept === "nocturne"
+    ? {
+      bloom: "rgba(255, 102, 72, 0.58)",
+      light: "rgba(255, 188, 151, 0.72)",
+    }
+    : {
+      bloom: "rgba(230, 106, 78, 0.34)",
+      light: "rgba(255, 229, 202, 0.76)",
+    };
+
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.globalAlpha = concept === "nocturne" ? 0.5 : 0.34;
+  ctx.shadowColor = colors.bloom;
+  ctx.shadowBlur = 22 / scale;
+  ctx.strokeStyle = colors.bloom;
+  ctx.lineWidth = 18 / scale;
+  ctx.stroke(path);
+
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = concept === "nocturne" ? 0.3 : 0.22;
+  ctx.strokeStyle = colors.light;
+  ctx.lineWidth = 8 / scale;
+  ctx.stroke(path);
+  ctx.restore();
+}
+
+function drawSelectionContour(ctx, node, concept, scale) {
+  const radiusX = (node.radiusX ?? node.radius ?? node.r) + 7 / scale;
+  const radiusY = (node.radiusY ?? node.radius ?? node.r) + 7 / scale;
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(node.x, node.y, radiusX, radiusY, node.rotation ?? 0, 0, Math.PI * 2);
+  ctx.lineWidth = 2 / scale;
+  ctx.strokeStyle = concept === "nocturne"
+    ? "rgba(255, 181, 158, 0.94)"
+    : "rgba(132, 59, 45, 0.9)";
+  ctx.stroke();
+  ctx.restore();
 }
 
 function boundaryRadius(node, angle) {
@@ -453,6 +541,7 @@ export function MindMap({
   const [textureReady, setTextureReady] = useState(false);
   const [shaderAvailable, setShaderAvailable] = useState(false);
   const [marqueeRect, setMarqueeRect] = useState(null);
+  const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const palette = palettes[concept];
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const focusIds = useMemo(() => getFocusIds(focusId, edges), [edges, focusId]);
@@ -477,7 +566,10 @@ export function MindMap({
   }, []);
 
   useEffect(() => {
-    if (marqueeActive) return;
+    if (marqueeActive) {
+      setHoveredNodeId(null);
+      return;
+    }
     if (dragRef.current?.type === "marquee") dragRef.current = null;
     setMarqueeRect(null);
   }, [marqueeActive]);
@@ -716,14 +808,7 @@ export function MindMap({
       renderedNodes.forEach((node) => {
         if (!selectedIdSet.has(node.id)) return;
         const visual = visualNodes.get(node.id) ?? node;
-        context.save();
-        context.beginPath();
-        context.arc(visual.x, visual.y, visual.r + 7 / transform.scale, 0, Math.PI * 2);
-        context.setLineDash([5 / transform.scale, 4 / transform.scale]);
-        context.lineWidth = 2 / transform.scale;
-        context.strokeStyle = concept === "nocturne" ? "rgba(255, 181, 158, 0.94)" : "rgba(132, 59, 45, 0.9)";
-        context.stroke();
-        context.restore();
+        drawSelectionContour(context, visual, concept, transform.scale);
       });
 
       const connecting = visualNodes.get(connectFromId);
@@ -767,6 +852,10 @@ export function MindMap({
       if (concept === "paper") {
         beginWorld(underlayCtx, dpr);
         drawTethers(underlayCtx, visualNodes);
+        const hoveredNode = visualNodes.get(hoveredNodeId);
+        if (hoveredNode && !marqueeActive) {
+          drawHoverGlow(underlayCtx, hoveredNode, concept, transform.scale);
+        }
 
         if (paperShaderActive) {
           underlayCtx.restore();
@@ -808,6 +897,10 @@ export function MindMap({
           ctx.arc(root.x, root.y, root.r * 1.48, 0, Math.PI * 2);
           ctx.fill();
         }
+        const hoveredNode = visualNodes.get(hoveredNodeId);
+        if (hoveredNode && !marqueeActive) {
+          drawHoverGlow(ctx, hoveredNode, concept, transform.scale);
+        }
         drawCommittedMaterial(ctx, visualNodes, now);
         drawConnectionPops(ctx, visualNodes, now);
         drawGhostsSelectionAndText(ctx, visualNodes);
@@ -828,6 +921,8 @@ export function MindMap({
     concept,
     connectFromId,
     fontReady,
+    hoveredNodeId,
+    marqueeActive,
     palette,
     reducedMotion,
     renderedEdges,
@@ -1006,7 +1101,13 @@ export function MindMap({
       });
     }
     const drag = dragRef.current;
-    if (!drag) return;
+    if (!drag) {
+      if (event.pointerType !== "touch" && !marqueeActive) {
+        const hovered = hitNode(screenToWorld(event.clientX, event.clientY));
+        setHoveredNodeId((current) => current === hovered?.id ? current : hovered?.id ?? null);
+      }
+      return;
+    }
     if (drag.type === "touch-gesture") {
       const touches = touchPointers();
       if (touches.length < 2) return;
@@ -1108,7 +1209,17 @@ export function MindMap({
       if (event.type === "pointercancel") onMoveCancel(drag.id);
       else onMoveEnd(drag.id, drag.vx, drag.vy, drag.moved);
     }
+    if (event.pointerType !== "touch") {
+      const hovered = event.type === "pointercancel"
+        ? null
+        : hitNode(screenToWorld(event.clientX, event.clientY));
+      setHoveredNodeId(hovered?.id ?? null);
+    }
     dragRef.current = null;
+  };
+
+  const handlePointerLeave = () => {
+    if (!dragRef.current) setHoveredNodeId(null);
   };
 
   const handleDoubleClick = (event) => {
@@ -1166,6 +1277,7 @@ export function MindMap({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerEnd}
         onPointerCancel={handlePointerEnd}
+        onPointerLeave={handlePointerLeave}
         onDoubleClick={handleDoubleClick}
       />
 
@@ -1254,6 +1366,16 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [aiQuery, setAiQuery] = useState("");
   const [aiMode, setAiMode] = useState("quiet");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiActivity, setAiActivity] = useState("");
+  const aiModeRef = useRef("quiet");
+  const lastProactiveAtRef = useRef(0);
+  const [synthesis, setSynthesis] = useState("This map explores a private, voice-first thinking space where complete thoughts become flexible structure. AI helps surface connections and alternative framings, but every change remains yours to accept.");
+  const [synthesisBusy, setSynthesisBusy] = useState(false);
+  const [companion, setCompanion] = useState({
+    line: "Keep going, this is getting interesting…",
+    followup: "What if we explored the flow a bit more?",
+  });
   const [viewMode, setViewMode] = useState("clusters");
   const viewModeRef = useRef(viewMode);
   const [zoom, setZoom] = useState(1);
@@ -1261,13 +1383,19 @@ export function App() {
   const [showSuggestions, setShowSuggestions] = useState(true);
   const [showProvenance, setShowProvenance] = useState(false);
   const [showPrivateIsland, setShowPrivateIsland] = useState(true);
-  const [reducedMotion, setReducedMotion] = useState(false);
+  const [reducedMotion, setReducedMotion] = useState(
+    () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+  );
   const [focusId, setFocusId] = useState(null);
   const [connectFromId, setConnectFromId] = useState(null);
   const [favorite, setFavorite] = useState(true);
   const [listening, setListening] = useState(false);
   const [seconds, setSeconds] = useState(0);
   const [voiceIndex, setVoiceIndex] = useState(0);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [distilling, setDistilling] = useState(false);
+  const recognitionRef = useRef(null);
+  const transcriptRef = useRef("");
   const [toast, setToast] = useState("");
   const [history, setHistory] = useState(() => [{
     label: "Opened map",
@@ -1296,6 +1424,7 @@ export function App() {
   // Syncing them back from a committed render can rewind a newer animation frame,
   // which becomes a visible two-frame shake on high-refresh displays.
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
+  useEffect(() => { aiModeRef.current = aiMode; }, [aiMode]);
   useEffect(() => {
     let animationFrame;
     let lastTime = performance.now();
@@ -1397,6 +1526,10 @@ export function App() {
   useEffect(() => {
     const handleKeyDown = (event) => {
       if (event.key === "Escape") {
+        if (listening) {
+          cancelVoice();
+          return;
+        }
         setActivePanel(null);
         setConnectFromId(null);
         if (marqueeActive) {
@@ -1425,7 +1558,7 @@ export function App() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [history, historyIndex, marqueeActive, selectedId, selectedIds]);
+  }, [history, historyIndex, listening, marqueeActive, selectedId, selectedIds]);
 
   const togglePanel = (panel) => {
     if (marqueeActive) {
@@ -1539,7 +1672,7 @@ export function App() {
     const nextEdges = [...edgesRef.current, edge];
     applyGraph(nextNodes, nextEdges, options.ghost ? "AI proposed a thought" : "Added a thought");
     if (viewMode === "clusters") organicPositionsRef.current.set(id, { x: node.x, y: node.y });
-    selectOne(id);
+    if (!options.quiet) selectOne(id);
     if (options.ghost) setShowSuggestions(true);
     return id;
   };
@@ -1605,20 +1738,110 @@ export function App() {
     setComposerValue("");
   };
 
-  const createSuggestion = (prompt = aiQuery) => {
+  const createSuggestion = async (prompt = aiQuery) => {
     const text = prompt.trim();
-    if (!text) return;
+    if (!text || aiBusy) return;
     const parentId = selected && !selected.ghost ? selected.id : "root";
-    addThought(text, parentId, { ghost: true, provenance: "AI suggestion" });
     setAiQuery("");
     setActivePanel(null);
-    showToast("AI suggestion added for review");
+    setAiBusy(true);
+    setAiActivity("Sketching proposals…");
+    try {
+      const proposals = await requestProposals({
+        graph: serializeGraph(nodesRef.current, edgesRef.current),
+        prompt: text,
+        selectedId: parentId,
+      });
+      if (!proposals.length) {
+        showToast("The map already covers that — no proposals");
+        return;
+      }
+      proposals.forEach((proposal) => {
+        addThought(proposal.text, proposal.parent_id, {
+          ghost: true,
+          provenance: `GPT-5.6 · ${proposal.reason}`,
+        });
+      });
+      showToast(proposals.length === 1 ? "1 proposal ready for review" : `${proposals.length} proposals ready for review`);
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setAiBusy(false);
+      setAiActivity("");
+    }
   };
+
+  const refreshSynthesis = async () => {
+    if (synthesisBusy) return;
+    setSynthesisBusy(true);
+    setAiActivity("Synthesizing the map…");
+    try {
+      setSynthesis(await requestSynthesis(serializeGraph(nodesRef.current, edgesRef.current)));
+      showToast("Synthesis refreshed from the current map");
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setSynthesisBusy(false);
+      setAiActivity("");
+    }
+  };
+
+  // Nocturne's ambient caption reads the actual map instead of a canned line.
+  // Refreshes quietly after edits settle; failures keep the last good caption.
+  useEffect(() => {
+    if (concept !== "nocturne") return undefined;
+    const timer = window.setTimeout(async () => {
+      try {
+        const next = await requestCompanion(serializeGraph(nodesRef.current, edgesRef.current));
+        if (next?.line && next?.followup) setCompanion(next);
+      } catch {
+        // Ambient copy is not worth an error toast.
+      }
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [concept, historyIndex]);
+
+  // Proactive mode: after the map settles, quietly sketch one ghost branch.
+  // Never more than one pending at a time, and never touch the user's selection.
+  useEffect(() => {
+    if (aiMode !== "proactive" || aiBusy || listening) return undefined;
+    if (nodesRef.current.some((node) => node.ghost)) return undefined;
+    const wait = Math.max(7000, lastProactiveAtRef.current + 25000 - Date.now());
+    const timer = window.setTimeout(async () => {
+      if (aiModeRef.current !== "proactive" || document.hidden) return;
+      if (nodesRef.current.some((node) => node.ghost)) return;
+      lastProactiveAtRef.current = Date.now();
+      setAiBusy(true);
+      setAiActivity("Noticing where you're heading…");
+      try {
+        const proposals = await requestProposals({
+          graph: serializeGraph(nodesRef.current, edgesRef.current),
+          prompt: "Offer one gentle branch the thinker seems to be circling but has not written down yet.",
+          selectedId: "root",
+        });
+        const proposal = proposals[0];
+        if (proposal && aiModeRef.current === "proactive") {
+          addThought(proposal.text, proposal.parent_id, {
+            ghost: true,
+            quiet: true,
+            provenance: `GPT-5.6 · ${proposal.reason}`,
+          });
+          showToast("AI sketched a branch — review when ready");
+        }
+      } catch {
+        // Proactive suggestions fail silently; asking directly surfaces errors.
+      } finally {
+        setAiBusy(false);
+        setAiActivity("");
+      }
+    }, wait);
+    return () => window.clearTimeout(timer);
+  }, [aiMode, aiBusy, historyIndex, listening]);
 
   const acceptGhost = (id) => {
     const createdAt = performance.now();
     const nextNodes = nodesRef.current.map((node) => node.id === id
-      ? { ...node, ghost: false, provenance: "AI suggestion · accepted", createdAt }
+      ? { ...node, ghost: false, provenance: `${node.provenance ?? "AI suggestion"} · accepted`, createdAt }
       : node);
     const nextEdges = edgesRef.current.map((edge) => edge.to === id
       ? { ...edge, ghost: false, createdAt }
@@ -1776,19 +1999,96 @@ export function App() {
     showToast("Connection popped");
   };
 
+  const finishDictation = async (transcript) => {
+    const text = transcript.trim();
+    if (!text) {
+      setDistilling(false);
+      setLiveTranscript("");
+      showToast("Didn't catch anything — try again closer to the mic");
+      return;
+    }
+    const parentId = selected && !selected.ghost ? selected.id : "root";
+    try {
+      const thought = await requestDictation(text);
+      addThought(thought, parentId, { provenance: "Voice · GPT-5.6 dictation" });
+      showToast("Complete thought added to the map");
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setDistilling(false);
+      setLiveTranscript("");
+    }
+  };
+
+  const cancelVoice = () => {
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    recognition?.stop();
+    transcriptRef.current = "";
+    setListening(false);
+    setLiveTranscript("");
+    showToast("Voice capture discarded");
+  };
+
   const toggleVoice = () => {
+    const SpeechRecognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!listening) {
       setSeconds(0);
+      transcriptRef.current = "";
+      setLiveTranscript("");
+      if (!SpeechRecognition) {
+        setListening(true);
+        showToast("Speech recognition unsupported in this browser — using canned voice");
+        return;
+      }
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = navigator.language || "en-US";
+      recognition.onresult = (event) => {
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          if (result.isFinal) transcriptRef.current += `${result[0].transcript} `;
+          else interim += result[0].transcript;
+        }
+        setLiveTranscript(`${transcriptRef.current}${interim}`.trim());
+      };
+      recognition.onerror = (event) => {
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+          recognitionRef.current = null;
+          setListening(false);
+          showToast("Microphone blocked — allow mic access for this site and retry");
+        } else if (event.error !== "no-speech" && event.error !== "aborted") {
+          showToast(`Voice error: ${event.error}`);
+        }
+      };
+      // Chrome ends recognition after a silence gap; restart until the user finishes.
+      recognition.onend = () => {
+        if (recognitionRef.current === recognition) recognition.start();
+      };
+      recognitionRef.current = recognition;
+      recognition.start();
       setListening(true);
       showToast("Listening for a complete thought…");
       return;
     }
     setListening(false);
-    const text = voiceThoughts[voiceIndex % voiceThoughts.length];
-    const parentId = selected && !selected.ghost ? selected.id : "root";
-    addThought(text, parentId, { provenance: "Voice · complete thought" });
-    setVoiceIndex((value) => value + 1);
-    showToast("Complete thought added to the map");
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    if (!recognition) {
+      const text = voiceThoughts[voiceIndex % voiceThoughts.length];
+      const parentId = selected && !selected.ghost ? selected.id : "root";
+      addThought(text, parentId, { provenance: "Voice · complete thought" });
+      setVoiceIndex((value) => value + 1);
+      showToast("Complete thought added to the map");
+      return;
+    }
+    recognition.onend = () => {
+      setDistilling(true);
+      finishDictation(transcriptRef.current);
+    };
+    recognition.stop();
   };
 
   const changeLayout = (nextMode) => {
@@ -1891,19 +2191,28 @@ export function App() {
         <>
           <div className="segmented-control" aria-label="AI presence">
             <button type="button" className={aiMode === "quiet" ? "is-active" : ""} onClick={() => setAiMode("quiet")}>Quiet</button>
-            <button type="button" className={aiMode === "proactive" ? "is-active" : ""} onClick={() => setAiMode("proactive")}>Proactive</button>
+            <button
+              type="button"
+              className={aiMode === "proactive" ? "is-active" : ""}
+              onClick={() => {
+                if (aiMode !== "proactive") showToast("Proactive on — ghost branches appear as you think");
+                setAiMode("proactive");
+              }}
+            >
+              Proactive
+            </button>
           </div>
           <p className="panel-description">
             {aiMode === "quiet" ? "AI waits until you ask, then proposes changes for review." : "AI surfaces occasional ghost branches while you think."}
           </p>
           <div className="prompt-list">
             {aiPrompts.map((prompt) => (
-              <button type="button" key={prompt} onClick={() => createSuggestion(prompt)}><IconBulb /><span>{prompt}</span><IconArrowRight /></button>
+              <button type="button" key={prompt} disabled={aiBusy} onClick={() => createSuggestion(prompt)}><IconBulb /><span>{prompt}</span><IconArrowRight /></button>
             ))}
           </div>
           <form className="ask-form" onSubmit={(event) => { event.preventDefault(); createSuggestion(); }}>
             <input value={aiQuery} onChange={(event) => setAiQuery(event.target.value)} placeholder="Ask the map…" />
-            <IconButton type="submit" label="Send question" disabled={!aiQuery.trim()}><IconSend /></IconButton>
+            <IconButton type="submit" label="Send question" disabled={!aiQuery.trim() || aiBusy}><IconSend /></IconButton>
           </form>
         </>
       );
@@ -1926,9 +2235,9 @@ export function App() {
           <div className="map-stats"><span><strong>{committedCount}</strong><small>Thoughts</small></span><span><strong>{edges.filter((edge) => !edge.ghost).length}</strong><small>Links</small></span><span><strong>{suggestionCount}</strong><small>Proposals</small></span></div>
           <article className="synthesis-card">
             <div><span>Working synthesis</span><IconMessageCircle /></div>
-            <p>This map explores a private, voice-first thinking space where complete thoughts become flexible structure. AI helps surface connections and alternative framings, but every change remains yours to accept.</p>
+            <p>{synthesis}</p>
           </article>
-          <button type="button" className="wide-action" onClick={() => showToast("Synthesis refreshed from the current map")}><IconSparkles /><span>Refresh synthesis</span></button>
+          <button type="button" className="wide-action" disabled={synthesisBusy} onClick={refreshSynthesis}><IconSparkles /><span>{synthesisBusy ? "Synthesizing…" : "Refresh synthesis"}</span></button>
         </>
       );
     }
@@ -1947,7 +2256,7 @@ export function App() {
           <ToggleRow label="Complete-thought detection" description="Create nodes at semantic turn boundaries" checked onChange={() => {}} disabled />
           <ToggleRow label="Reduced motion" description="Remove lobe wobble and pulse animation" checked={reducedMotion} onChange={setReducedMotion} />
           <ToggleRow label="Show AI proposals" description="Keep pending changes visible on the canvas" checked={showSuggestions} onChange={setShowSuggestions} />
-          <div className="panel-note"><IconAdjustments /><span>Voice states mirror semantic turn detection; live audio and model calls are intentionally mocked in this frontend prototype.</span></div>
+          <div className="panel-note"><IconAdjustments /><span>Proposals, synthesis, dictation, and the nocturne companion route through the local AI server. Voice uses the browser's speech recognition (Chrome/Edge recommended).</span></div>
         </>
       );
     }
@@ -2006,7 +2315,15 @@ export function App() {
         {concept === "nocturne" && (
           <>
             <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={toggleMarquee} testId="marquee-tool"><IconMarquee /></IconButton>
-            <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
+            <IconButton
+              label={suggestionCount ? `Ask AI · ${suggestionCount} ${suggestionCount === 1 ? "proposal" : "proposals"} waiting` : "Ask AI"}
+              active={activePanel === "ai"}
+              onClick={() => togglePanel("ai")}
+              testId="ai-tool"
+            >
+              <IconSparkles />
+              {suggestionCount > 0 && <i className="tool-pip">{suggestionCount}</i>}
+            </IconButton>
             <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconHierarchy2 /></IconButton>
           </>
         )}
@@ -2025,7 +2342,15 @@ export function App() {
       {concept === "paper" && (
         <div className="top-dock" aria-label="Canvas modes">
           <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={toggleMarquee} testId="marquee-tool"><IconMarquee /></IconButton>
-          <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
+          <IconButton
+            label={suggestionCount ? `Ask AI · ${suggestionCount} ${suggestionCount === 1 ? "proposal" : "proposals"} waiting` : "Ask AI"}
+            active={activePanel === "ai"}
+            onClick={() => togglePanel("ai")}
+            testId="ai-tool"
+          >
+            <IconSparkles />
+            {suggestionCount > 0 && <i className="tool-pip">{suggestionCount}</i>}
+          </IconButton>
           <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconAffiliate /></IconButton>
           <IconButton label="Map overview and synthesis" active={activePanel === "overview"} onClick={() => togglePanel("overview")} testId="overview-tool"><IconGridDots /></IconButton>
           <IconButton label="Layers" active={activePanel === "layers"} onClick={() => togglePanel("layers")} testId="layers-tool"><IconStack2 /></IconButton>
@@ -2062,18 +2387,25 @@ export function App() {
         </FloatingPanel>
       )}
 
-      {listening && (
-        <div className="voice-caption" role="status" aria-live="polite">
+      {(listening || distilling) && (
+        <div className={`voice-caption ${distilling && !listening ? "is-distilling" : ""}`} role="status" aria-live="polite">
           <span />
-          <p>Listening for a complete thought…</p>
-          <small>{voiceThoughts[voiceIndex % voiceThoughts.length]}</small>
+          <p>{listening ? "Listening for a complete thought…" : "Distilling into a complete thought…"}</p>
+          <small>{liveTranscript || (listening ? "Waiting for your voice…" : "One moment…")}</small>
         </div>
       )}
 
-      {concept === "nocturne" && !listening && (
+      {aiActivity && !listening && !distilling && (
+        <div className="ai-status" role="status" aria-live="polite">
+          <IconSparkles />
+          <span>{aiActivity}</span>
+        </div>
+      )}
+
+      {concept === "nocturne" && !listening && !distilling && (
         <div className="nocturne-companion-caption" aria-label="AI companion prompt">
-          <p><span />Keep going, this is getting interesting…</p>
-          <small>What if we explored the flow a bit more?</small>
+          <p><span />{companion.line}</p>
+          <small>{companion.followup}</small>
         </div>
       )}
 

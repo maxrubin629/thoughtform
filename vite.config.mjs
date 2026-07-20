@@ -8,6 +8,9 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     allowedHosts: ["terminal.local"],
+    proxy: {
+      "/api": "http://localhost:8787",
+    },
     warmup: {
       clientFiles: ["./src/main.jsx"],
     },
