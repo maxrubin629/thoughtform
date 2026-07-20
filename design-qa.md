@@ -153,3 +153,66 @@
 - P3: the generated reference uses painterly, non-deterministic micro-variation. The live procedural sheen is intentionally restrained so text and interaction feedback remain stable.
 
 final result: passed
+
+## Restrained 2.5D liquid material QA
+
+### Comparison target
+
+- Source visual truth for Paper material: `designs/organic-paper-studio.png`
+- Initial implementation screenshot: `qa/flat-liquid-paper-initial.png`
+- Reference viewport: 1487 × 1058
+- State: Paper canvas, cluster view, root selected, WebGL2 flat-surface renderer active
+- Initial full-view comparison evidence: `qa/flat-liquid-paper-initial-comparison.jpg`
+- Focused comparison: not yet captured because the post-fix browser reload was blocked
+
+### Findings
+
+- [P2] Initial coral was too muted and brown relative to the prior Paper reference. The flat surface direction was correct, but the color lost the reference's warm coral clarity.
+- [P2] The first undershadow was broader than the requested small contrast cue and made some lobes read as lifted objects rather than flat material.
+- Typography, spacing, layout, iconography, copy, ghost proposals, and graph anatomy remained unchanged by scope. The initial browser capture showed no warning or error logs.
+
+### Comparison history
+
+- Initial fix applied: removed all normal-derived lighting, bright rims, specular highlights, subsurface variation, and ambient material animation while preserving the shared coverage texture and physical geometry.
+- Follow-up fix applied: restored brighter coral channel balance and changed the shadow from a broad halo to a tighter, lower-opacity down-right undershadow.
+- Motion-coherence refinement applied: added a separate local motion texture driven by the existing lobe velocity and deformation state. It produces only a faint warm stretched/leading edge and slightly darker compressed/trailing edge, fades with the physical motion, and is forced to zero under reduced motion. The resting shader still has no time input, normal-map lighting, rim, or internal highlight.
+- Post-fix evidence is missing. The in-app browser rejected reload and screenshot access to the local-network preview URL after the follow-up change, so the final color and shadow adjustment could not be honestly compared.
+
+### Verification status
+
+- `npm run build` passes.
+- `git diff --check` passes.
+- Interaction code, physics constants, geometry, hit-testing, Nocturne rendering, ghost proposals, text, and controls were not changed. The only interaction-state additions are transient visual velocity fields used by the Paper shader.
+- Blocking next check: capture the revised Paper canvas at rest and during a drag/settle at 1487 × 1058, compare the resting state with `designs/organic-paper-studio.png`, confirm the motion cue disappears fully at rest and under reduced motion, and rerun the interaction/console smoke test.
+
+final result: blocked
+
+## Uniform Paper material and conversation-first session QA
+
+### Comparison targets
+
+- Paper source visual truth: `designs/organic-paper-studio.png`
+- Standard-mode implementation: `qa/session-port-standard.png`
+- Session proposal review state: `qa/session-mode-proposal.png`
+- Preview routes: `/` for the unchanged standard experience and `/?mode=session` for the conversation-first session
+
+### Visual findings
+
+- All committed Paper lobes and fused stems use the same original coral `#f78269`. The live Canvas2D fallback and WebGL2 coverage/albedo path no longer vary the base material by depth, horizontal position, or lobe size.
+- The session curator uses the normal Paper proposal language: matte dashed coral ghost tethers on the canvas, a dashed warm ghost review surface, the same sparkle badge, and the same circular green accept / coral dismiss controls.
+- The curator remains an internal orchestration role only. Proposal headers, accepted-proposal history, and all curator-authored activity entries render under the single user-facing identity `Partner`, using the same visual treatment as realtime-partner activity.
+- Session bubbles reuse the Paper material, geometry, physics, text renderer, node actions, zoom controls, and fused-stem interactions. The standard route remains the existing application.
+- Follow-up evidence: `qa/session-sidebar-kept.png`. The expanded shared Paper rail remains, while the rejected extra ghost-lobe layer was removed; session proposals are again limited to direct matte ghost tethers plus the evidence review card.
+
+### Session contract verification
+
+- Committed a multi-clause utterance and confirmed the transcript retained the complete text while condensation produced three bubbles with exact contiguous character spans.
+- Repeated an existing idea and confirmed its bubble warmed and enlarged without a duplicate; the reversible map history and activity record attributed that revision to `partner`.
+- Selected one bubble and confirmed provenance marked only that bubble's recorded source span inside the full utterance.
+- Started voice capture and observed partial words only in the live caption; no transcript or map entry appeared until the complete voice turn committed.
+- Generated curator proposals, confirmed rationale, transcript evidence, and source map revision were present, then accepted a two-link proposal and confirmed the links used the requested 160 ms stagger. Undo removed the map change without changing the transcript; redo remained available.
+- Proposal rebasing drops missing endpoints, already-live links, self-links, and reversed duplicates; an empty rebase reports the proposal as stale.
+- Static contract checks confirmed condensation never exceeds three ideas, stored spans round-trip to the source text, bubble radius is independent of label length, and duplicate proposal operations collapse to one valid operation.
+- Production build and `git diff --check` pass. The live browser console contains no warnings or errors after standard and session interaction passes.
+
+final result: passed

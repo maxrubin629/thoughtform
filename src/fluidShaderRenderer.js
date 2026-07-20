@@ -45,96 +45,65 @@ precision highp float;
 uniform sampler2D uSource;
 uniform sampler2D uSoft;
 uniform sampler2D uBroad;
+uniform sampler2D uMotion;
 uniform vec2 uResolution;
 uniform vec2 uSoftTexel;
-uniform vec2 uBroadTexel;
-uniform float uTime;
 
 in vec2 vUv;
 out vec4 outColor;
 
-float hash21(vec2 point) {
-  point = fract(point * vec2(123.34, 456.21));
-  point += dot(point, point + 45.32);
-  return fract(point.x * point.y);
-}
-
-float valueNoise(vec2 point) {
-  vec2 cell = floor(point);
-  vec2 local = fract(point);
-  local = local * local * (3.0 - 2.0 * local);
-  float a = hash21(cell);
-  float b = hash21(cell + vec2(1.0, 0.0));
-  float c = hash21(cell + vec2(0.0, 1.0));
-  float d = hash21(cell + vec2(1.0, 1.0));
-  return mix(mix(a, b, local.x), mix(c, d, local.x), local.y);
-}
-
 void main() {
   vec4 source = texture(uSource, vUv);
   float coverage = source.a;
-  float soft = texture(uSoft, vUv).a;
-  float broad = texture(uBroad, vUv).a;
+  float depthTone = smoothstep(0.5, 0.69, source.g);
+  vec3 flatColor = source.rgb + vec3(
+    mix(0.15, 0.10, depthTone),
+    mix(-0.065, 0.025, depthTone),
+    mix(-0.025, 0.02, depthTone)
+  );
+  flatColor = clamp(flatColor, 0.0, 1.0);
 
-  float softLeft = texture(uSoft, vUv - vec2(uSoftTexel.x * 1.45, 0.0)).a;
-  float softRight = texture(uSoft, vUv + vec2(uSoftTexel.x * 1.45, 0.0)).a;
-  float softDown = texture(uSoft, vUv - vec2(0.0, uSoftTexel.y * 1.45)).a;
-  float softUp = texture(uSoft, vUv + vec2(0.0, uSoftTexel.y * 1.45)).a;
-  float broadLeft = texture(uBroad, vUv - vec2(uBroadTexel.x * 1.1, 0.0)).a;
-  float broadRight = texture(uBroad, vUv + vec2(uBroadTexel.x * 1.1, 0.0)).a;
-  float broadDown = texture(uBroad, vUv - vec2(0.0, uBroadTexel.y * 1.1)).a;
-  float broadUp = texture(uBroad, vUv + vec2(0.0, uBroadTexel.y * 1.1)).a;
+  vec4 motion = texture(uMotion, vUv);
+  float motionStrength = motion.a;
+  vec2 motionDirection = vec2(
+    motion.r * 2.0 - 1.0,
+    1.0 - motion.g * 2.0
+  );
+  float motionLength = length(motionDirection);
+  if (motionStrength > 0.001 && motionLength > 0.001 && coverage > 0.001) {
+    motionDirection /= motionLength;
+    float softLeft = texture(uSoft, vUv - vec2(uSoftTexel.x, 0.0)).a;
+    float softRight = texture(uSoft, vUv + vec2(uSoftTexel.x, 0.0)).a;
+    float softDown = texture(uSoft, vUv - vec2(0.0, uSoftTexel.y)).a;
+    float softUp = texture(uSoft, vUv + vec2(0.0, uSoftTexel.y)).a;
+    vec2 edgeNormal = vec2(softLeft - softRight, softDown - softUp);
+    float edgeLength = length(edgeNormal);
+    if (edgeLength > 0.0001) edgeNormal /= edgeLength;
 
-  float slopeX = (softRight - softLeft) * 0.78 + (broadRight - broadLeft) * 0.42;
-  float slopeY = (softUp - softDown) * 0.78 + (broadUp - broadDown) * 0.42;
-  vec3 normal = normalize(vec3(-slopeX * 6.6, -slopeY * 6.6, 0.56));
-  vec3 light = normalize(vec3(-0.52, 0.64, 0.76));
-  vec3 view = vec3(0.0, 0.0, 1.0);
-  vec3 halfVector = normalize(light + view);
+    float innerEdge = clamp((coverage - texture(uSoft, vUv).a) * 4.8, 0.0, 1.0);
+    float response = innerEdge * motionStrength;
+    float directionalSide = dot(edgeNormal, motionDirection);
+    float stretchedSide = max(directionalSide, 0.0) * response;
+    float compressedSide = max(-directionalSide, 0.0) * response;
+    flatColor += vec3(1.0, 0.49, 0.31) * stretchedSide * 0.055;
+    flatColor *= 1.0 - compressedSide * 0.045;
+    flatColor = clamp(flatColor, 0.0, 1.0);
+  }
 
-  float diffuse = 0.94 + max(dot(normal, light), 0.0) * 0.16;
-  float specular = pow(max(dot(normal, halfVector), 0.0), 38.0);
-  float softSpecular = pow(max(dot(normal, halfVector), 0.0), 8.0);
-  float broadEdge = clamp((coverage - broad) * 1.75, 0.0, 1.0);
-  float innerEdge = clamp((coverage - soft) * 3.3, 0.0, 1.0);
-  float outerEdge = clamp((soft - coverage) * 3.6, 0.0, 1.0);
-  float edgeFacingLight = smoothstep(-0.2, 0.84, dot(normal, light));
-  float litEdge = innerEdge * edgeFacingLight;
-  float pearlShoulder = broadEdge * (1.0 - innerEdge * 0.62) * edgeFacingLight;
+  vec2 shadowOffset = vec2(-3.5 / max(uResolution.x, 1.0), 4.5 / max(uResolution.y, 1.0));
+  float shiftedSoft = texture(uSoft, vUv + shadowOffset).a;
+  float broad = texture(uBroad, vUv + shadowOffset * 0.72).a;
+  float shadow = max(shiftedSoft * 0.82 + broad * 0.18 - coverage, 0.0);
+  shadow = smoothstep(0.018, 0.58, shadow) * 0.105;
+  vec3 shadowColor = vec3(0.34, 0.23, 0.19);
 
-  vec2 aspectPoint = vec2(vUv.x * (uResolution.x / max(uResolution.y, 1.0)), vUv.y);
-  float slowNoise = valueNoise(aspectPoint * 7.0 + vec2(uTime * 0.018, -uTime * 0.012));
-  float fineNoise = valueNoise(aspectPoint * 29.0 - vec2(uTime * 0.025, uTime * 0.018));
-  float movingBand = sin((aspectPoint.x * 0.74 + aspectPoint.y) * 11.0 - uTime * 0.11 + slowNoise * 1.4);
-  movingBand = pow(max(movingBand, 0.0), 7.0) * 0.035;
-
-  vec3 base = source.rgb;
-  base *= diffuse;
-  base *= 0.965 + (slowNoise - 0.5) * 0.055 + (fineNoise - 0.5) * 0.018;
-  base += vec3(1.0, 0.53, 0.40) * broad * 0.05;
-  base += vec3(1.0, 0.93, 0.82) * softSpecular * 0.13;
-  base += vec3(1.0, 0.975, 0.91) * specular * 0.78;
-  base += vec3(1.0, 0.78, 0.68) * litEdge * 0.4;
-  base += vec3(1.0, 0.94, 0.86) * pearlShoulder * 0.43;
-  base += vec3(1.0, 0.92, 0.82) * movingBand * coverage;
-  base = clamp(base, 0.0, 1.0);
-
-  vec2 shadowOffset = vec2(-6.0 / max(uResolution.x, 1.0), 7.0 / max(uResolution.y, 1.0));
-  float shiftedBroad = texture(uBroad, vUv + shadowOffset).a;
-  float shadow = max(shiftedBroad - max(coverage, outerEdge * 0.18), 0.0);
-  shadow = smoothstep(0.015, 0.52, shadow) * 0.13;
-  float rimAlpha = outerEdge * smoothstep(-0.12, 0.95, dot(normal, light)) * 0.62;
-  vec3 rimColor = vec3(1.0, 0.91, 0.82);
-  vec3 shadowColor = vec3(0.31, 0.20, 0.16);
-
-  float materialAlpha = clamp(coverage + rimAlpha * (1.0 - coverage), 0.0, 1.0);
+  float materialAlpha = coverage;
   float shadowAlpha = shadow * (1.0 - materialAlpha);
   float finalAlpha = materialAlpha + shadowAlpha;
   if (finalAlpha < 0.001) discard;
 
-  vec3 materialColor = mix(rimColor, base, smoothstep(0.0, 0.7, coverage));
   vec3 finalColor = (
-    materialColor * materialAlpha
+    flatColor * materialAlpha
     + shadowColor * shadowAlpha
   ) / max(finalAlpha, 0.001);
   outColor = vec4(finalColor, finalAlpha);
@@ -202,6 +171,7 @@ export function createFluidShaderRenderer(canvas, options = {}) {
   let disposed = false;
   let resources = null;
   let sourceCanvas = null;
+  let motionCanvas = null;
   let pixelWidth = 1;
   let pixelHeight = 1;
 
@@ -216,7 +186,7 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       resources = null;
       return;
     }
-    [resources.source, resources.softA.texture, resources.softB.texture,
+    [resources.source, resources.motion, resources.softA.texture, resources.softB.texture,
       resources.broadA.texture, resources.broadB.texture].forEach((texture) => gl.deleteTexture(texture));
     [resources.softA.framebuffer, resources.softB.framebuffer,
       resources.broadA.framebuffer, resources.broadB.framebuffer].forEach((framebuffer) => gl.deleteFramebuffer(framebuffer));
@@ -243,6 +213,7 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       materialProgram,
       vertexArray,
       source: createTexture(gl),
+      motion: createTexture(gl),
       softA: createTarget(),
       softB: createTarget(),
       broadA: createTarget(),
@@ -256,10 +227,9 @@ export function createFluidShaderRenderer(canvas, options = {}) {
         source: gl.getUniformLocation(materialProgram, "uSource"),
         soft: gl.getUniformLocation(materialProgram, "uSoft"),
         broad: gl.getUniformLocation(materialProgram, "uBroad"),
+        motion: gl.getUniformLocation(materialProgram, "uMotion"),
         resolution: gl.getUniformLocation(materialProgram, "uResolution"),
         softTexel: gl.getUniformLocation(materialProgram, "uSoftTexel"),
-        broadTexel: gl.getUniformLocation(materialProgram, "uBroadTexel"),
-        time: gl.getUniformLocation(materialProgram, "uTime"),
       },
     };
     gl.bindVertexArray(vertexArray);
@@ -297,6 +267,18 @@ export function createFluidShaderRenderer(canvas, options = {}) {
   const allocateTextures = () => {
     if (!resources) return;
     gl.bindTexture(gl.TEXTURE_2D, resources.source);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA8,
+      pixelWidth,
+      pixelHeight,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      null,
+    );
+    gl.bindTexture(gl.TEXTURE_2D, resources.motion);
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
@@ -347,9 +329,9 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       initializeResources();
       allocateTextures();
       notifyAvailability(true);
-      if (sourceCanvas) renderer.update(sourceCanvas);
+      if (sourceCanvas) renderer.update(sourceCanvas, motionCanvas);
     } catch (error) {
-      console.warn("Unable to restore the pearlescent fluid shader", error);
+      console.warn("Unable to restore the fluid surface shader", error);
       notifyAvailability(false);
     }
   };
@@ -376,9 +358,10 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       return true;
     },
 
-    update(nextSourceCanvas) {
+    update(nextSourceCanvas, nextMotionCanvas = null) {
       if (!renderer.available || !nextSourceCanvas) return false;
       sourceCanvas = nextSourceCanvas;
+      motionCanvas = nextMotionCanvas;
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
       gl.bindTexture(gl.TEXTURE_2D, resources.source);
       gl.texImage2D(
@@ -389,11 +372,34 @@ export function createFluidShaderRenderer(canvas, options = {}) {
         gl.UNSIGNED_BYTE,
         nextSourceCanvas,
       );
+      gl.bindTexture(gl.TEXTURE_2D, resources.motion);
+      if (nextMotionCanvas) {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA8,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          nextMotionCanvas,
+        );
+      } else {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA8,
+          pixelWidth,
+          pixelHeight,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null,
+        );
+      }
       updateBlurTextures();
       return true;
     },
 
-    render(now, { reducedMotion = false } = {}) {
+    render() {
       if (!renderer.available) return false;
       const { materialProgram, materialUniforms, softB, broadB, vertexArray } = resources;
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -405,10 +411,9 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       bindTexture(gl, resources.source, 0, materialUniforms.source);
       bindTexture(gl, softB.texture, 1, materialUniforms.soft);
       bindTexture(gl, broadB.texture, 2, materialUniforms.broad);
+      bindTexture(gl, resources.motion, 3, materialUniforms.motion);
       gl.uniform2f(materialUniforms.resolution, pixelWidth, pixelHeight);
       gl.uniform2f(materialUniforms.softTexel, 1 / softB.width, 1 / softB.height);
-      gl.uniform2f(materialUniforms.broadTexel, 1 / broadB.width, 1 / broadB.height);
-      gl.uniform1f(materialUniforms.time, reducedMotion ? 0 : now / 1000);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       return true;
     },
@@ -436,7 +441,7 @@ export function createFluidShaderRenderer(canvas, options = {}) {
     notifyAvailability(true);
     return renderer;
   } catch (error) {
-    console.warn("Unable to initialize the pearlescent fluid shader", error);
+    console.warn("Unable to initialize the fluid surface shader", error);
     renderer.dispose();
     return null;
   }

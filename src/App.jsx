@@ -76,7 +76,7 @@ const paperMaterialSettings = {
 const palettes = {
   paper: {
     material: "#f78269",
-    materialByDepth: ["#f5795c", "#f8846b", "#f9937d", "#f9a08c", "#f5aa98"],
+    materialByDepth: ["#f78269", "#f78269", "#f78269", "#f78269", "#f78269"],
     ink: "#251d1a",
     ghost: "#dc6d58",
     ghostFill: "rgba(245, 132, 109, 0.08)",
@@ -336,7 +336,7 @@ function drawWrappedText(ctx, node, x, y, palette, showProvenance) {
   }
 }
 
-function IconButton({
+export function IconButton({
   label,
   children,
   type = "button",
@@ -402,7 +402,7 @@ function ToggleRow({ label, description, checked, onChange, disabled = false }) 
   );
 }
 
-function MindMap({
+export function MindMap({
   concept,
   nodes,
   edges,
@@ -440,6 +440,7 @@ function MindMap({
   const shaderCanvasRef = useRef(null);
   const shaderRendererRef = useRef(null);
   const materialRasterRef = useRef(null);
+  const motionRasterRef = useRef(null);
   const shellRef = useRef(null);
   const textureRef = useRef(null);
   const dragRef = useRef(null);
@@ -587,22 +588,27 @@ function MindMap({
     const paperShaderActive = concept === "paper" && shaderAvailable && renderer?.available;
     const shaderDpr = Math.min(window.devicePixelRatio || 1, 1.5);
     let materialCtx = null;
+    let motionCtx = null;
     if (paperShaderActive) {
       renderer.resize(viewport.width, viewport.height, shaderDpr);
       if (!materialRasterRef.current) materialRasterRef.current = document.createElement("canvas");
+      if (!motionRasterRef.current) motionRasterRef.current = document.createElement("canvas");
       const materialRaster = materialRasterRef.current;
-      if (
-        materialRaster.width !== shaderCanvasRef.current.width
-        || materialRaster.height !== shaderCanvasRef.current.height
-      ) {
-        materialRaster.width = shaderCanvasRef.current.width;
-        materialRaster.height = shaderCanvasRef.current.height;
-      }
+      const motionRaster = motionRasterRef.current;
+      [materialRaster, motionRaster].forEach((raster) => {
+        if (
+          raster.width !== shaderCanvasRef.current.width
+          || raster.height !== shaderCanvasRef.current.height
+        ) {
+          raster.width = shaderCanvasRef.current.width;
+          raster.height = shaderCanvasRef.current.height;
+        }
+      });
       materialCtx = materialRaster.getContext("2d");
+      motionCtx = motionRaster.getContext("2d");
     }
     let frame = 0;
     let materialDirty = true;
-    let lastIdleShaderFrame = 0;
     let wasAnimating = false;
 
     const clearLayer = (context, layer) => {
@@ -628,7 +634,9 @@ function MindMap({
     const drawCommittedMaterial = (context, visualNodes, now) => {
       drawFluidMaterial(context, visualNodes, renderedEdges, {
         color: palette.material,
-        colorForNode: (node) => palette.materialByDepth[clamp(node.depth ?? 0, 0, palette.materialByDepth.length - 1)],
+        colorForNode: (node) => concept === "paper"
+          ? palette.material
+          : palette.materialByDepth[clamp(node.depth ?? 0, 0, palette.materialByDepth.length - 1)],
         now,
         reducedMotion,
         settings: paperMaterialSettings,
@@ -654,10 +662,42 @@ function MindMap({
         const a = visualNodes.get(pop.aId) ?? pop.a;
         const b = visualNodes.get(pop.bId) ?? pop.b;
         const fill = context.createLinearGradient(a.x, a.y, b.x, b.y);
-        fill.addColorStop(0, palette.materialByDepth[clamp(a.depth ?? 0, 0, palette.materialByDepth.length - 1)]);
-        fill.addColorStop(1, palette.materialByDepth[clamp(b.depth ?? 0, 0, palette.materialByDepth.length - 1)]);
+        const colorA = concept === "paper"
+          ? palette.material
+          : palette.materialByDepth[clamp(a.depth ?? 0, 0, palette.materialByDepth.length - 1)];
+        const colorB = concept === "paper"
+          ? palette.material
+          : palette.materialByDepth[clamp(b.depth ?? 0, 0, palette.materialByDepth.length - 1)];
+        fill.addColorStop(0, colorA);
+        fill.addColorStop(1, colorB);
         drawFluidConnectionPop(context, a, b, paperMaterialSettings, pop, progress, fill);
         return true;
+      });
+    };
+
+    const drawMotionField = (context, visualNodes) => {
+      visualNodes.forEach((node) => {
+        if (node.ghost || node.motionShadeStrength <= 0) return;
+        const strength = clamp(node.motionShadeStrength, 0, 1);
+        const red = Math.round(clamp(node.motionShadeX * 0.5 + 0.5, 0, 1) * 255);
+        const green = Math.round(clamp(node.motionShadeY * 0.5 + 0.5, 0, 1) * 255);
+        const radius = Math.max(node.radiusX, node.radiusY) * 1.72;
+        const centerAlpha = Math.min(0.82, strength * 0.9);
+        const field = context.createRadialGradient(
+          node.x,
+          node.y,
+          Math.max(node.radius * 0.18, 1),
+          node.x,
+          node.y,
+          radius,
+        );
+        field.addColorStop(0, `rgba(${red}, ${green}, 255, ${centerAlpha})`);
+        field.addColorStop(0.58, `rgba(${red}, ${green}, 255, ${centerAlpha * 0.72})`);
+        field.addColorStop(1, `rgba(${red}, ${green}, 255, 0)`);
+        context.fillStyle = field;
+        context.beginPath();
+        context.arc(node.x, node.y, radius, 0, Math.PI * 2);
+        context.fill();
       });
     };
 
@@ -719,20 +759,6 @@ function MindMap({
     const draw = (now) => {
       const animatingBeforeDraw = hasMaterialAnimation(now);
       const needsFinalMaterialFrame = wasAnimating && !animatingBeforeDraw;
-      if (
-        paperShaderActive
-        && !reducedMotion
-        && !animatingBeforeDraw
-        && !needsFinalMaterialFrame
-        && !materialDirty
-      ) {
-        if (now - lastIdleShaderFrame >= 1000 / 30) {
-          renderer.render(now);
-          lastIdleShaderFrame = now;
-        }
-        frame = window.requestAnimationFrame(draw);
-        return;
-      }
 
       clearLayer(ctx, canvas);
       clearLayer(underlayCtx, underlayCanvas);
@@ -746,14 +772,18 @@ function MindMap({
           underlayCtx.restore();
           if (materialDirty || animatingBeforeDraw || needsFinalMaterialFrame) {
             clearLayer(materialCtx, materialRasterRef.current);
+            clearLayer(motionCtx, motionRasterRef.current);
             beginWorld(materialCtx, shaderDpr);
             drawCommittedMaterial(materialCtx, visualNodes, now);
             applyPaperGrain(materialCtx);
             drawConnectionPops(materialCtx, visualNodes, now);
             materialCtx.restore();
-            renderer.update(materialRasterRef.current);
+            beginWorld(motionCtx, shaderDpr);
+            drawMotionField(motionCtx, visualNodes);
+            motionCtx.restore();
+            renderer.update(materialRasterRef.current, motionRasterRef.current);
           }
-          renderer.render(now, { reducedMotion });
+          renderer.render();
         } else {
           drawCommittedMaterial(underlayCtx, visualNodes, now);
           applyPaperGrain(underlayCtx);
@@ -787,7 +817,7 @@ function MindMap({
       materialDirty = false;
       const animatingAfterDraw = hasMaterialAnimation(now);
       wasAnimating = animatingAfterDraw;
-      if (animatingAfterDraw || (paperShaderActive && !reducedMotion)) {
+      if (animatingAfterDraw) {
         frame = window.requestAnimationFrame(draw);
       }
     };
@@ -1420,6 +1450,8 @@ export function App() {
       dragging: true,
       vx: 0,
       vy: 0,
+      shadeVx: 0,
+      shadeVy: 0,
     } : node);
     nodesRef.current = next;
     setNodes(next);
@@ -1433,6 +1465,8 @@ export function App() {
       dragging: true,
       vx: 0,
       vy: 0,
+      shadeVx: x - node.x,
+      shadeVy: y - node.y,
     } : node);
     nodesRef.current = next;
     setNodes(next);
@@ -1448,6 +1482,8 @@ export function App() {
         dragging: false,
         vx: moved ? clamp(vx, -24, 24) * release : 0,
         vy: moved ? clamp(vy, -24, 24) * release : 0,
+        shadeVx: 0,
+        shadeVy: 0,
       };
       return moved ? released : withWobble(released, 1, 0, 0.082);
     });
@@ -1464,6 +1500,8 @@ export function App() {
       dragging: false,
       vx: 0,
       vy: 0,
+      shadeVx: 0,
+      shadeVy: 0,
     } : node);
     nodesRef.current = next;
     setNodes(next);

@@ -3,7 +3,7 @@
 
 const MIN_CROWDED_HALF_ANGLE = 8 * (Math.PI / 180);
 const CREATE_DURATION = 460;
-export const CONNECTION_CREATE_DURATION = 420;
+export const CONNECTION_CREATE_DURATION = 350;
 export const CONNECTION_CREATE_CONTACT_PROGRESS = 0.7;
 export const CONNECTION_CREATE_RETURN_DELAY = 72;
 export const CONNECTION_POP_DURATION = 520;
@@ -416,6 +416,16 @@ export function buildFluidVisualNodes(nodes, now, reducedMotion = false) {
       0.01,
       node.r * visual.scale * (1 - stretch * 0.52) * visual.scaleY,
     );
+    const shadeVx = node.dragging ? (node.shadeVx ?? 0) : (node.vx ?? 0);
+    const shadeVy = node.dragging ? (node.shadeVy ?? 0) : (node.vy ?? 0);
+    const shadeSpeed = Math.hypot(shadeVx, shadeVy);
+    const anisotropy = Math.abs(radiusX - radiusY) / Math.max(node.r, 1);
+    const rawMotionStrength = clamp(shadeSpeed * 0.035 + anisotropy * 3.2, 0, 1);
+    const motionStrength = reducedMotion || rawMotionStrength < 0.018 ? 0 : rawMotionStrength;
+    const motionAngle = visual.rotation || (shadeSpeed > 0.01
+      ? Math.atan2(shadeVy, shadeVx)
+      : movementAngle);
+    const stretchPolarity = radiusX >= radiusY ? 1 : -1;
     visuals.set(node.id, {
       ...node,
       x: node.x + visual.offsetX,
@@ -424,6 +434,9 @@ export function buildFluidVisualNodes(nodes, now, reducedMotion = false) {
       radiusX,
       radiusY,
       rotation: visual.rotation || movementAngle,
+      motionShadeX: Math.cos(motionAngle) * stretchPolarity,
+      motionShadeY: Math.sin(motionAngle) * stretchPolarity,
+      motionShadeStrength: motionStrength,
     });
   });
   return visuals;
