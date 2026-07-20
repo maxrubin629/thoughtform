@@ -24,6 +24,10 @@ export async function requestDictation(transcript) {
   return thought;
 }
 
+export async function requestCompanion(graph) {
+  return post("/api/companion", { graph });
+}
+
 export async function requestSynthesis(graph) {
   const { synthesis } = await post("/api/synthesize", { graph });
   return synthesis;

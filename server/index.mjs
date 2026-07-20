@@ -1,6 +1,8 @@
 import express from "express";
 import OpenAI from "openai";
 import {
+  COMPANION_SCHEMA,
+  COMPANION_SYSTEM,
   DICTATE_SYSTEM,
   DICTATION_SCHEMA,
   PROPOSAL_SCHEMA,
@@ -86,6 +88,25 @@ app.post("/api/dictate", wrap(async (req) => {
     schema: DICTATION_SCHEMA,
   });
   return { thought };
+}));
+
+app.post("/api/companion", wrap(async (req) => {
+  const { graph } = req.body ?? {};
+  if (!graph?.thoughts?.length) throw new Error("companion needs { graph }");
+
+  if (!hasKey) {
+    return {
+      line: "Keep going, this is getting interesting…",
+      followup: "What if we explored the flow a bit more?",
+    };
+  }
+
+  return structuredCall({
+    system: COMPANION_SYSTEM,
+    payload: { graph },
+    schemaName: "companion",
+    schema: COMPANION_SCHEMA,
+  });
 }));
 
 app.post("/api/synthesize", wrap(async (req) => {

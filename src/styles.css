@@ -118,6 +118,7 @@ button:disabled {
 }
 
 .icon-button {
+  position: relative;
   width: 42px;
   height: 42px;
   flex: 0 0 auto;
@@ -337,6 +338,80 @@ button:disabled {
 
 .ghost-badge:hover {
   transform: translate(-50%, -50%) scale(1.06);
+}
+
+.tool-pip {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: #fff8f0;
+  background: #d76550;
+  box-shadow: 0 0 0 2px #fffaf2;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.nocturne .tool-pip {
+  background: #dc6b55;
+  box-shadow: 0 0 0 2px #0e0f1b;
+}
+
+.ai-status {
+  position: absolute;
+  z-index: 8;
+  left: 50%;
+  bottom: 172px;
+  transform: translateX(-50%);
+  padding: 8px 15px 8px 12px;
+  border: 1px solid rgba(78, 65, 53, 0.1);
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #6b5c53;
+  background: rgba(255, 250, 242, 0.94);
+  box-shadow: 0 10px 24px rgba(66, 53, 42, 0.1);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: panel-enter 170ms ease-out both;
+}
+
+.ai-status svg {
+  width: 15px;
+  height: 15px;
+  color: #d76550;
+  animation: ai-status-pulse 1.4s ease-in-out infinite;
+}
+
+.nocturne .ai-status {
+  color: rgba(255, 241, 223, 0.78);
+  border-color: rgba(255, 241, 223, 0.13);
+  background: rgba(14, 15, 27, 0.94);
+}
+
+.nocturne .ai-status svg {
+  color: #ef8068;
+}
+
+@keyframes ai-status-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.92); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+.voice-caption.is-distilling > span {
+  background: #d76550;
+  animation: ai-status-pulse 1.2s ease-in-out infinite;
 }
 
 .voice-control {

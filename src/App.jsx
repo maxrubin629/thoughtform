@@ -60,7 +60,7 @@ import {
   voiceThoughts,
 } from "./mapData.js";
 import { serializeGraph } from "./graphContext.js";
-import { requestDictation, requestProposals, requestSynthesis } from "./aiClient.js";
+import { requestCompanion, requestDictation, requestProposals, requestSynthesis } from "./aiClient.js";
 
 const initialFluidEdges = captureFluidRestLengths(initialNodes, initialEdges, { reset: true });
 const MIN_ZOOM = 0.72;
@@ -1196,8 +1196,15 @@ export function App() {
   const [aiQuery, setAiQuery] = useState("");
   const [aiMode, setAiMode] = useState("quiet");
   const [aiBusy, setAiBusy] = useState(false);
+  const [aiActivity, setAiActivity] = useState("");
+  const aiModeRef = useRef("quiet");
+  const lastProactiveAtRef = useRef(0);
   const [synthesis, setSynthesis] = useState("This map explores a private, voice-first thinking space where complete thoughts become flexible structure. AI helps surface connections and alternative framings, but every change remains yours to accept.");
   const [synthesisBusy, setSynthesisBusy] = useState(false);
+  const [companion, setCompanion] = useState({
+    line: "Keep going, this is getting interesting…",
+    followup: "What if we explored the flow a bit more?",
+  });
   const [viewMode, setViewMode] = useState("clusters");
   const viewModeRef = useRef(viewMode);
   const [zoom, setZoom] = useState(1);
@@ -1205,7 +1212,9 @@ export function App() {
   const [showSuggestions, setShowSuggestions] = useState(true);
   const [showProvenance, setShowProvenance] = useState(false);
   const [showPrivateIsland, setShowPrivateIsland] = useState(true);
-  const [reducedMotion, setReducedMotion] = useState(false);
+  const [reducedMotion, setReducedMotion] = useState(
+    () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+  );
   const [focusId, setFocusId] = useState(null);
   const [connectFromId, setConnectFromId] = useState(null);
   const [favorite, setFavorite] = useState(true);
@@ -1213,6 +1222,7 @@ export function App() {
   const [seconds, setSeconds] = useState(0);
   const [voiceIndex, setVoiceIndex] = useState(0);
   const [liveTranscript, setLiveTranscript] = useState("");
+  const [distilling, setDistilling] = useState(false);
   const recognitionRef = useRef(null);
   const transcriptRef = useRef("");
   const [toast, setToast] = useState("");
@@ -1243,6 +1253,7 @@ export function App() {
   // Syncing them back from a committed render can rewind a newer animation frame,
   // which becomes a visible two-frame shake on high-refresh displays.
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
+  useEffect(() => { aiModeRef.current = aiMode; }, [aiMode]);
   useEffect(() => {
     let animationFrame;
     let lastTime = performance.now();
@@ -1344,6 +1355,10 @@ export function App() {
   useEffect(() => {
     const handleKeyDown = (event) => {
       if (event.key === "Escape") {
+        if (listening) {
+          cancelVoice();
+          return;
+        }
         setActivePanel(null);
         setConnectFromId(null);
         if (marqueeActive) {
@@ -1372,7 +1387,7 @@ export function App() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [history, historyIndex, marqueeActive, selectedId, selectedIds]);
+  }, [history, historyIndex, listening, marqueeActive, selectedId, selectedIds]);
 
   const togglePanel = (panel) => {
     if (marqueeActive) {
@@ -1478,7 +1493,7 @@ export function App() {
     const nextEdges = [...edgesRef.current, edge];
     applyGraph(nextNodes, nextEdges, options.ghost ? "AI proposed a thought" : "Added a thought");
     if (viewMode === "clusters") organicPositionsRef.current.set(id, { x: node.x, y: node.y });
-    selectOne(id);
+    if (!options.quiet) selectOne(id);
     if (options.ghost) setShowSuggestions(true);
     return id;
   };
@@ -1551,7 +1566,7 @@ export function App() {
     setAiQuery("");
     setActivePanel(null);
     setAiBusy(true);
-    showToast("Asking for proposals…");
+    setAiActivity("Sketching proposals…");
     try {
       const proposals = await requestProposals({
         graph: serializeGraph(nodesRef.current, edgesRef.current),
@@ -1573,12 +1588,14 @@ export function App() {
       showToast(error.message);
     } finally {
       setAiBusy(false);
+      setAiActivity("");
     }
   };
 
   const refreshSynthesis = async () => {
     if (synthesisBusy) return;
     setSynthesisBusy(true);
+    setAiActivity("Synthesizing the map…");
     try {
       setSynthesis(await requestSynthesis(serializeGraph(nodesRef.current, edgesRef.current)));
       showToast("Synthesis refreshed from the current map");
@@ -1586,8 +1603,61 @@ export function App() {
       showToast(error.message);
     } finally {
       setSynthesisBusy(false);
+      setAiActivity("");
     }
   };
+
+  // Nocturne's ambient caption reads the actual map instead of a canned line.
+  // Refreshes quietly after edits settle; failures keep the last good caption.
+  useEffect(() => {
+    if (concept !== "nocturne") return undefined;
+    const timer = window.setTimeout(async () => {
+      try {
+        const next = await requestCompanion(serializeGraph(nodesRef.current, edgesRef.current));
+        if (next?.line && next?.followup) setCompanion(next);
+      } catch {
+        // Ambient copy is not worth an error toast.
+      }
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [concept, historyIndex]);
+
+  // Proactive mode: after the map settles, quietly sketch one ghost branch.
+  // Never more than one pending at a time, and never touch the user's selection.
+  useEffect(() => {
+    if (aiMode !== "proactive" || aiBusy || listening) return undefined;
+    if (nodesRef.current.some((node) => node.ghost)) return undefined;
+    const wait = Math.max(7000, lastProactiveAtRef.current + 25000 - Date.now());
+    const timer = window.setTimeout(async () => {
+      if (aiModeRef.current !== "proactive" || document.hidden) return;
+      if (nodesRef.current.some((node) => node.ghost)) return;
+      lastProactiveAtRef.current = Date.now();
+      setAiBusy(true);
+      setAiActivity("Noticing where you're heading…");
+      try {
+        const proposals = await requestProposals({
+          graph: serializeGraph(nodesRef.current, edgesRef.current),
+          prompt: "Offer one gentle branch the thinker seems to be circling but has not written down yet.",
+          selectedId: "root",
+        });
+        const proposal = proposals[0];
+        if (proposal && aiModeRef.current === "proactive") {
+          addThought(proposal.text, proposal.parent_id, {
+            ghost: true,
+            quiet: true,
+            provenance: `GPT-5.6 · ${proposal.reason}`,
+          });
+          showToast("AI sketched a branch — review when ready");
+        }
+      } catch {
+        // Proactive suggestions fail silently; asking directly surfaces errors.
+      } finally {
+        setAiBusy(false);
+        setAiActivity("");
+      }
+    }, wait);
+    return () => window.clearTimeout(timer);
+  }, [aiMode, aiBusy, historyIndex, listening]);
 
   const acceptGhost = (id) => {
     const createdAt = performance.now();
@@ -1753,18 +1823,32 @@ export function App() {
   const finishDictation = async (transcript) => {
     const text = transcript.trim();
     if (!text) {
+      setDistilling(false);
+      setLiveTranscript("");
       showToast("Didn't catch anything — try again closer to the mic");
       return;
     }
     const parentId = selected && !selected.ghost ? selected.id : "root";
-    showToast("Distilling your thought…");
     try {
       const thought = await requestDictation(text);
       addThought(thought, parentId, { provenance: "Voice · GPT-5.6 dictation" });
       showToast("Complete thought added to the map");
     } catch (error) {
       showToast(error.message);
+    } finally {
+      setDistilling(false);
+      setLiveTranscript("");
     }
+  };
+
+  const cancelVoice = () => {
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    recognition?.stop();
+    transcriptRef.current = "";
+    setListening(false);
+    setLiveTranscript("");
+    showToast("Voice capture discarded");
   };
 
   const toggleVoice = () => {
@@ -1822,7 +1906,7 @@ export function App() {
       return;
     }
     recognition.onend = () => {
-      setLiveTranscript("");
+      setDistilling(true);
       finishDictation(transcriptRef.current);
     };
     recognition.stop();
@@ -1928,7 +2012,16 @@ export function App() {
         <>
           <div className="segmented-control" aria-label="AI presence">
             <button type="button" className={aiMode === "quiet" ? "is-active" : ""} onClick={() => setAiMode("quiet")}>Quiet</button>
-            <button type="button" className={aiMode === "proactive" ? "is-active" : ""} onClick={() => setAiMode("proactive")}>Proactive</button>
+            <button
+              type="button"
+              className={aiMode === "proactive" ? "is-active" : ""}
+              onClick={() => {
+                if (aiMode !== "proactive") showToast("Proactive on — ghost branches appear as you think");
+                setAiMode("proactive");
+              }}
+            >
+              Proactive
+            </button>
           </div>
           <p className="panel-description">
             {aiMode === "quiet" ? "AI waits until you ask, then proposes changes for review." : "AI surfaces occasional ghost branches while you think."}
@@ -1984,7 +2077,7 @@ export function App() {
           <ToggleRow label="Complete-thought detection" description="Create nodes at semantic turn boundaries" checked onChange={() => {}} disabled />
           <ToggleRow label="Reduced motion" description="Remove lobe wobble and pulse animation" checked={reducedMotion} onChange={setReducedMotion} />
           <ToggleRow label="Show AI proposals" description="Keep pending changes visible on the canvas" checked={showSuggestions} onChange={setShowSuggestions} />
-          <div className="panel-note"><IconAdjustments /><span>Proposals, synthesis, and voice dictation route through the local AI server. Voice uses the browser's speech recognition (Chrome/Edge recommended).</span></div>
+          <div className="panel-note"><IconAdjustments /><span>Proposals, synthesis, dictation, and the nocturne companion route through the local AI server. Voice uses the browser's speech recognition (Chrome/Edge recommended).</span></div>
         </>
       );
     }
@@ -2043,7 +2136,15 @@ export function App() {
         {concept === "nocturne" && (
           <>
             <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={toggleMarquee} testId="marquee-tool"><IconMarquee /></IconButton>
-            <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
+            <IconButton
+              label={suggestionCount ? `Ask AI · ${suggestionCount} ${suggestionCount === 1 ? "proposal" : "proposals"} waiting` : "Ask AI"}
+              active={activePanel === "ai"}
+              onClick={() => togglePanel("ai")}
+              testId="ai-tool"
+            >
+              <IconSparkles />
+              {suggestionCount > 0 && <i className="tool-pip">{suggestionCount}</i>}
+            </IconButton>
             <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconHierarchy2 /></IconButton>
           </>
         )}
@@ -2062,7 +2163,15 @@ export function App() {
       {concept === "paper" && (
         <div className="top-dock" aria-label="Canvas modes">
           <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={toggleMarquee} testId="marquee-tool"><IconMarquee /></IconButton>
-          <IconButton label="Ask AI" active={activePanel === "ai"} onClick={() => togglePanel("ai")} testId="ai-tool"><IconSparkles /></IconButton>
+          <IconButton
+            label={suggestionCount ? `Ask AI · ${suggestionCount} ${suggestionCount === 1 ? "proposal" : "proposals"} waiting` : "Ask AI"}
+            active={activePanel === "ai"}
+            onClick={() => togglePanel("ai")}
+            testId="ai-tool"
+          >
+            <IconSparkles />
+            {suggestionCount > 0 && <i className="tool-pip">{suggestionCount}</i>}
+          </IconButton>
           <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconAffiliate /></IconButton>
           <IconButton label="Map overview and synthesis" active={activePanel === "overview"} onClick={() => togglePanel("overview")} testId="overview-tool"><IconGridDots /></IconButton>
           <IconButton label="Layers" active={activePanel === "layers"} onClick={() => togglePanel("layers")} testId="layers-tool"><IconStack2 /></IconButton>
@@ -2099,18 +2208,25 @@ export function App() {
         </FloatingPanel>
       )}
 
-      {listening && (
-        <div className="voice-caption" role="status" aria-live="polite">
+      {(listening || distilling) && (
+        <div className={`voice-caption ${distilling && !listening ? "is-distilling" : ""}`} role="status" aria-live="polite">
           <span />
-          <p>Listening for a complete thought…</p>
-          <small>{liveTranscript || "Waiting for your voice…"}</small>
+          <p>{listening ? "Listening for a complete thought…" : "Distilling into a complete thought…"}</p>
+          <small>{liveTranscript || (listening ? "Waiting for your voice…" : "One moment…")}</small>
         </div>
       )}
 
-      {concept === "nocturne" && !listening && (
+      {aiActivity && !listening && !distilling && (
+        <div className="ai-status" role="status" aria-live="polite">
+          <IconSparkles />
+          <span>{aiActivity}</span>
+        </div>
+      )}
+
+      {concept === "nocturne" && !listening && !distilling && (
         <div className="nocturne-companion-caption" aria-label="AI companion prompt">
-          <p><span />Keep going, this is getting interesting…</p>
-          <small>What if we explored the flow a bit more?</small>
+          <p><span />{companion.line}</p>
+          <small>{companion.followup}</small>
         </div>
       )}
 

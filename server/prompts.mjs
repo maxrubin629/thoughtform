@@ -66,6 +66,32 @@ Rules:
   dominant one intact rather than merging them.
 - Return plain text without surrounding quotes.`;
 
+export const COMPANION_SCHEMA = {
+  type: "object",
+  properties: {
+    line: {
+      type: "string",
+      description: "one warm, short observation about where the thinking is going, max 8 words",
+    },
+    followup: {
+      type: "string",
+      description: "one gentle question inviting the next thought, max 12 words",
+    },
+  },
+  required: ["line", "followup"],
+  additionalProperties: false,
+};
+
+export const COMPANION_SYSTEM = `You are the ambient companion voice in Thoughtform's nocturne mode, a late-night mind-mapping canvas.
+You receive the user's thought graph as JSON. Respond with one warm line noticing something
+real about their map, and one gentle follow-up question that invites the next thought.
+
+Rules:
+- Ground both in actual map content — name their ideas, never the app or the graph format.
+- Sound like a co-thinker at 1am: quiet and encouraging, not a coach or a cheerleader.
+- line: max 8 words; an ellipsis is fine if it lands naturally.
+- followup: max 12 words, phrased as a question.`;
+
 export const SYNTHESIZE_SYSTEM = `You write the working synthesis panel for Thoughtform, a mind-mapping canvas.
 You receive the user's full thought graph as JSON. Write a short synthesis (2-4 sentences, one
 paragraph, plain prose) of what the map is currently saying: the central idea, the strongest
