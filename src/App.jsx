@@ -32,9 +32,7 @@ import {
 } from "@tabler/icons-react";
 import paperTextureUrl from "./assets/paper-texture.png";
 import {
-  CONNECTION_CREATE_CONTACT_PROGRESS,
   CONNECTION_CREATE_DURATION,
-  CONNECTION_CREATE_RETURN_DELAY,
   CONNECTION_POP_DURATION,
   PAPER_MATERIAL_SETTINGS,
   buildFluidVisualNodes,
@@ -53,6 +51,10 @@ import {
   stepFluidPhysics,
 } from "./fluidPhysics.js";
 import {
+  applyConnectionGrowthMotion,
+  buildConnectionPopTransition,
+} from "./connectionVisualMotion.js";
+import {
   BASE_HEIGHT,
   BASE_WIDTH,
   aiPrompts,
@@ -62,6 +64,7 @@ import {
 } from "./mapData.js";
 import { serializeGraph } from "./graphContext.js";
 import { requestCompanion, requestDictation, requestProposals, requestSynthesis } from "./aiClient.js";
+import { radiusForThought, wrapThought } from "./thoughtSizing.js";
 
 const initialFluidEdges = captureFluidRestLengths(initialNodes, initialEdges, { reset: true });
 const MIN_ZOOM = 0.72;
@@ -108,36 +111,6 @@ function cloneEdges(edges) {
 
 function nodeLabel(node) {
   return node?.lines?.join(" ") ?? "Thought";
-}
-
-function wrapThought(value, maxLength = 18) {
-  const words = value.trim().split(/\s+/).filter(Boolean);
-  if (!words.length) return ["New thought"];
-  const lines = [];
-  let current = "";
-  words.forEach((word) => {
-    const next = current ? `${current} ${word}` : word;
-    if (next.length > maxLength && current) {
-      lines.push(current);
-      current = word;
-    } else {
-      current = next;
-    }
-  });
-  if (current) lines.push(current);
-  return lines;
-}
-
-function radiusForThought(lines, fallbackRadius, ghost = false) {
-  const longestLine = Math.max(...lines.map((line) => line.length), 1);
-  const characterCount = lines.reduce((sum, line) => sum + line.length, 0);
-  const contentRadius = Math.max(
-    ghost ? 52 : 36,
-    longestLine * 3.55,
-    Math.sqrt(characterCount) * 10.5,
-    22 + lines.length * 8,
-  );
-  return clamp(Math.max(fallbackRadius, contentRadius), ghost ? 52 : 36, ghost ? 78 : 82);
 }
 
 function formatTimer(seconds) {
@@ -553,7 +526,7 @@ export function MindMap({
 
   const connectionIsPopping = (edge, now = performance.now()) => (
     Boolean(connectionPopQueueRef) && poppingConnectionsRef.current.some((pop) => {
-      if (now >= pop.start + pop.duration) return false;
+      if (!pop.hideUntilResolved && now >= pop.start + pop.duration) return false;
       if (pop.edgeId && edge.id && pop.edgeId === edge.id) return true;
       return (
         (pop.aId === edge.from && pop.bId === edge.to)
@@ -582,7 +555,12 @@ export function MindMap({
   }, [marqueeActive]);
 
   useEffect(() => {
-    if (reducedMotion) poppingConnectionsRef.current = [];
+    if (reducedMotion) {
+      const now = performance.now();
+      poppingConnectionsRef.current = poppingConnectionsRef.current
+        .filter((pop) => pop.hideUntilResolved)
+        .map((pop) => ({ ...pop, start: now - 1, duration: 1 }));
+    }
   }, [poppingConnectionsRef, reducedMotion]);
 
   useEffect(() => {
@@ -592,7 +570,7 @@ export function MindMap({
         ? `ends:${edge.from}:${edge.to}`
         : `ends:${edge.to}:${edge.from}`;
     };
-    const committedEdges = renderedEdges.filter((edge) => !edge.ghost);
+    const committedEdges = edges.filter((edge) => !edge.ghost);
     const previousKeys = previousRenderedEdgeKeysRef.current;
     const restoredEdges = committedEdges.filter((edge) => !previousKeys.has(edgeKey(edge)));
     if (connectionPopQueueRef && restoredEdges.length && poppingConnectionsRef.current.length) {
@@ -605,7 +583,7 @@ export function MindMap({
       ));
     }
     previousRenderedEdgeKeysRef.current = new Set(committedEdges.map(edgeKey));
-  }, [connectionPopQueueRef, poppingConnectionsRef, renderedEdges]);
+  }, [connectionPopQueueRef, edges, poppingConnectionsRef]);
 
   useEffect(() => {
     Promise.all([
@@ -1015,6 +993,7 @@ export function MindMap({
       ((value * 31) + character.charCodeAt(0)) >>> 0
     ), Math.round(now));
     poppingConnectionsRef.current.push({
+      edgeId: connection.link.id,
       aId: connection.a.id,
       bId: connection.b.id,
       a: { ...connection.a, radius: connection.a.radius ?? connection.a.r },
@@ -1957,44 +1936,19 @@ export function App() {
       showToast("Those thoughts are already connected");
       return;
     }
-    const dx = (target?.x ?? 0) - (source?.x ?? 0);
-    const dy = (target?.y ?? 0) - (source?.y ?? 0);
     const createdAt = performance.now();
-    const targetImpactAt = createdAt
-      + CONNECTION_CREATE_DURATION * CONNECTION_CREATE_CONTACT_PROGRESS;
-    const sourceReturnAt = targetImpactAt + CONNECTION_CREATE_RETURN_DELAY;
-    const nextNodes = reducedMotion ? nodesRef.current : nodesRef.current.map((node) => {
-      if (node.id === connectFromId) {
-        const launched = withWobble(
-          node,
-          dx,
-          dy,
-          0.064,
-          { startAt: createdAt, travel: 0.14 },
-        );
-        return withWobble(
-          launched,
-          -dx,
-          -dy,
-          0.038,
-          { startAt: sourceReturnAt, travel: 0.11, append: true },
-        );
-      }
-      if (node.id === targetId) return withWobble(
-        node,
-        dx,
-        dy,
-        0.105,
-        { startAt: targetImpactAt, travel: 0.32 },
-      );
-      return node;
-    });
-    const nextEdges = [...edgesRef.current, {
+    const nextEdge = {
       from: connectFromId,
       to: targetId,
       bend: 0,
       createdAt,
-    }];
+    };
+    const nextNodes = applyConnectionGrowthMotion(
+      nodesRef.current,
+      nextEdge,
+      { reducedMotion },
+    );
+    const nextEdges = [...edgesRef.current, nextEdge];
     applyGraph(nextNodes, nextEdges, "Connected two thoughts");
     setConnectFromId(null);
     selectOne(targetId);
@@ -2005,34 +1959,18 @@ export function App() {
     const source = nodesRef.current.find((node) => node.id === targetEdge.from);
     const target = nodesRef.current.find((node) => node.id === targetEdge.to);
     if (!source || !target) return;
-    const hitT = clamp(motion.hitT ?? 0.5, 0, 1);
-    const hitX = source.x + (target.x - source.x) * hitT;
-    const hitY = source.y + (target.y - source.y) * hitT;
-    const sourceAmplitude = 0.036 + (1 - hitT) * 0.016;
-    const targetAmplitude = 0.036 + hitT * 0.016;
     const matches = (edge) => (
       (edge.from === targetEdge.from && edge.to === targetEdge.to)
       || (edge.from === targetEdge.to && edge.to === targetEdge.from)
     );
     const nextEdges = edgesRef.current.filter((edge) => !matches(edge));
-    const nextNodes = nodesRef.current.map((node) => {
-      if (node.id === source.id) return withWobble(
-        node,
-        source.x - hitX,
-        source.y - hitY,
-        sourceAmplitude,
-        { startAt: motion.sourceImpactAt, travel: 0.13 },
-      );
-      if (node.id === target.id) return withWobble(
-        node,
-        target.x - hitX,
-        target.y - hitY,
-        targetAmplitude,
-        { startAt: motion.targetImpactAt, travel: 0.13 },
-      );
-      return node;
-    });
-    applyGraph(nextNodes, nextEdges, "Removed a connection");
+    const transition = buildConnectionPopTransition(
+      nodesRef.current,
+      targetEdge,
+      motion,
+      { reducedMotion, includePop: false },
+    );
+    applyGraph(transition.nodes, nextEdges, "Removed a connection");
     setConnectFromId(null);
     showToast("Connection popped");
   };

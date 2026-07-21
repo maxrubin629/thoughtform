@@ -1,6 +1,6 @@
 import { clamp } from "../fluidMaterial.js";
+import { radiusForThought, wrapThought } from "../thoughtSizing.js";
 import { connectionEdgeKey } from "./connectionMotion.js";
-import { bubbleLines, bubbleTargetRadius } from "./sizing.js";
 
 const ACTOR_LABELS = {
   you: "You",
@@ -27,15 +27,6 @@ function visualSources(sources = []) {
   }));
 }
 
-function degreesFor(edges = []) {
-  const degrees = new Map();
-  edges.forEach((edge) => {
-    degrees.set(edge.from, (degrees.get(edge.from) ?? 0) + 1);
-    degrees.set(edge.to, (degrees.get(edge.to) ?? 0) + 1);
-  });
-  return degrees;
-}
-
 export function visualizeSession(
   session,
   previousNodes = [],
@@ -46,7 +37,6 @@ export function visualizeSession(
 ) {
   const oldNodes = new Map(previousNodes.filter((node) => !node.ghost).map((node) => [node.id, node]));
   const oldEdges = new Map(previousEdges.filter((edge) => !edge.ghost).map((edge) => [edge.id ?? `${edge.from}:${edge.to}`, edge]));
-  const degrees = degreesFor(session?.edges);
   const committedPositions = new Map();
 
   const nodes = (session?.nodes ?? []).map((node) => {
@@ -54,18 +44,19 @@ export function visualizeSession(
     const committed = previousCommittedPositions.get(node.id);
     const serverMoved = !committed || committed.x !== node.x || committed.y !== node.y;
     const heatAt = heatAtForClock(node.heat_at, now);
-    const draft = { depth: node.depth, heatAt };
-    const targetR = bubbleTargetRadius(draft, degrees.get(node.id) ?? 0, now);
+    const lines = wrapThought(node.text);
+    const initialFallback = node.depth === 0 ? 82 : 46;
+    const targetR = radiusForThought(lines, previous?.r ?? initialFallback, false);
     committedPositions.set(node.id, { x: node.x, y: node.y });
-    return {
+    const visualNode = {
       ...(previous ?? {}),
       id: node.id,
       text: node.text,
-      lines: bubbleLines(node.text),
+      lines,
       depth: clamp(node.depth ?? 2, 0, 4),
       x: previous && !serverMoved ? previous.x : node.x,
       y: previous && !serverMoved ? previous.y : node.y,
-      r: previous?.r ?? targetR,
+      r: previous?.text === node.text ? previous?.r ?? targetR : targetR,
       targetR,
       vx: previous?.vx ?? 0,
       vy: previous?.vy ?? 0,
@@ -77,6 +68,7 @@ export function visualizeSession(
       updatedAt: node.updated_at,
       ghost: false,
     };
+    return visualNode;
   });
 
   let newEdgeIndex = 0;
@@ -163,7 +155,7 @@ export function proposalVisuals(proposals = [], nodes = []) {
         y,
         r: radius,
         depth: clamp((parent?.depth ?? 1) + 1, 1, 4),
-        lines: bubbleLines(operation.text ?? "Partner suggestion"),
+        lines: wrapThought(operation.text ?? "Partner suggestion"),
         ghost: true,
         proposalId: proposal.id,
       });

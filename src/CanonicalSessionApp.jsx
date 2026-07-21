@@ -35,13 +35,14 @@ import {
   stepFluidPhysics,
 } from "./fluidPhysics.js";
 import { clamp, withWobble } from "./fluidMaterial.js";
-import { bubbleLines, updateBubbleRadii } from "./session/sizing.js";
 import { condenseUtterance, informativeTokens, overlapScore } from "./session/condense.js";
 import {
   applyConnectionGrowthMotion,
   buildConnectionPopTransition,
   connectionEdgeKey,
+  connectionEndpointKey,
   connectionMatches,
+  confirmPendingConnectionEdge,
 } from "./session/connectionMotion.js";
 import {
   actorLabel,
@@ -151,6 +152,7 @@ export function CanonicalSessionApp() {
   const organicPositionsRef = useRef(new Map());
   const connectionPopQueueRef = useRef([]);
   const manualPopKeysRef = useRef(new Set());
+  const pendingManualConnectionsRef = useRef(new Map());
 
   const [selectedId, setSelectedId] = useState(null);
   const [selectedIds, setSelectedIds] = useState([]);
@@ -232,17 +234,32 @@ export function CanonicalSessionApp() {
       { animateNew: motionEnabled },
     );
     let nextNodes = visual.nodes;
-    if (motionEnabled) {
-      visual.addedEdges.forEach((edge) => {
+    visual.addedEdges.forEach((edge) => {
+      const pendingKey = connectionEndpointKey(edge);
+      const pendingManual = pendingManualConnectionsRef.current.get(pendingKey);
+      if (pendingManual) {
+        Object.assign(edge, confirmPendingConnectionEdge(edge, pendingManual));
+        pendingManualConnectionsRef.current.delete(pendingKey);
+        return;
+      }
+      if (motionEnabled) {
         nextNodes = applyConnectionGrowthMotion(nextNodes, edge);
-      });
+      }
+    });
 
+    const confirmedEndpointKeys = new Set(visual.edges.map(connectionEndpointKey));
+    pendingManualConnectionsRef.current.forEach((pending, key) => {
+      if (!confirmedEndpointKeys.has(key)) visual.edges.push(pending.edge);
+    });
+
+    if (motionEnabled) {
       const nextNodeIds = new Set(nextNodes.map((node) => node.id));
       let transitionNodes = [
         ...nextNodes,
         ...nodesRef.current.filter((node) => !node.ghost && !nextNodeIds.has(node.id)),
       ];
       visual.removedEdges.forEach((edge) => {
+        if (edge.pending) return;
         const key = connectionEdgeKey(edge);
         const wasManual = manualPopKeysRef.current.delete(key);
         const alreadyPopping = connectionPopQueueRef.current.some((pop) => (
@@ -263,7 +280,9 @@ export function CanonicalSessionApp() {
       const transitionedById = new Map(transitionNodes.map((node) => [node.id, node]));
       nextNodes = nextNodes.map((node) => transitionedById.get(node.id) ?? node);
     } else {
-      visual.removedEdges.forEach((edge) => manualPopKeysRef.current.delete(connectionEdgeKey(edge)));
+      visual.removedEdges.forEach((edge) => {
+        if (!edge.pending) manualPopKeysRef.current.delete(connectionEdgeKey(edge));
+      });
     }
 
     const nextEdges = captureFluidRestLengths(nextNodes, visual.edges, {});
@@ -307,6 +326,7 @@ export function CanonicalSessionApp() {
       committedPositionsRef.current = new Map();
       connectionPopQueueRef.current = [];
       manualPopKeysRef.current.clear();
+      pendingManualConnectionsRef.current.clear();
       nodesRef.current = [];
       edgesRef.current = [];
       setSelectedId(null);
@@ -417,8 +437,7 @@ export function CanonicalSessionApp() {
             settings: FLUID_PHYSICS_SETTINGS,
           })
         : { nodes: nodesRef.current.map((node) => ({ ...node })), active: false };
-      const radiusActive = updateBubbleRadii(result.nodes, edgesRef.current, now, frameStep, { reducedMotion });
-      if (result.active || radiusActive) {
+      if (result.active) {
         nodesRef.current = result.nodes;
         setNodes(result.nodes);
       }
@@ -466,9 +485,11 @@ export function CanonicalSessionApp() {
     setSelectedIds(id ? [id] : []);
   }, []);
 
-  const touchGraph = (nextNodes) => {
+  const touchGraph = (nextNodes, nextEdges = edgesRef.current) => {
     nodesRef.current = nextNodes;
+    edgesRef.current = nextEdges;
     setNodes(nextNodes);
+    setEdges(nextEdges);
   };
 
   const materializeTypedThought = useCallback(async (text, itemId) => {
@@ -651,12 +672,54 @@ export function CanonicalSessionApp() {
 
   const connectTarget = async (targetId) => {
     if (!connectFromId || connectFromId === targetId) return;
+    const sourceId = connectFromId;
+    const source = nodesRef.current.find((node) => node.id === sourceId);
+    const target = nodesRef.current.find((node) => node.id === targetId);
+    if (!source || !target) {
+      setConnectFromId(null);
+      return;
+    }
+    const pendingKey = connectionEndpointKey({ from: sourceId, to: targetId });
+    const startedAt = performance.now();
+    const pendingEdge = {
+      id: `pending:${pendingKey}:${startedAt}`,
+      from: sourceId,
+      to: targetId,
+      bend: 0,
+      createdAt: startedAt,
+      pending: true,
+      ghost: false,
+    };
+    const nextNodes = applyConnectionGrowthMotion(
+      nodesRef.current,
+      pendingEdge,
+      { reducedMotion: reducedMotionRef.current },
+    );
+    const nextEdges = captureFluidRestLengths(
+      nextNodes,
+      [...edgesRef.current, pendingEdge],
+      {},
+    );
+    const visualPendingEdge = nextEdges.find((edge) => edge.id === pendingEdge.id) ?? pendingEdge;
+    pendingManualConnectionsRef.current.set(pendingKey, {
+      edge: visualPendingEdge,
+      startedAt,
+    });
+    touchGraph(nextNodes, nextEdges);
     try {
-      await perform({ type: "connect_bubbles", from_reference: connectFromId, to_reference: targetId });
+      await perform({ type: "connect_bubbles", from_reference: sourceId, to_reference: targetId });
       selectOne(targetId);
     } catch (error) {
       showToast(error.message);
     } finally {
+      const unresolved = pendingManualConnectionsRef.current.get(pendingKey);
+      if (unresolved?.edge.id === pendingEdge.id) {
+        pendingManualConnectionsRef.current.delete(pendingKey);
+        touchGraph(
+          nodesRef.current,
+          edgesRef.current.filter((edge) => edge.id !== pendingEdge.id),
+        );
+      }
       setConnectFromId(null);
     }
   };
@@ -670,6 +733,14 @@ export function CanonicalSessionApp() {
     if (!canonicalEdge) return;
     const key = connectionEdgeKey(canonicalEdge);
     manualPopKeysRef.current.add(key);
+    const pendingPop = [...connectionPopQueueRef.current].reverse().find((pop) => (
+      connectionMatches(canonicalEdge, {
+        id: pop.edgeId,
+        from: pop.aId,
+        to: pop.bId,
+      })
+    ));
+    if (pendingPop) pendingPop.hideUntilResolved = true;
     const transition = buildConnectionPopTransition(nodesRef.current, canonicalEdge, motion, {
       reducedMotion: reducedMotionRef.current,
       includePop: false,
@@ -678,10 +749,12 @@ export function CanonicalSessionApp() {
     perform({ type: "delete_connection", edge_id: canonicalEdge.id })
       .then(() => {
         manualPopKeysRef.current.delete(key);
+        if (pendingPop) pendingPop.hideUntilResolved = false;
         showToast("Connection popped");
       })
       .catch((error) => {
         manualPopKeysRef.current.delete(key);
+        if (pendingPop) pendingPop.hideUntilResolved = false;
         showToast(error.message);
       });
   };

@@ -1,6 +1,28 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import { buildFluidVisualNodes } from "./fluidMaterial.js";
 import { proposalVisuals, visualizeSession } from "./session/presentation.js";
+import { radiusForThought, wrapThought } from "./thoughtSizing.js";
+
+test("classic and session routes reuse one sizing and canvas renderer", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const motionSource = readFileSync(new URL("./connectionVisualMotion.js", import.meta.url), "utf8");
+  const sessionMotionSource = readFileSync(new URL("./session/connectionMotion.js", import.meta.url), "utf8");
+  const presentationSource = readFileSync(new URL("./session/presentation.js", import.meta.url), "utf8");
+  const sessionSource = readFileSync(new URL("./CanonicalSessionApp.jsx", import.meta.url), "utf8");
+
+  assert.match(appSource, /import \{ radiusForThought, wrapThought \} from "\.\/thoughtSizing\.js"/);
+  assert.match(presentationSource, /import \{ radiusForThought, wrapThought \} from "\.\.\/thoughtSizing\.js"/);
+  assert.doesNotMatch(appSource, /function (?:wrapThought|radiusForThought)\(/);
+  assert.doesNotMatch(presentationSource, /function (?:wrapThought|radiusForThought)\(/);
+  assert.match(sessionSource, /import \{ IconButton, MindMap, layoutHierarchy \} from "\.\/App\.jsx"/);
+  assert.match(appSource, /from "\.\/connectionVisualMotion\.js"/);
+  assert.match(sessionMotionSource, /from "\.\.\/connectionVisualMotion\.js"/);
+  assert.match(motionSource, /export function applyConnectionGrowthMotion/);
+  assert.match(motionSource, /export function buildConnectionPopTransition/);
+  assert.doesNotMatch(sessionSource, /updateBubbleRadii/);
+});
 
 test("create-bubble proposals preserve their parent ghost tether", () => {
   const nodes = [{ id: "root", x: 500, y: 500, r: 70, depth: 0, ghost: false }];
@@ -126,4 +148,107 @@ test("canonical edge transitions are staggered once and remain idempotent across
   );
   assert.deepEqual(restored.addedEdges.map((edge) => edge.id), ["edge-1"]);
   assert.equal(restored.addedEdges[0].createdAt, 1200);
+});
+
+test("committing a connection preserves classic lobe radius and typography", () => {
+  const session = {
+    nodes: [
+      {
+        id: "root",
+        text: "First thought",
+        depth: 0,
+        x: 100,
+        y: 200,
+        sources: [],
+        created_by: "you",
+        created_at: "2026-07-20T12:00:00.000Z",
+        updated_at: "2026-07-20T12:00:00.000Z",
+      },
+      {
+        id: "other",
+        text: "Second thought",
+        depth: 1,
+        x: 300,
+        y: 200,
+        sources: [],
+        created_by: "you",
+        created_at: "2026-07-20T12:00:00.000Z",
+        updated_at: "2026-07-20T12:00:00.000Z",
+      },
+    ],
+    edges: [],
+  };
+  const before = visualizeSession(session, [], [], new Map(), 1000);
+  const typographyBefore = before.nodes.map((node) => ({
+    id: node.id,
+    r: node.r,
+    targetR: node.targetR,
+    lines: node.lines,
+  }));
+
+  const connected = visualizeSession(
+    {
+      ...session,
+      edges: [{ id: "edge-1", from: "root", to: "other", created_by: "you" }],
+    },
+    before.nodes,
+    before.edges,
+    before.committedPositions,
+    1200,
+  );
+
+  assert.deepEqual(
+    connected.nodes.map((node) => ({
+      id: node.id,
+      r: node.r,
+      targetR: node.targetR,
+      lines: node.lines,
+    })),
+    typographyBefore,
+  );
+
+  const reloadedConnected = visualizeSession(
+    {
+      ...session,
+      edges: [{ id: "edge-1", from: "root", to: "other", created_by: "you" }],
+    },
+    [],
+    [],
+    new Map(),
+    1200,
+    { animateNew: false },
+  );
+  assert.deepEqual(
+    reloadedConnected.nodes.map((node) => ({
+      id: node.id,
+      r: node.r,
+      targetR: node.targetR,
+      lines: node.lines,
+    })),
+    typographyBefore,
+  );
+
+  const classicNodes = session.nodes.map((node, index) => {
+    const lines = wrapThought(node.text);
+    const fallback = index === 0 ? 82 : 46;
+    const r = radiusForThought(lines, fallback, false);
+    return {
+      id: node.id,
+      x: node.x,
+      y: node.y,
+      r,
+      lines,
+      createdAt: before.nodes[index].createdAt,
+    };
+  });
+  const sessionGeometry = buildFluidVisualNodes(before.nodes, 1400, false);
+  const classicGeometry = buildFluidVisualNodes(classicNodes, 1400, false);
+  classicNodes.forEach((node) => {
+    const sessionVisual = sessionGeometry.get(node.id);
+    const classicVisual = classicGeometry.get(node.id);
+    assert.deepEqual(
+      [sessionVisual.radius, sessionVisual.radiusX, sessionVisual.radiusY, sessionVisual.rotation],
+      [classicVisual.radius, classicVisual.radiusX, classicVisual.radiusY, classicVisual.rotation],
+    );
+  });
 });
