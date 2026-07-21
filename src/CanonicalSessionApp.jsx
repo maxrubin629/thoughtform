@@ -47,6 +47,9 @@ import {
 import {
   actorLabel,
   activityLabel,
+  buildConversationTimeline,
+  createMapControllerActivityDelay,
+  mapControllerPresentation,
   proposalOperationLabel,
   proposalVisuals,
   visualizeSession,
@@ -59,6 +62,8 @@ import {
   getSession,
   listSessions,
   renameSession,
+  retrySessionMapController,
+  shouldApplySessionSnapshot,
   subscribeSessionEvents,
   synthesizeSession,
   updateSessionUiContext,
@@ -153,6 +158,10 @@ export function CanonicalSessionApp() {
   const connectionPopQueueRef = useRef([]);
   const manualPopKeysRef = useRef(new Set());
   const pendingManualConnectionsRef = useRef(new Map());
+  const [proposalPositions, setProposalPositions] = useState(() => new Map());
+  const proposalNodesRef = useRef([]);
+  const proposalEdgesRef = useRef([]);
+  const proposalDragStartRef = useRef(new Map());
 
   const [selectedId, setSelectedId] = useState(null);
   const [selectedIds, setSelectedIds] = useState([]);
@@ -168,6 +177,8 @@ export function CanonicalSessionApp() {
   const [searchQuery, setSearchQuery] = useState("");
   const [favorite, setFavorite] = useState(true);
   const [showSuggestions, setShowSuggestions] = useState(true);
+  const showSuggestionsRef = useRef(showSuggestions);
+  showSuggestionsRef.current = showSuggestions;
   const [showProvenance, setShowProvenance] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(() => (
     globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false
@@ -189,9 +200,16 @@ export function CanonicalSessionApp() {
 
   const [voiceState, setVoiceState] = useState("idle");
   const [voiceError, setVoiceError] = useState("");
+  const [controllerActivity, setControllerActivity] = useState({
+    sessionId: null,
+    active: false,
+    visible: false,
+  });
+  const [controllerRetrying, setControllerRetrying] = useState(false);
   const [liveCaption, setLiveCaption] = useState("");
   const [partnerCaption, setPartnerCaption] = useState("");
   const [seconds, setSeconds] = useState(0);
+  const controllerActivityDelayRef = useRef(null);
   const realtimeRef = useRef(null);
   const audioRef = useRef(null);
 
@@ -207,6 +225,19 @@ export function CanonicalSessionApp() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    const delay = createMapControllerActivityDelay({ onChange: setControllerActivity });
+    controllerActivityDelayRef.current = delay;
+    return () => {
+      delay.dispose();
+      if (controllerActivityDelayRef.current === delay) controllerActivityDelayRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    controllerActivityDelayRef.current?.update(canonical);
+  }, [canonical?.id, canonical?.map_controller?.status]);
+
   const applyCanonicalSnapshot = useCallback((
     snapshot,
     { animateNew = true, allowSessionSwitch = false } = {},
@@ -218,12 +249,7 @@ export function CanonicalSessionApp() {
       && !allowSessionSwitch
     ) return;
     const currentSnapshot = canonicalRef.current;
-    if (
-      currentSnapshot?.id === snapshot.id
-      && Number.isFinite(currentSnapshot.revision)
-      && Number.isFinite(snapshot.revision)
-      && snapshot.revision < currentSnapshot.revision
-    ) return;
+    if (!shouldApplySessionSnapshot(currentSnapshot, snapshot)) return;
     const motionEnabled = animateNew && !reducedMotionRef.current;
     const visual = visualizeSession(
       snapshot,
@@ -429,17 +455,30 @@ export function CanonicalSessionApp() {
     const animate = (now) => {
       const frameStep = clamp((now - lastTime) / 16.67, 0.35, 2);
       lastTime = now;
+      const presentationNodes = showSuggestionsRef.current
+        ? [...nodesRef.current, ...proposalNodesRef.current]
+        : nodesRef.current;
+      const presentationEdges = showSuggestionsRef.current
+        ? [...edgesRef.current, ...proposalEdgesRef.current]
+        : edgesRef.current;
       const result = viewMode === "clusters"
-        ? stepFluidPhysics(nodesRef.current, edgesRef.current, {
+        ? stepFluidPhysics(presentationNodes, presentationEdges, {
             frameStep,
             width: BASE_WIDTH,
             height: BASE_HEIGHT,
             settings: FLUID_PHYSICS_SETTINGS,
+            includeGhosts: true,
           })
-        : { nodes: nodesRef.current.map((node) => ({ ...node })), active: false };
+        : { nodes: presentationNodes, active: false };
       if (result.active) {
-        nodesRef.current = result.nodes;
-        setNodes(result.nodes);
+        const nextNodes = result.nodes.filter((node) => !node.ghost);
+        const nextProposalNodes = result.nodes.filter((node) => node.ghost);
+        nodesRef.current = nextNodes;
+        setNodes(nextNodes);
+        if (showSuggestionsRef.current) {
+          proposalNodesRef.current = nextProposalNodes;
+          setProposalPositions(new Map(nextProposalNodes.map((node) => [node.id, node])));
+        }
       }
       animationFrame = window.requestAnimationFrame(animate);
     };
@@ -452,7 +491,7 @@ export function CanonicalSessionApp() {
     const next = layoutHierarchy(nodesRef.current, edgesRef.current);
     nodesRef.current = next;
     setNodes(next);
-  }, [canonical?.id, canonical?.revision, canonical?.nodes?.length, canonical?.edges?.length, viewMode]);
+  }, [canonical?.id, canonical?.nodes?.length, canonical?.edges?.length, viewMode]);
 
   useEffect(() => {
     if (!realtimeRef.current?.connected) return undefined;
@@ -480,7 +519,6 @@ export function CanonicalSessionApp() {
   useEffect(() => () => stopRealtime(), [stopRealtime]);
 
   const selectOne = useCallback((id) => {
-    if (id && !nodesRef.current.some((node) => node.id === id)) return;
     setSelectedId(id);
     setSelectedIds(id ? [id] : []);
   }, []);
@@ -508,21 +546,29 @@ export function CanonicalSessionApp() {
       const quote = text.slice(idea.span[0], idea.span[1]);
       const repeated = best && bestScore >= REMENTION_MIN_OVERLAP
         && bestScore / Math.max(idea.tokens.size, 1) >= REMENTION_COVERAGE;
-      if (repeated) {
-        await perform({
+      const operation = repeated
+        ? {
           type: "revisit_bubble",
           node_reference: best.id,
           transcript_quote: quote,
           realtime_item_id: itemId,
-        }, { actor: "partner" });
-      } else {
-        await perform({
+        }
+        : {
           type: "create_bubble",
           text: idea.label,
           parent_reference: bestScore >= ATTACH_MIN_OVERLAP ? best?.id ?? null : null,
           transcript_quote: quote,
           realtime_item_id: itemId,
-        }, { actor: "partner" });
+        };
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await perform(operation, { actor: "partner" });
+          break;
+        } catch (error) {
+          if (!(error instanceof SessionApiError)
+            || error.code !== "revision_conflict"
+            || attempt === 2) throw error;
+        }
       }
     }
   }, [perform]);
@@ -571,7 +617,7 @@ export function CanonicalSessionApp() {
     onPartnerTranscriptPartial: ({ text }) => setPartnerCaption(text),
     onPartnerTranscriptFinal: ({ text, itemId }) => {
       setPartnerCaption("");
-      appendUtterance("partner", text, itemId).catch((error) => showToast(error.message));
+      return appendUtterance("partner", text, itemId).catch((error) => showToast(error.message));
     },
     onToolResult: ({ result }) => {
       const snapshot = snapshotFrom(result);
@@ -606,6 +652,21 @@ export function CanonicalSessionApp() {
     showToast(mode === "vad" ? "Server voice detection selected" : "Push-to-talk selected");
   };
 
+  const retryMapController = async () => {
+    if (!canonical?.id || controllerRetrying) return;
+    setControllerRetrying(true);
+    try {
+      const result = await retrySessionMapController(canonical.id);
+      const snapshot = snapshotFrom(result);
+      if (snapshot) applyCanonicalSnapshot(snapshot);
+    } catch (error) {
+      if (error instanceof SessionApiError && error.snapshot) applyCanonicalSnapshot(error.snapshot);
+      showToast(error.message);
+    } finally {
+      setControllerRetrying(false);
+    }
+  };
+
   const startPushToTalk = (event) => {
     try {
       event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -628,6 +689,16 @@ export function CanonicalSessionApp() {
   };
 
   const startMoveNode = (id) => {
+    const proposalNode = proposalNodesRef.current.find((node) => node.id === id);
+    if (proposalNode) {
+      proposalDragStartRef.current.set(id, proposalNode);
+      const next = proposalNodesRef.current.map((node) => node.id === id
+        ? { ...node, dragging: true, vx: 0, vy: 0, shadeVx: 0, shadeVy: 0 }
+        : node);
+      proposalNodesRef.current = next;
+      setProposalPositions(new Map(next.map((node) => [node.id, node])));
+      return;
+    }
     if (!nodesRef.current.some((node) => node.id === id)) return;
     touchGraph(nodesRef.current.map((node) => node.id === id
       ? { ...node, dragging: true, vx: 0, vy: 0, shadeVx: 0, shadeVy: 0 }
@@ -635,6 +706,23 @@ export function CanonicalSessionApp() {
   };
 
   const moveNode = (id, x, y) => {
+    if (proposalNodesRef.current.some((node) => node.id === id)) {
+      const next = proposalNodesRef.current.map((node) => node.id === id
+        ? {
+            ...node,
+            x,
+            y,
+            dragging: true,
+            vx: 0,
+            vy: 0,
+            shadeVx: x - node.x,
+            shadeVy: y - node.y,
+          }
+        : node);
+      proposalNodesRef.current = next;
+      setProposalPositions(new Map(next.map((node) => [node.id, node])));
+      return;
+    }
     if (!nodesRef.current.some((node) => node.id === id)) return;
     touchGraph(nodesRef.current.map((node) => node.id === id
       ? { ...node, x, y, dragging: true, vx: 0, vy: 0, shadeVx: x - node.x, shadeVy: y - node.y }
@@ -642,6 +730,25 @@ export function CanonicalSessionApp() {
   };
 
   const finishMoveNode = (id, vx, vy, moved) => {
+    if (proposalNodesRef.current.some((node) => node.id === id)) {
+      proposalDragStartRef.current.delete(id);
+      const release = 0.08 + (1 - FLUID_PHYSICS_SETTINGS.viscosity) * 0.08;
+      const next = proposalNodesRef.current.map((node) => {
+        if (node.id !== id) return node;
+        const released = {
+          ...node,
+          dragging: false,
+          vx: moved ? clamp(vx, -24, 24) * release : 0,
+          vy: moved ? clamp(vy, -24, 24) * release : 0,
+          shadeVx: 0,
+          shadeVy: 0,
+        };
+        return moved ? released : withWobble(released, 1, 0, 0.082);
+      });
+      proposalNodesRef.current = next;
+      setProposalPositions(new Map(next.map((node) => [node.id, node])));
+      return;
+    }
     if (!nodesRef.current.some((node) => node.id === id)) return;
     const release = 0.08 + (1 - FLUID_PHYSICS_SETTINGS.viscosity) * 0.08;
     const next = nodesRef.current.map((node) => {
@@ -664,6 +771,18 @@ export function CanonicalSessionApp() {
   };
 
   const cancelMoveNode = (id) => {
+    if (proposalNodesRef.current.some((node) => node.id === id)) {
+      const start = proposalDragStartRef.current.get(id);
+      proposalDragStartRef.current.delete(id);
+      if (start) {
+        const next = proposalNodesRef.current.map((node) => node.id === id
+          ? { ...start, dragging: false, vx: 0, vy: 0, shadeVx: 0, shadeVy: 0 }
+          : node);
+        proposalNodesRef.current = next;
+        setProposalPositions(new Map(next.map((node) => [node.id, node])));
+      }
+      return;
+    }
     if (!nodesRef.current.some((node) => node.id === id)) return;
     touchGraph(nodesRef.current.map((node) => node.id === id
       ? { ...node, dragging: false, vx: 0, vy: 0, shadeVx: 0, shadeVy: 0 }
@@ -730,7 +849,7 @@ export function CanonicalSessionApp() {
       || (candidate.from === edge.from && candidate.to === edge.to)
       || (candidate.from === edge.to && candidate.to === edge.from)
     ));
-    if (!canonicalEdge) return;
+    if (!canonicalEdge) return false;
     const key = connectionEdgeKey(canonicalEdge);
     manualPopKeysRef.current.add(key);
     const pendingPop = [...connectionPopQueueRef.current].reverse().find((pop) => (
@@ -757,6 +876,7 @@ export function CanonicalSessionApp() {
         if (pendingPop) pendingPop.hideUntilResolved = false;
         showToast(error.message);
       });
+    return true;
   };
 
   const rootId = useMemo(() => (
@@ -972,14 +1092,39 @@ export function CanonicalSessionApp() {
   const pendingProposals = useMemo(() => (
     (canonical?.proposals ?? []).filter((proposal) => proposal.status === "pending" || proposal.status === "stale")
   ), [canonical?.proposals]);
-  const ghostVisuals = useMemo(() => proposalVisuals(pendingProposals, nodes), [pendingProposals, nodes]);
-  const mapNodes = showSuggestions ? [...nodes, ...ghostVisuals.ghostNodes] : nodes;
-  const mapEdges = showSuggestions ? [...edges, ...ghostVisuals.ghostEdges] : edges;
+  const ghostVisuals = useMemo(
+    () => proposalVisuals(pendingProposals, nodes, proposalPositions),
+    [pendingProposals, nodes, proposalPositions],
+  );
+  proposalNodesRef.current = ghostVisuals.ghostNodes;
+  const previousProposalEdges = new Map(proposalEdgesRef.current.map((edge) => [edge.id, edge]));
+  const retainedProposalEdges = ghostVisuals.ghostEdges.map((edge) => {
+    const previous = previousProposalEdges.get(edge.id);
+    return previous?.rest ? { ...edge, rest: previous.rest, restDx: previous.restDx, restDy: previous.restDy } : edge;
+  });
+  const physicalProposalEdges = captureFluidRestLengths(
+    [...nodes, ...ghostVisuals.ghostNodes],
+    retainedProposalEdges,
+    { includeGhosts: true },
+  );
+  proposalEdgesRef.current = physicalProposalEdges;
+  const mapNodes = useMemo(
+    () => (showSuggestions ? [...nodes, ...ghostVisuals.ghostNodes] : nodes),
+    [ghostVisuals.ghostNodes, nodes, showSuggestions],
+  );
+  const mapEdges = useMemo(
+    () => (showSuggestions ? [...edges, ...physicalProposalEdges] : edges),
+    [edges, physicalProposalEdges, showSuggestions],
+  );
   const selected = mapNodes.find((node) => node.id === selectedId);
   const selectedSource = selected?.sources?.[0];
   const sourceUtterance = selectedSource
     ? canonical?.transcript?.find((utterance) => utterance.id === selectedSource.utteranceId)
     : null;
+  const conversationTimeline = useMemo(
+    () => buildConversationTimeline(canonical?.transcript, canonical?.operations),
+    [canonical?.operations, canonical?.transcript],
+  );
   const searchResults = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     if (!query) return nodes.slice(0, 12);
@@ -1022,11 +1167,18 @@ export function CanonicalSessionApp() {
   const timer = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
   const voiceConnected = realtimeRef.current?.connected;
   const voiceStarting = ["connecting", "requesting_microphone"].includes(voiceState);
+  const controllerStatus = mapControllerPresentation(canonical?.map_controller, {
+    activeVisible: controllerActivity.sessionId === canonical?.id
+      && controllerActivity.active
+      && controllerActivity.visible,
+  });
   const committedNodeIds = new Set(canonical?.nodes?.map((node) => node.id) ?? []);
   const deletableSelection = selectedIds.filter((id) => id !== rootId && committedNodeIds.has(id));
-  const historyEntryIds = [...(canonical?.operations ?? [])].reverse()
-    .find((operation) => Array.isArray(operation.history_entry_ids))?.history_entry_ids ?? [];
-  const canRedo = (canonical?.history_cursor ?? 0) < historyEntryIds.length;
+  const historyLength = canonical?.history_length
+    ?? [...(canonical?.operations ?? [])].reverse()
+      .find((operation) => Array.isArray(operation.history_entry_ids))?.history_entry_ids?.length
+    ?? 0;
+  const canRedo = (canonical?.history_cursor ?? 0) < historyLength;
 
   const acceptGhost = (ghostId) => {
     const ghost = ghostVisuals.ghostNodes.find((node) => node.id === ghostId);
@@ -1169,12 +1321,39 @@ export function CanonicalSessionApp() {
             <>
               <div className="session-transcript" data-testid="transcript">
                 {!canonical?.transcript?.length && <p className="empty-state">The transcript is the record; the map is the interpretation. Start anywhere.</p>}
-                {(canonical?.transcript ?? []).map((utterance) => (
-                  <div key={utterance.id} ref={(element) => { if (element) utteranceElementsRef.current.set(utterance.id, element); else utteranceElementsRef.current.delete(utterance.id); }} className={`session-utterance ${utterance.speaker} ${highlight?.utteranceId === utterance.id ? "is-highlighted" : ""}`}>
-                    <span>{utterance.speaker === "you" ? "You" : "Partner"} · {formatClock(utterance.completed_at)}</span>
-                    <p>{renderUtteranceText(utterance)}</p>
-                  </div>
-                ))}
+                {conversationTimeline.map((turn) => {
+                  const firstUtterance = turn.utterances[0];
+                  const highlighted = turn.utterances.some((utterance) => utterance.id === highlight?.utteranceId);
+                  const timestamp = firstUtterance?.completed_at ?? turn.actions[0]?.createdAt;
+                  return (
+                    <div key={turn.id} className={`session-utterance ${turn.speaker} ${highlighted ? "is-highlighted" : ""}`}>
+                      <time>{turn.speaker === "you" ? "You" : "Partner"} · {formatClock(timestamp)}</time>
+                      {turn.utterances.length > 0 && (
+                        <p>
+                          {turn.utterances.map((utterance, index) => (
+                            <React.Fragment key={utterance.id}>
+                              {index > 0 && " "}
+                              <span
+                                ref={(element) => {
+                                  if (element) utteranceElementsRef.current.set(utterance.id, element);
+                                  else utteranceElementsRef.current.delete(utterance.id);
+                                }}
+                                className="session-utterance-fragment"
+                              >
+                                {renderUtteranceText(utterance)}
+                              </span>
+                            </React.Fragment>
+                          ))}
+                        </p>
+                      )}
+                      {turn.actions.length > 0 && (
+                        <div className="session-turn-actions" aria-label="Partner map actions">
+                          {turn.actions.map((action) => <span key={action.id}>{action.label}</span>)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
                 <div ref={transcriptEndRef} />
               </div>
               <form className="session-chat" onSubmit={submitChat}>
@@ -1280,7 +1459,14 @@ export function CanonicalSessionApp() {
       )}
 
       {(voiceStarting || voiceConnected || liveCaption || partnerCaption) && (
-        <div className="voice-caption session-caption" role="status" aria-live="polite"><span /><p>{partnerCaption ? "Partner" : voiceStarting ? "Connecting securely…" : voiceMode === "push-to-talk" ? "Hold the mic while you speak…" : "Listening for a complete thought…"}</p><small>{partnerCaption || liveCaption || "Partial speech stays here until the utterance completes."}</small></div>
+        <div className="voice-caption session-caption" role="status" aria-live="polite"><span /><p>{partnerCaption ? "Partner" : voiceStarting ? "Connecting…" : voiceMode === "push-to-talk" ? "Hold the mic while you speak…" : "Listening for a complete thought…"}</p><small>{partnerCaption || liveCaption || "Speak naturally."}</small></div>
+      )}
+
+      {controllerStatus && (
+        <div className={`session-controller-status is-${controllerStatus.kind}`} role="status" aria-live="polite">
+          <span>{controllerStatus.label}</span>
+          {controllerStatus.kind === "error" && <button type="button" onClick={retryMapController} disabled={controllerRetrying}>{controllerRetrying ? "Retrying…" : "Retry"}</button>}
+        </div>
       )}
 
       <div className={`voice-control ${voiceConnected ? "is-listening" : ""}`}>

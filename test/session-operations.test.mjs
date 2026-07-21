@@ -18,6 +18,12 @@ function blankSession() {
     proposals: [],
     operations: [],
     history_cursor: 0,
+    map_controller: {
+      processed_transcript_count: 0,
+      last_run_id: null,
+      last_success_at: null,
+      last_error: null,
+    },
   };
 }
 
@@ -74,6 +80,58 @@ test("transcript commits are append-only, non-semantic, and idempotent by realti
   assert.equal(h.session.transcript[0].text, "The voice agent should keep an exact transcript and exact transcript spans");
 });
 
+test("semantic records retain controller and realtime provenance while presenting Partner as actor", () => {
+  const h = harness();
+  appendUserTurn(h, "Map this complete spoken thought.");
+  const utterance = h.session.transcript[0];
+
+  h.apply({
+    type: "create_bubble",
+    text: "Complete spoken thought",
+    quote: "complete spoken thought",
+    utterance_id: utterance.id,
+    realtime_item_id: utterance.realtime_item_id,
+    origin: "map_controller",
+    expected_revision: 0,
+  });
+  const controllerRecord = h.session.operations.at(-1);
+  assert.equal(controllerRecord.actor, "partner");
+  assert.equal(controllerRecord.origin, "map_controller");
+  assert.deepEqual(controllerRecord.source_utterance_ids, [utterance.id]);
+  assert.equal(controllerRecord.source_realtime_item_id, utterance.realtime_item_id);
+
+  h.apply({
+    type: "revisit_bubble",
+    node_id: h.session.nodes[0].id,
+    origin: "realtime",
+    realtime_item_id: utterance.realtime_item_id,
+    expected_revision: 1,
+  });
+  const realtimeRecord = h.session.operations.at(-1);
+  assert.equal(realtimeRecord.actor, "partner");
+  assert.equal(realtimeRecord.origin, "realtime");
+  assert.deepEqual(realtimeRecord.source_utterance_ids, [utterance.id]);
+  assert.equal(realtimeRecord.source_realtime_item_id, utterance.realtime_item_id);
+});
+
+test("rejects malformed operation provenance arrays as client errors", () => {
+  const h = harness();
+  for (const [field, value] of [["source_utterance_ids", "utterance-1"], ["sources", { utterance_id: "utterance-1" }]]) {
+    assert.throws(
+      () => h.apply({
+        type: "create_bubble",
+        text: `Malformed ${field}`,
+        [field]: value,
+        expected_revision: 0,
+      }),
+      (error) => error instanceof SessionOperationError
+        && error.status === 400
+        && error.code === `invalid_${field}`,
+    );
+  }
+  assert.equal(h.session.nodes.length, 0);
+});
+
 test("resolves exact transcript quotes and rejects missing or ambiguous quotes", () => {
   const h = harness();
   appendUserTurn(h, "exact phrase then exact phrase");
@@ -88,6 +146,46 @@ test("resolves exact transcript quotes and rejects missing or ambiguous quotes",
   assert.deepEqual(
     resolveQuoteSpan(h.session, { utterance_id: h.session.transcript[0].id, quote: "then" }),
     { utterance_id: h.session.transcript[0].id, start: 13, end: 17, quote: "then" },
+  );
+});
+
+test("validates pre-resolved provenance spans against their exact bounded quote", () => {
+  const h = harness();
+  appendUserTurn(h, "bounded source text");
+  const utteranceId = h.session.transcript[0].id;
+  h.apply({
+    type: "create_bubble",
+    text: "Bounded source",
+    source: { utterance_id: utteranceId, start: 0, end: 7, quote: "bounded" },
+    expected_revision: 0,
+  });
+  assert.equal(h.session.nodes[0].sources[0].quote, "bounded");
+
+  assert.throws(
+    () => h.apply({
+      type: "edit_bubble",
+      node_id: h.session.nodes[0].id,
+      text: "Still bounded",
+      quote: "bounded",
+      source: { utterance_id: utteranceId, start: 0, end: 200, quote: "bounded" },
+      expected_revision: 1,
+    }),
+    (error) => error.code === "invalid_source_span",
+  );
+});
+
+test("move coordinates reject null instead of coercing it to the origin", () => {
+  const h = harness();
+  createRoot(h);
+  assert.throws(
+    () => h.apply({
+      type: "move_bubble",
+      node_id: h.session.nodes[0].id,
+      x: null,
+      y: 20,
+      expected_revision: 1,
+    }),
+    (error) => error.code === "invalid_x",
   );
 });
 
@@ -218,6 +316,130 @@ test("repeated create warms the existing bubble instead of duplicating it", () =
   assert.ok(h.session.nodes[0].heat_at);
 });
 
+test("setting an existing bubble as the central idea preserves the graph and is reversible", () => {
+  const h = harness();
+  createRoot(h, "Conversation is the main focus");
+  const originalRoot = structuredClone(h.session.nodes[0]);
+  h.apply({
+    type: "create_bubble",
+    text: "Voice-controlled mind map",
+    parent: originalRoot.id,
+    expected_revision: 1,
+    actor: "partner",
+  });
+  const promotedBefore = structuredClone(h.session.nodes[1]);
+  const edgesBefore = structuredClone(h.session.edges);
+
+  h.apply({
+    type: "set_central_idea",
+    node_reference: promotedBefore.id,
+    expected_revision: 2,
+    actor: "partner",
+  });
+
+  const promoted = h.session.nodes.find(({ id }) => id === promotedBefore.id);
+  const priorRoot = h.session.nodes.find(({ id }) => id === originalRoot.id);
+  assert.equal(promoted.depth, 0);
+  assert.equal(priorRoot.depth, 1);
+  assert.deepEqual([promoted.x, promoted.y], [originalRoot.x, originalRoot.y]);
+  assert.deepEqual([priorRoot.x, priorRoot.y], [promotedBefore.x, promotedBefore.y]);
+  assert.deepEqual(h.session.edges, [{
+    ...edgesBefore[0],
+    from: promotedBefore.id,
+    to: originalRoot.id,
+  }]);
+  assert.equal(priorRoot.text, originalRoot.text);
+  assert.equal(h.session.operations.at(-1).undoable, true);
+
+  h.apply({ type: "undo_map_change", expected_revision: 3, actor: "partner" });
+  assert.deepEqual(h.session.nodes, [originalRoot, promotedBefore]);
+  assert.deepEqual(h.session.edges, edgesBefore);
+
+  h.apply({ type: "redo_map_change", expected_revision: 4, actor: "partner" });
+  assert.equal(h.session.nodes.find(({ id }) => id === promotedBefore.id).depth, 0);
+  assert.equal(h.session.nodes.find(({ id }) => id === originalRoot.id).depth, 1);
+});
+
+test("setting a new sourced central idea keeps the previous root as a supporting bubble", () => {
+  const h = harness();
+  appendUserTurn(h, "It's like a voice-controlled mind map.");
+  createRoot(h, "Conversation is the main focus");
+  const originalRoot = structuredClone(h.session.nodes[0]);
+
+  h.apply({
+    type: "set_central_idea",
+    text: "Voice-controlled mind map",
+    quote: "voice-controlled mind map",
+    expected_revision: 1,
+    actor: "partner",
+  });
+
+  assert.equal(h.session.nodes.length, 2);
+  const central = h.session.nodes.find(({ depth }) => depth === 0);
+  const priorRoot = h.session.nodes.find(({ id }) => id === originalRoot.id);
+  assert.equal(central.text, "Voice-controlled mind map");
+  assert.equal(central.sources[0].quote, "voice-controlled mind map");
+  assert.deepEqual([central.x, central.y], [originalRoot.x, originalRoot.y]);
+  assert.equal(priorRoot.text, originalRoot.text);
+  assert.equal(priorRoot.depth, 1);
+  assert.equal(h.session.edges.length, 0);
+});
+
+test("one bubble can preserve exact provenance from several finalized speech fragments", () => {
+  const h = harness();
+  appendUserTurn(h, "I have an idea for a voice-controlled");
+  h.apply({
+    type: "append_utterance",
+    speaker: "you",
+    text: "sort of mind map app",
+    realtime_item_id: "input-item-2",
+    expected_revision: 0,
+  });
+
+  h.apply({
+    type: "create_bubble",
+    text: "Voice-controlled mind map",
+    quotes: ["voice-controlled", "mind map app"],
+    expected_revision: 0,
+    actor: "partner",
+  });
+
+  assert.deepEqual(h.session.nodes[0].sources, [
+    {
+      utterance_id: h.session.transcript[0].id,
+      start: 21,
+      end: 37,
+      quote: "voice-controlled",
+    },
+    {
+      utterance_id: h.session.transcript[1].id,
+      start: 8,
+      end: 20,
+      quote: "mind map app",
+    },
+  ]);
+});
+
+test("setting the central idea requires either an existing bubble or new text, but not both", () => {
+  const h = harness();
+  createRoot(h);
+
+  assert.throws(
+    () => h.apply({ type: "set_central_idea", expected_revision: 1, actor: "partner" }),
+    (error) => error.code === "invalid_central_idea_target",
+  );
+  assert.throws(
+    () => h.apply({
+      type: "set_central_idea",
+      node_reference: h.session.nodes[0].id,
+      text: "A different central idea",
+      expected_revision: 1,
+      actor: "partner",
+    }),
+    (error) => error.code === "invalid_central_idea_target",
+  );
+});
+
 test("one completed utterance can contribute no more than three bubbles", () => {
   const h = harness();
   appendUserTurn(h, "Alpha idea. Beta idea. Gamma idea. Delta idea.");
@@ -301,6 +523,27 @@ test("protects the anchor and bulk deletion is one reversible map change", () =>
   h.apply({ type: "undo_map_change", expected_revision: 4 });
   assert.equal(h.session.nodes.length, 3);
   assert.equal(h.session.edges.length, 2);
+});
+
+test("history stores entity deltas and only one current history list", () => {
+  const h = harness();
+  createRoot(h);
+  h.apply({ type: "create_bubble", text: "Child", parent: h.session.nodes[0].id, expected_revision: 1 });
+  h.apply({ type: "edit_bubble", node_id: h.session.nodes[1].id, text: "Edited child", expected_revision: 2 });
+
+  const undoable = h.session.operations.filter(({ undoable }) => undoable);
+  undoable.forEach((record) => {
+    assert.ok(Array.isArray(record.change.nodes));
+    assert.ok(Array.isArray(record.change.edges));
+    assert.equal(record.change.before, undefined);
+    assert.equal(record.change.after, undefined);
+  });
+  assert.equal(h.session.operations.filter(({ history_entry_ids }) => history_entry_ids).length, 1);
+
+  h.apply({ type: "undo_map_change", expected_revision: 3 });
+  assert.equal(h.session.nodes[1].text, "Child");
+  h.apply({ type: "redo_map_change", expected_revision: 4 });
+  assert.equal(h.session.nodes[1].text, "Edited child");
 });
 
 test("revision conflicts and duplicate call IDs cannot overwrite or replay a mutation", () => {
@@ -411,4 +654,27 @@ test("proposal acceptance drops duplicate and invalid operations and reports ful
     expected_revision: 5,
   });
   assert.equal(h.session.proposals[0].status, "dismissed");
+});
+
+test("proposal acceptance drops an over-limit utterance operation as stale", () => {
+  const h = harness();
+  appendUserTurn(h, "Alpha. Beta. Gamma. Delta.");
+  const utteranceId = h.session.transcript[0].id;
+  for (const [text, quote] of [["Alpha", "Alpha"], ["Beta", "Beta"], ["Gamma", "Gamma"]]) {
+    h.apply({ type: "create_bubble", text, quote, utterance_id: utteranceId, expected_revision: h.session.revision });
+  }
+  const proposed = h.apply({
+    type: "propose_changes",
+    actor: "curator",
+    rationale: "Add a fourth bubble from the same utterance.",
+    expected_revision: 3,
+    operations: [{ type: "create_bubble", text: "Delta", quote: "Delta", utterance_id: utteranceId }],
+  });
+  const accepted = h.apply({
+    type: "accept_proposal",
+    proposal_id: proposed.affected_ids[0],
+    expected_revision: 4,
+  });
+  assert.equal(accepted.proposal_status, "stale");
+  assert.equal(h.session.nodes.length, 3);
 });

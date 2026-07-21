@@ -30,10 +30,14 @@ function distanceToSegment(point, a, b) {
   return { distance: Math.hypot(point.x - x, point.y - y), t, x, y };
 }
 
-export function captureFluidRestLengths(nodes, edges, { reset = false } = {}) {
+export function captureFluidRestLengths(
+  nodes,
+  edges,
+  { reset = false, includeGhosts = false } = {},
+) {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   return edges.map((edge) => {
-    if (edge.ghost) {
+    if (edge.ghost && !includeGhosts) {
       const { rest: _rest, restDx: _restDx, restDy: _restDy, ...ghostEdge } = edge;
       return ghostEdge;
     }
@@ -60,6 +64,7 @@ export function stepFluidPhysics(
     width,
     height,
     settings = FLUID_PHYSICS_SETTINGS,
+    includeGhosts = false,
   },
 ) {
   const boundedStep = clamp(frameStep, 0.35, 2);
@@ -70,9 +75,9 @@ export function stepFluidPhysics(
     vy: Number.isFinite(node.vy) ? node.vy : 0,
     dragging: Boolean(node.dragging),
   }));
-  const physicalNodes = nextNodes.filter((node) => !node.ghost);
+  const physicalNodes = includeGhosts ? nextNodes : nextNodes.filter((node) => !node.ghost);
   const physicalById = new Map(physicalNodes.map((node) => [node.id, node]));
-  const links = edges.filter((edge) => !edge.ghost).flatMap((edge) => {
+  const links = edges.filter((edge) => includeGhosts || !edge.ghost).flatMap((edge) => {
     const a = physicalById.get(edge.from);
     const b = physicalById.get(edge.to);
     if (!a || !b) return [];

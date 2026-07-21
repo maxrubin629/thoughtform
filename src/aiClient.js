@@ -14,7 +14,7 @@ async function post(path, body) {
     if (response.status >= 500 && !data?.error) {
       throw new Error("AI server is unavailable — restart npm run dev");
     }
-    throw new Error(data?.error ?? `AI server error (${response.status})`);
+    throw new Error(data?.error?.message ?? data?.error ?? `AI server error (${response.status})`);
   }
   return data;
 }

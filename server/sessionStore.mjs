@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { open, mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
-export const SESSION_SCHEMA_VERSION = 1;
+export const SESSION_SCHEMA_VERSION = 2;
 export const UNTITLED_SESSION_TITLE = "Untitled map";
 
 const SESSION_KEYS = new Set([
@@ -18,8 +18,18 @@ const SESSION_KEYS = new Set([
   "proposals",
   "operations",
   "history_cursor",
+  "map_controller",
+]);
+const V1_SESSION_KEYS = new Set([...SESSION_KEYS].filter((key) => key !== "map_controller"));
+const INDEX_KEYS = new Set(["schema_version", "active_session_id"]);
+const MAP_CONTROLLER_KEYS = new Set([
+  "processed_transcript_count",
+  "last_run_id",
+  "last_success_at",
+  "last_error",
 ]);
 const ACTORS = new Set(["you", "partner", "curator"]);
+const OPERATION_ORIGINS = new Set(["ui", "realtime", "map_controller"]);
 const SPEAKERS = new Set(["you", "partner"]);
 const PROPOSAL_STATUSES = new Set(["pending", "accepted", "dismissed", "stale"]);
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -58,7 +68,6 @@ export class SessionRevisionConflictError extends SessionStoreError {
       details: {
         expected_revision: expected,
         current_revision: session.revision,
-        snapshot: structuredClone(session),
       },
     });
     this.current_revision = session.revision;
@@ -104,6 +113,118 @@ function assertTimestamp(value, pathname) {
 
 function assertActor(value, pathname) {
   if (!ACTORS.has(value)) schemaError(pathname, "must be you, partner, or curator");
+}
+
+function assertNullableString(value, pathname) {
+  if (value !== null) assertString(value, pathname, { nonempty: true });
+}
+
+function assertNullableTimestamp(value, pathname) {
+  if (value !== null) assertTimestamp(value, pathname);
+}
+
+function validateMapController(controller, pathname, transcriptLength) {
+  assertObject(controller, pathname);
+  for (const key of Object.keys(controller)) {
+    if (!MAP_CONTROLLER_KEYS.has(key)) schemaError(`${pathname}.${key}`, "is not part of the map controller checkpoint");
+  }
+  for (const key of MAP_CONTROLLER_KEYS) {
+    if (!(key in controller)) schemaError(`${pathname}.${key}`, "is required");
+  }
+  assertInteger(controller.processed_transcript_count, `${pathname}.processed_transcript_count`);
+  if (controller.processed_transcript_count > transcriptLength) {
+    schemaError(`${pathname}.processed_transcript_count`, "must not exceed the completed transcript length");
+  }
+  assertNullableString(controller.last_run_id, `${pathname}.last_run_id`);
+  assertNullableTimestamp(controller.last_success_at, `${pathname}.last_success_at`);
+  if (controller.last_error === null) return;
+  assertObject(controller.last_error, `${pathname}.last_error`);
+  const errorKeys = new Set(["code", "message", "at"]);
+  for (const key of Object.keys(controller.last_error)) {
+    if (!errorKeys.has(key)) schemaError(`${pathname}.last_error.${key}`, "is not part of the controller error");
+  }
+  for (const key of errorKeys) {
+    if (!(key in controller.last_error)) schemaError(`${pathname}.last_error.${key}`, "is required");
+  }
+  assertString(controller.last_error.code, `${pathname}.last_error.code`, { nonempty: true });
+  assertString(controller.last_error.message, `${pathname}.last_error.message`, { nonempty: true });
+  assertTimestamp(controller.last_error.at, `${pathname}.last_error.at`);
+}
+
+function defaultMapController(transcriptLength = 0) {
+  return {
+    processed_transcript_count: transcriptLength,
+    last_run_id: null,
+    last_success_at: null,
+    last_error: null,
+  };
+}
+
+function validateLegacyKeys(value, keys, pathname, version) {
+  for (const key of Object.keys(value)) {
+    if (!keys.has(key)) schemaError(`${pathname}.${key}`, `is not part of schema version ${version}`);
+  }
+  for (const key of keys) {
+    if (!(key in value)) schemaError(`${pathname}.${key}`, "is required");
+  }
+}
+
+function legacyOperationOrigin(operation) {
+  if (operation.actor === "partner") return "realtime";
+  return "ui";
+}
+
+function migrateOperationRecord(operation) {
+  const migrated = {
+    ...operation,
+    origin: operation.origin ?? legacyOperationOrigin(operation),
+  };
+  if (migrated.utterance_id && !migrated.source_utterance_ids) {
+    migrated.source_utterance_ids = [migrated.utterance_id];
+  }
+  if (migrated.realtime_item_id && !migrated.source_realtime_item_id) {
+    migrated.source_realtime_item_id = migrated.realtime_item_id;
+  }
+  return migrated;
+}
+
+export function migrateSession(session) {
+  assertObject(session, "session");
+  if (session.schema_version === SESSION_SCHEMA_VERSION) return { session, migrated: false };
+  if (session.schema_version !== 1) {
+    throw new SessionSchemaError(
+      `Unsupported session schema version ${String(session.schema_version)}; expected ${SESSION_SCHEMA_VERSION}.`,
+      { found: session.schema_version, supported: SESSION_SCHEMA_VERSION },
+    );
+  }
+  validateLegacyKeys(session, V1_SESSION_KEYS, "session", 1);
+  if (!Array.isArray(session.transcript)) schemaError("session.transcript", "must be an array");
+  if (!Array.isArray(session.operations)) schemaError("session.operations", "must be an array");
+  return {
+    migrated: true,
+    session: {
+      ...session,
+      schema_version: SESSION_SCHEMA_VERSION,
+      operations: session.operations.map(migrateOperationRecord),
+      map_controller: defaultMapController(session.transcript.length),
+    },
+  };
+}
+
+function migrateIndex(index) {
+  assertObject(index, "session index");
+  if (index.schema_version === SESSION_SCHEMA_VERSION) return { index, migrated: false };
+  if (index.schema_version !== 1) {
+    throw new SessionSchemaError("Unsupported session index schema version.", {
+      found: index.schema_version,
+      supported: SESSION_SCHEMA_VERSION,
+    });
+  }
+  validateLegacyKeys(index, INDEX_KEYS, "session index", 1);
+  return {
+    migrated: true,
+    index: { ...index, schema_version: SESSION_SCHEMA_VERSION },
+  };
 }
 
 function validateSource(source, pathname, utterances) {
@@ -161,7 +282,7 @@ export function validateSession(session) {
     );
   }
   for (const key of Object.keys(session)) {
-    if (!SESSION_KEYS.has(key)) schemaError(`session.${key}`, "is not part of schema version 1");
+    if (!SESSION_KEYS.has(key)) schemaError(`session.${key}`, `is not part of schema version ${SESSION_SCHEMA_VERSION}`);
   }
   for (const key of SESSION_KEYS) {
     if (!(key in session)) schemaError(`session.${key}`, "is required");
@@ -194,6 +315,7 @@ export function validateSession(session) {
     assertTimestamp(utterance.completed_at, `${pathname}.completed_at`);
     utterances.set(utterance.id, utterance);
   });
+  validateMapController(session.map_controller, "session.map_controller", session.transcript.length);
 
   if (!Array.isArray(session.nodes)) schemaError("session.nodes", "must be an array");
   const nodeIds = new Set();
@@ -253,6 +375,31 @@ export function validateSession(session) {
     operationIds.add(operation.id);
     assertString(operation.type, `${pathname}.type`, { nonempty: true });
     assertActor(operation.actor, `${pathname}.actor`);
+    if (!OPERATION_ORIGINS.has(operation.origin)) {
+      schemaError(`${pathname}.origin`, "must be ui, realtime, or map_controller");
+    }
+    if ((operation.origin === "realtime" || operation.origin === "map_controller")
+      && operation.actor !== "partner") {
+      schemaError(`${pathname}.actor`, "must be partner for realtime or map_controller operations");
+    }
+    if (operation.source_utterance_ids !== undefined) {
+      if (!Array.isArray(operation.source_utterance_ids)) {
+        schemaError(`${pathname}.source_utterance_ids`, "must be an array when present");
+      }
+      const sourceUtteranceIds = new Set();
+      operation.source_utterance_ids.forEach((id, sourceIndex) => {
+        assertId(id, `${pathname}.source_utterance_ids[${sourceIndex}]`);
+        if (!utterances.has(id)) schemaError(`${pathname}.source_utterance_ids[${sourceIndex}]`, "must reference a transcript utterance");
+        if (sourceUtteranceIds.has(id)) schemaError(`${pathname}.source_utterance_ids[${sourceIndex}]`, "must not contain duplicates");
+        sourceUtteranceIds.add(id);
+      });
+    }
+    if (operation.source_realtime_item_id !== undefined) {
+      assertString(operation.source_realtime_item_id, `${pathname}.source_realtime_item_id`, { nonempty: true });
+      if (!realtimeItems.has(operation.source_realtime_item_id)) {
+        schemaError(`${pathname}.source_realtime_item_id`, "must reference a transcript realtime item");
+      }
+    }
     assertTimestamp(operation.created_at, `${pathname}.created_at`);
     if (operation.history_entry_ids !== undefined && !Array.isArray(operation.history_entry_ids)) {
       schemaError(`${pathname}.history_entry_ids`, "must be an array when present");
@@ -342,7 +489,9 @@ export class SessionStore {
             active_session_id: null,
           });
         } else {
-          this.#validateIndex(index);
+          const migrated = migrateIndex(index);
+          this.#validateIndex(migrated.index);
+          if (migrated.migrated) await atomicWriteJson(this.indexPath, migrated.index);
         }
         return this;
       })().catch((error) => {
@@ -361,8 +510,18 @@ export class SessionStore {
         supported: SESSION_SCHEMA_VERSION,
       });
     }
+    validateLegacyKeys(index, INDEX_KEYS, "session index", SESSION_SCHEMA_VERSION);
     if (index.active_session_id !== null) assertId(index.active_session_id, "session index.active_session_id");
     return index;
+  }
+
+  async #readSessionFile(filename) {
+    const raw = await readJson(filename);
+    if (!raw) return null;
+    const migrated = migrateSession(raw);
+    validateSession(migrated.session);
+    if (migrated.migrated) await atomicWriteJson(filename, migrated.session);
+    return migrated.session;
   }
 
   #sessionPath(id) {
@@ -371,7 +530,8 @@ export class SessionStore {
 
   async #readIndex() {
     await this.init();
-    return this.#validateIndex(await readJson(this.indexPath));
+    const index = await readJson(this.indexPath);
+    return this.#validateIndex(index);
   }
 
   async #writeIndex(activeSessionId) {
@@ -400,17 +560,28 @@ export class SessionStore {
     await this.init();
     const entries = await readdir(this.directory, { withFileTypes: true });
     const sessions = [];
+    const warnings = [];
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name === "_index.json") continue;
-      const session = await readJson(path.join(this.directory, entry.name));
-      validateSession(session);
-      sessions.push({
-        id: session.id,
-        title: session.title,
-        revision: session.revision,
-        updated_at: session.updated_at,
-        thought_count: session.nodes.length,
-      });
+      try {
+        const session = await this.#readSessionFile(path.join(this.directory, entry.name));
+        if (!session) continue;
+        validateSession(session);
+        sessions.push({
+          id: session.id,
+          title: session.title,
+          revision: session.revision,
+          updated_at: session.updated_at,
+          thought_count: session.nodes.length,
+        });
+      } catch (error) {
+        if (!(error instanceof SessionSchemaError)) throw error;
+        warnings.push({
+          filename: entry.name,
+          code: error?.code ?? "session_read_failed",
+          message: error?.message ?? "The session could not be read.",
+        });
+      }
     }
     const index = await this.#readIndex();
     sessions.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
@@ -419,6 +590,7 @@ export class SessionStore {
         ? index.active_session_id
         : null,
       sessions,
+      warnings,
     };
   }
 
@@ -462,6 +634,7 @@ export class SessionStore {
       proposals: [],
       operations: [],
       history_cursor: 0,
+      map_controller: defaultMapController(),
     };
     validateSession(session);
     await atomicWriteJson(this.#sessionPath(sessionId), session);
@@ -475,9 +648,8 @@ export class SessionStore {
 
   async get(id) {
     await this.init();
-    const session = await readJson(this.#sessionPath(id));
+    const session = await this.#readSessionFile(this.#sessionPath(id));
     if (!session) throw new SessionNotFoundError(id);
-    validateSession(session);
     return structuredClone(session);
   }
 
@@ -497,7 +669,7 @@ export class SessionStore {
       try {
         return await this.get(index.active_session_id);
       } catch (error) {
-        if (!(error instanceof SessionNotFoundError)) throw error;
+        if (!(error instanceof SessionNotFoundError) && !(error instanceof SessionSchemaError)) throw error;
       }
     }
     const { sessions } = await this.list();
@@ -523,7 +695,6 @@ export class SessionStore {
       session.updated_at = nowIso(this.now);
       validateSession(session);
       await atomicWriteJson(this.#sessionPath(id), session);
-      await this.#writeIndex(id);
       return structuredClone(session);
     });
   }
@@ -557,7 +728,6 @@ export class SessionStore {
         throw new SessionRevisionConflictError(expectedRevision, current);
       }
       await atomicWriteJson(this.#sessionPath(session.id), session);
-      await this.#writeIndex(session.id);
       return structuredClone(session);
     });
   }
@@ -576,7 +746,6 @@ export class SessionStore {
       }
       validateSession(next);
       await atomicWriteJson(this.#sessionPath(id), next);
-      await this.#writeIndex(id);
       if (outcome?.session) return { ...outcome, session: structuredClone(next) };
       return structuredClone(next);
     });

@@ -2,14 +2,15 @@ import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { PROPOSAL_OPERATION_SCHEMA } from "./realtime.mjs";
 
-export const CURATOR_SYSTEM = `You are Thoughtform's silent background map curator. You inspect a complete canonical conversation and mind-map snapshot and may propose a small, coherent batch of improvements for review.
+export const CURATOR_SYSTEM = `You are Thoughtform's silent creative curator. You inspect the current canonical mind map and a bounded window of recent conversation, then decide whether one genuinely useful new direction is worth the user's attention.
 
 You are proposal-only. Never claim that an operation was applied, never address the user, and never mutate state directly. The product presents all assistant-side work under the single user-facing identity Partner; “curator” is an internal actor label only.
 
 Rules:
-- Ground every proposal in actual node ids, edge ids, and completed transcript evidence from the snapshot.
-- Prefer no proposal to a weak one. Return an empty operations array when the map needs no useful structural change.
-- Propose at most five operations that form one understandable atomic review card.
+- Think beyond transcription. Look for a missing implication, productive tension, unstated assumption, alternative, or non-obvious connection that the user has not already expressed.
+- Prefer no proposal to a weak, obvious, repetitive, or merely paraphrased idea. Returning an empty operations array should be common.
+- Surface only the single strongest direction and use at most three operations that form one understandable atomic review card.
+- Ground the direction in actual map content. Transcript evidence identifies the recent context that inspired it; it does not mean the proposed idea must repeat that text.
 - Use create_bubble, edit_bubble, revisit_bubble, connect_bubbles, delete_bubble, or delete_connection. Fill irrelevant nullable fields with null and excluded with false.
 - Do not duplicate an existing node or connection. Do not target missing endpoints, a pending/ghost node, or the protected starting anchor for deletion.
 - Treat deletion and reinterpretation conservatively. If evidence is weak or ambiguous, omit that operation.
@@ -48,7 +49,7 @@ export const CURATOR_PROPOSAL_SCHEMA = {
     },
     operations: {
       type: "array",
-      maxItems: 5,
+      maxItems: 3,
       items: PROPOSAL_OPERATION_SCHEMA,
       description: "A reviewable atomic batch. Return an empty array when no worthwhile proposal exists.",
     },
@@ -58,16 +59,19 @@ export const CURATOR_PROPOSAL_SCHEMA = {
 };
 
 export function isCuratorEnabled(env = process.env) {
-  return String(env.THOUGHTFORM_CURATOR_ENABLED ?? "false").toLowerCase() === "true";
+  return String(env.THOUGHTFORM_CURATOR_ENABLED ?? "true").toLowerCase() === "true";
 }
 
-export function shouldRunCurator(snapshot, { minimumUserTurns = 2 } = {}) {
+export function shouldRunCurator(snapshot, { minimumUserTurns = 2, maximumSurfacedProposals = 3 } = {}) {
   if (!snapshot || !Number.isInteger(snapshot.revision)) return false;
   const completedUserTurns = (snapshot.transcript ?? [])
     .filter((utterance) => utterance?.speaker === "you" && utterance?.text?.trim())
     .length;
   if (completedUserTurns < minimumUserTurns) return false;
-  return !(snapshot.proposals ?? []).some((proposal) => proposal?.status === "pending");
+  const proposals = snapshot.proposals ?? [];
+  if (proposals.some((proposal) => proposal?.status === "pending")) return false;
+  const surfaced = proposals.filter((proposal) => proposal?.actor === "curator").length;
+  return surfaced < maximumSurfacedProposals;
 }
 
 function compactSnapshot(snapshot) {
@@ -75,7 +79,7 @@ function compactSnapshot(snapshot) {
     id: snapshot.id,
     title: snapshot.title,
     revision: snapshot.revision,
-    transcript: snapshot.transcript ?? [],
+    transcript: (snapshot.transcript ?? []).slice(-8),
     nodes: snapshot.nodes ?? [],
     edges: snapshot.edges ?? [],
     proposals: snapshot.proposals ?? [],
@@ -151,7 +155,7 @@ function normalizeProposal(result, snapshot, { now, idFactory }) {
     actor: "curator",
     rationale: String(result.rationale ?? "A possible map refinement").trim(),
     evidence: resolveEvidence(result.evidence, snapshot.transcript),
-    operations: result.operations.slice(0, 5).map((operation) => normalizeOperation(operation, idFactory)),
+    operations: result.operations.slice(0, 3).map((operation) => normalizeOperation(operation, idFactory)),
     created_at: now().toISOString(),
   };
 }
@@ -164,7 +168,7 @@ export function createCurator({
   minimumUserTurns = 2,
 } = {}) {
   const enabled = isCuratorEnabled(env);
-  const model = env.OPENAI_CURATOR_MODEL ?? env.OPENAI_MODEL ?? "gpt-5.6";
+  const model = env.OPENAI_CURATOR_MODEL ?? "gpt-5.6-sol";
   let openai = client;
 
   return {
@@ -204,8 +208,10 @@ export function createCuratorScheduler({
   curator,
   loadSnapshot,
   onProposal,
+  isBlocked = () => false,
   onError = (error) => console.error(error),
-  idleMs = 1_500,
+  idleMs = 10_000,
+  minimumUserTurnsBetweenRuns = 3,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
 } = {}) {
@@ -214,6 +220,13 @@ export function createCuratorScheduler({
   }
   const timers = new Map();
   const lastRunFingerprint = new Map();
+  const lastRunUserTurnCount = new Map();
+  const active = new Set();
+  const queued = new Set();
+
+  const userTurnCount = (snapshot) => (snapshot.transcript ?? [])
+    .filter((utterance) => utterance?.speaker === "you" && utterance?.text?.trim())
+    .length;
 
   const snapshotFingerprint = (snapshot) => {
     const latestUserTurn = [...(snapshot.transcript ?? [])]
@@ -226,30 +239,56 @@ export function createCuratorScheduler({
     const timer = timers.get(sessionId);
     if (timer !== undefined) clearTimer(timer);
     timers.delete(sessionId);
+    queued.delete(sessionId);
   };
 
-  const notify = (sessionId) => {
+  const schedule = (sessionId) => {
     cancel(sessionId);
-    if (!curator.enabled) return false;
     const timer = setTimer(async () => {
       timers.delete(sessionId);
+      if (await isBlocked(sessionId)) {
+        schedule(sessionId);
+        return;
+      }
+      if (active.has(sessionId)) {
+        queued.add(sessionId);
+        return;
+      }
+      active.add(sessionId);
       try {
         const snapshot = await loadSnapshot(sessionId);
         const fingerprint = snapshotFingerprint(snapshot);
         if (!curator.shouldRun(snapshot) || lastRunFingerprint.get(sessionId) === fingerprint) return;
+        const turns = userTurnCount(snapshot);
+        const previousTurns = lastRunUserTurnCount.get(sessionId);
+        if (previousTurns !== undefined && turns - previousTurns < minimumUserTurnsBetweenRuns) return;
         const proposal = await curator.propose(snapshot);
         lastRunFingerprint.set(sessionId, fingerprint);
+        lastRunUserTurnCount.set(sessionId, turns);
         if (proposal) await onProposal(sessionId, proposal);
       } catch (error) {
         onError(error, sessionId);
+      } finally {
+        active.delete(sessionId);
+        if (queued.delete(sessionId)) schedule(sessionId);
       }
     }, idleMs);
     timers.set(sessionId, timer);
     return true;
   };
 
+  const notify = (sessionId) => {
+    if (!curator.enabled) return false;
+    if (active.has(sessionId)) {
+      queued.add(sessionId);
+      return true;
+    }
+    return schedule(sessionId);
+  };
+
   const dispose = () => {
     [...timers.keys()].forEach(cancel);
+    queued.clear();
   };
 
   return { notify, cancel, dispose };

@@ -29,11 +29,19 @@ function snapshot(overrides = {}) {
 }
 
 test("curator is environment gated and skips ineligible snapshots", () => {
-  assert.equal(isCuratorEnabled({}), false);
+  assert.equal(isCuratorEnabled({}), true);
+  assert.equal(isCuratorEnabled({ THOUGHTFORM_CURATOR_ENABLED: "false" }), false);
   assert.equal(isCuratorEnabled({ THOUGHTFORM_CURATOR_ENABLED: "TRUE" }), true);
   assert.equal(shouldRunCurator(snapshot()), true);
   assert.equal(shouldRunCurator(snapshot({ transcript: [{ speaker: "you", text: "one" }] })), false);
   assert.equal(shouldRunCurator(snapshot({ proposals: [{ status: "pending" }] })), false);
+  assert.equal(shouldRunCurator(snapshot({
+    proposals: Array.from({ length: 3 }, (_, index) => ({
+      id: `curator-${index}`,
+      actor: "curator",
+      status: "dismissed",
+    })),
+  })), false);
 });
 
 test("disabled curator does not call the Responses API", async () => {
@@ -97,6 +105,7 @@ test("enabled curator creates a canonical proposal through structured Responses 
   assert.equal(request.model, "curator-test-model");
   assert.equal(request.text.format.strict, true);
   assert.equal(request.text.format.schema, CURATOR_PROPOSAL_SCHEMA);
+  assert.equal(CURATOR_PROPOSAL_SCHEMA.properties.operations.maxItems, 3);
   assert.deepEqual(JSON.parse(request.input).nodes.map((node) => node.id), ["n1", "n2"]);
   assert.equal(proposal.id, "proposal-1");
   assert.equal(proposal.base_revision, 4);
@@ -127,6 +136,30 @@ test("curator returns no card for an empty recommendation", async () => {
     client: { responses: { create: async () => ({ output_text: '{"rationale":"No change","evidence":[],"operations":[]}' }) } },
   });
   assert.equal(await curator.propose(snapshot()), null);
+});
+
+test("curator sends bounded recent conversation context and defaults to Sol", async () => {
+  let request;
+  const curator = createCurator({
+    env: { THOUGHTFORM_CURATOR_ENABLED: "true" },
+    client: { responses: { create: async (payload) => {
+      request = payload;
+      return { output_text: '{"rationale":"No change","evidence":[],"operations":[]}' };
+    } } },
+  });
+  const transcript = Array.from({ length: 12 }, (_, index) => ({
+    id: `utterance-${index}`,
+    speaker: index % 2 ? "partner" : "you",
+    text: `Utterance ${index}`,
+  }));
+
+  await curator.propose(snapshot({ transcript }));
+
+  assert.equal(curator.model, "gpt-5.6-sol");
+  assert.deepEqual(
+    JSON.parse(request.input).transcript.map(({ id }) => id),
+    transcript.slice(-8).map(({ id }) => id),
+  );
 });
 
 test("scheduler debounces and reloads the latest canonical snapshot", async () => {
@@ -167,6 +200,7 @@ test("scheduler runs again for a new user turn at the same map revision", async 
     curator,
     loadSnapshot: async () => current,
     onProposal: async (_sessionId, proposal) => proposals.push(proposal.id),
+    minimumUserTurnsBetweenRuns: 1,
     setTimer: (callback) => { queued.push(callback); return queued.length; },
     clearTimer: () => {},
   });
@@ -184,5 +218,80 @@ test("scheduler runs again for a new user turn at the same map revision", async 
   await queued[1]();
 
   assert.deepEqual(proposals, ["p-3", "p-4"]);
+  scheduler.dispose();
+});
+
+test("scheduler waits for three new user turns before spending attention again", async () => {
+  const queued = [];
+  const proposals = [];
+  let current = snapshot({ revision: 9 });
+  const curator = {
+    enabled: true,
+    shouldRun: () => true,
+    propose: async (value) => ({ id: `p-${value.transcript.length}` }),
+  };
+  const scheduler = createCuratorScheduler({
+    curator,
+    loadSnapshot: async () => current,
+    onProposal: async (_sessionId, proposal) => proposals.push(proposal.id),
+    minimumUserTurnsBetweenRuns: 3,
+    setTimer: (callback) => { queued.push(callback); return queued.length; },
+    clearTimer: () => {},
+  });
+
+  scheduler.notify("session-1");
+  await queued.shift()();
+  current = snapshot({
+    revision: 10,
+    transcript: [
+      ...current.transcript,
+      { id: "u3", speaker: "you", text: "One more thought." },
+      { id: "p2", speaker: "partner", text: "Keep going." },
+      { id: "u4", speaker: "you", text: "A second new thought." },
+    ],
+  });
+  scheduler.notify("session-1");
+  await queued.shift()();
+  assert.deepEqual(proposals, ["p-3"]);
+
+  current = snapshot({
+    revision: 11,
+    transcript: [
+      ...current.transcript,
+      { id: "u5", speaker: "you", text: "A third new thought." },
+    ],
+  });
+  scheduler.notify("session-1");
+  await queued.shift()();
+  assert.deepEqual(proposals, ["p-3", "p-7"]);
+  scheduler.dispose();
+});
+
+test("scheduler reschedules instead of overlapping an active map-controller pass", async () => {
+  const queued = [];
+  const proposals = [];
+  let controllerBusy = true;
+  const curator = {
+    enabled: true,
+    shouldRun: () => true,
+    propose: async () => ({ id: "proposal-after-controller" }),
+  };
+  const scheduler = createCuratorScheduler({
+    curator,
+    loadSnapshot: async () => snapshot(),
+    onProposal: async (_sessionId, proposal) => proposals.push(proposal.id),
+    isBlocked: () => controllerBusy,
+    setTimer: (callback) => { queued.push(callback); return queued.length; },
+    clearTimer: () => {},
+  });
+
+  scheduler.notify("session-1");
+  await queued.shift()();
+  assert.deepEqual(proposals, []);
+  assert.equal(queued.length, 1);
+
+  controllerBusy = false;
+  await queued.shift()();
+  assert.deepEqual(proposals, ["proposal-after-controller"]);
   scheduler.dispose();
 });
