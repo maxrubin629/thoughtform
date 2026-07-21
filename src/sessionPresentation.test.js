@@ -2,8 +2,179 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { buildFluidVisualNodes } from "./fluidMaterial.js";
-import { proposalVisuals, visualizeSession } from "./session/presentation.js";
+import {
+  buildConversationTimeline,
+  createMapControllerActivityDelay,
+  mapControllerPresentation,
+  modelActionLabel,
+  proposalVisuals,
+  visualizeSession,
+} from "./session/presentation.js";
 import { radiusForThought, wrapThought } from "./thoughtSizing.js";
+
+test("conversation presentation groups consecutive utterances without changing their source records", () => {
+  const transcript = [
+    { id: "you-1", speaker: "you", text: "I have an idea for a...", completed_at: "2026-07-21T07:43:00.000Z" },
+    { id: "you-2", speaker: "you", text: "Voice-based", completed_at: "2026-07-21T07:43:02.000Z" },
+    { id: "you-3", speaker: "you", text: "Sort of mind map app.", completed_at: "2026-07-21T07:43:05.000Z" },
+    { id: "partner-1", speaker: "partner", text: "That sounds promising.", completed_at: "2026-07-21T07:43:08.000Z" },
+  ];
+
+  const timeline = buildConversationTimeline(transcript, []);
+
+  assert.equal(timeline.length, 2);
+  assert.equal(timeline[0].speaker, "you");
+  assert.deepEqual(timeline[0].utterances, transcript.slice(0, 3));
+  assert.equal(timeline[1].speaker, "partner");
+  assert.deepEqual(timeline[1].utterances, transcript.slice(3));
+});
+
+test("Partner action does not split one spoken turn and appears as a generic visual status", () => {
+  const transcript = [
+    { id: "you-1", speaker: "you", text: "Mostly infer it.", completed_at: "2026-07-21T07:44:33.000Z" },
+    { id: "partner-1", speaker: "partner", text: "Got it—let me think.", completed_at: "2026-07-21T07:44:34.000Z" },
+    { id: "partner-2", speaker: "partner", text: "Then it should mostly infer structure.", completed_at: "2026-07-21T07:44:41.000Z" },
+  ];
+  const operations = [{
+    id: "operation-secret",
+    type: "create_bubble",
+    actor: "partner",
+    created_at: "2026-07-21T07:44:37.000Z",
+    affected_ids: ["node-secret"],
+  }];
+
+  const timeline = buildConversationTimeline(transcript, operations);
+
+  assert.equal(timeline.length, 2);
+  assert.deepEqual(timeline[1].utterances.map(({ id }) => id), ["partner-1", "partner-2"]);
+  assert.deepEqual(timeline[1].actions, [{
+    id: "operation-secret",
+    label: "Created a bubble",
+    createdAt: "2026-07-21T07:44:37.000Z",
+  }]);
+  assert.doesNotMatch(JSON.stringify(timeline[1].actions), /node-secret/);
+});
+
+test("conversation action labels cover map changes without exposing their targets", () => {
+  assert.equal(modelActionLabel({ type: "create_bubble" }), "Created a bubble");
+  assert.equal(modelActionLabel({ type: "edit_bubble" }), "Edited a bubble");
+  assert.equal(modelActionLabel({ type: "set_central_idea" }), "Changed the central idea");
+  assert.equal(modelActionLabel({ type: "delete_bubble" }), "Removed a bubble");
+  assert.equal(modelActionLabel({ type: "connect_bubbles" }), "Created a new connection");
+  assert.equal(modelActionLabel({ type: "delete_connection" }), "Removed a connection");
+  assert.equal(modelActionLabel({ type: "append_utterance" }), null);
+});
+
+test("conversation presentation shows only Partner-side map actions", () => {
+  const transcript = [{
+    id: "partner-1",
+    speaker: "partner",
+    text: "What should we explore next?",
+    completed_at: "2026-07-21T07:44:41.000Z",
+  }];
+  const operations = [
+    { id: "append", type: "append_utterance", actor: "partner", created_at: "2026-07-21T07:44:41.000Z" },
+    { id: "manual", type: "delete_bubble", actor: "you", created_at: "2026-07-21T07:44:42.000Z" },
+    { id: "curator", type: "connect_bubbles", actor: "curator", created_at: "2026-07-21T07:44:40.000Z" },
+  ];
+
+  const timeline = buildConversationTimeline(transcript, operations);
+
+  assert.deepEqual(timeline[0].actions.map(({ label }) => label), ["Created a new connection"]);
+});
+
+test("map controller activity stays quiet until it remains active for two seconds", () => {
+  const controller = { status: "running", last_error: null };
+
+  assert.equal(mapControllerPresentation(controller, { activeVisible: false }), null);
+  assert.deepEqual(mapControllerPresentation(controller, { activeVisible: true }), {
+    kind: "active",
+    label: "Organizing map…",
+  });
+});
+
+test("controller activity delay is scoped to one active session and clears stale timers", () => {
+  const timers = [];
+  const cleared = [];
+  const states = [];
+  const delay = createMapControllerActivityDelay({
+    delayMs: 2_000,
+    setTimer: (callback, milliseconds) => {
+      const timer = { callback, milliseconds };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (timer) => cleared.push(timer),
+    onChange: (state) => states.push(state),
+  });
+
+  delay.update({ id: "session-a", map_controller: { status: "waiting" } });
+  assert.deepEqual(delay.state(), { sessionId: "session-a", active: true, visible: false });
+  assert.equal(timers[0].milliseconds, 2_000);
+
+  delay.update({ id: "session-b", map_controller: { status: "running" } });
+  assert.deepEqual(delay.state(), { sessionId: "session-b", active: true, visible: false });
+  assert.deepEqual(cleared, [timers[0]]);
+  timers[0].callback();
+  assert.equal(delay.state().visible, false, "a stale session timer cannot reveal the status");
+
+  timers[1].callback();
+  assert.deepEqual(delay.state(), { sessionId: "session-b", active: true, visible: true });
+  delay.update({ id: "session-b", map_controller: { status: "idle" } });
+  assert.deepEqual(delay.state(), { sessionId: "session-b", active: false, visible: false });
+  delay.update({ id: "session-b", map_controller: { status: "waiting" } });
+  assert.deepEqual(delay.state(), { sessionId: "session-b", active: true, visible: false });
+  assert.equal(timers.length, 3, "a later run in the same session gets a fresh delay");
+  delay.dispose();
+  assert.ok(states.length >= 3);
+});
+
+test("a controller error is recoverable and an active retry suppresses the stale error", () => {
+  const failed = {
+    status: "error",
+    last_error: { code: "transient", message: "Temporary failure", at: "2026-07-21T08:00:00.000Z" },
+  };
+  const retrying = { ...failed, status: "waiting" };
+
+  assert.deepEqual(mapControllerPresentation(failed, { activeVisible: false }), {
+    kind: "error",
+    label: "Map organization paused",
+  });
+  assert.equal(mapControllerPresentation(retrying, { activeVisible: false }), null);
+  assert.deepEqual(mapControllerPresentation(retrying, { activeVisible: true }), {
+    kind: "active",
+    label: "Organizing map…",
+  });
+});
+
+test("a map-controller snapshot reconciles into the same generic Partner action timeline", () => {
+  const snapshot = {
+    revision: 11,
+    map_controller: { status: "idle", last_error: null },
+    operations: [{
+      id: "controller-operation",
+      type: "create_bubble",
+      actor: "partner",
+      origin: "map_controller",
+      created_at: "2026-07-21T08:00:00.000Z",
+      affected_ids: ["private-node-id"],
+    }],
+  };
+
+  const timeline = buildConversationTimeline([], snapshot.operations);
+
+  assert.deepEqual(timeline, [{
+    id: "turn-action-controller-operation",
+    speaker: "partner",
+    utterances: [],
+    actions: [{
+      id: "controller-operation",
+      label: "Created a bubble",
+      createdAt: "2026-07-21T08:00:00.000Z",
+    }],
+  }]);
+  assert.doesNotMatch(timeline[0].actions[0].label, /controller|private-node-id|map_controller/i);
+});
 
 test("classic and session routes reuse one sizing and canvas renderer", () => {
   const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
@@ -22,6 +193,8 @@ test("classic and session routes reuse one sizing and canvas renderer", () => {
   assert.match(motionSource, /export function applyConnectionGrowthMotion/);
   assert.match(motionSource, /export function buildConnectionPopTransition/);
   assert.doesNotMatch(sessionSource, /updateBubbleRadii/);
+  assert.match(sessionSource, /includeGhosts: true/);
+  assert.match(sessionSource, /withWobble\(released, 1, 0, 0\.082\)/);
 });
 
 test("create-bubble proposals preserve their parent ghost tether", () => {
@@ -44,6 +217,107 @@ test("create-bubble proposals preserve their parent ghost tether", () => {
   assert.deepEqual(
     { from: visuals.ghostEdges[0].from, to: visuals.ghostEdges[0].to },
     { from: "root", to: "ghost-child" },
+  );
+});
+
+test("proposal bubbles are initially placed clear of committed bubbles", () => {
+  const nodes = [
+    { id: "root", x: 500, y: 500, r: 70, depth: 0, ghost: false },
+    { id: "blocker", x: 650, y: 360, r: 82, depth: 1, ghost: false },
+  ];
+  const proposals = [{
+    id: "proposal-1",
+    status: "pending",
+    operations: [{
+      id: "proposal-operation-1",
+      type: "create_bubble",
+      node_id: "ghost-child",
+      parent: "root",
+      text: "A reviewable idea",
+      excluded: false,
+    }],
+  }];
+
+  const ghost = proposalVisuals(proposals, nodes).ghostNodes[0];
+  nodes.forEach((node) => {
+    assert.ok(
+      Math.hypot(ghost.x - node.x, ghost.y - node.y) >= ghost.r + node.r + 20,
+      `proposal overlaps ${node.id}`,
+    );
+  });
+});
+
+test("proposal visuals preserve a browser-local dragged position", () => {
+  const nodes = [{ id: "root", x: 500, y: 500, r: 70, depth: 0, ghost: false }];
+  const proposals = [{
+    id: "proposal-1",
+    status: "pending",
+    operations: [{
+      id: "proposal-operation-1",
+      type: "create_bubble",
+      node_id: "ghost-child",
+      parent: "root",
+      text: "A movable proposal",
+      excluded: false,
+    }],
+  }];
+  const positions = new Map([["ghost-child", { x: 940, y: 710 }]]);
+
+  const ghost = proposalVisuals(proposals, nodes, positions).ghostNodes[0];
+  assert.deepEqual({ x: ghost.x, y: ghost.y }, { x: 940, y: 710 });
+});
+
+test("proposal visuals preserve browser-local transient physics", () => {
+  const nodes = [{ id: "root", x: 500, y: 500, r: 70, depth: 0, ghost: false }];
+  const proposals = [{
+    id: "proposal-1",
+    status: "pending",
+    operations: [{
+      id: "proposal-operation-1",
+      type: "create_bubble",
+      node_id: "ghost-child",
+      parent: "root",
+      text: "A physical proposal",
+      excluded: false,
+    }],
+  }];
+  const wobblePulses = [{ startAt: 100, amplitude: 0.08, forceX: 1, forceY: 0 }];
+  const motion = new Map([["ghost-child", {
+    x: 940,
+    y: 710,
+    vx: 2.4,
+    vy: -1.2,
+    dragging: false,
+    shadeVx: 3,
+    shadeVy: -2,
+    wobblePulses,
+    wobbleEndAt: 640,
+  }]]);
+
+  const ghost = proposalVisuals(proposals, nodes, motion).ghostNodes[0];
+  assert.deepEqual(
+    {
+      x: ghost.x,
+      y: ghost.y,
+      vx: ghost.vx,
+      vy: ghost.vy,
+      dragging: ghost.dragging,
+      shadeVx: ghost.shadeVx,
+      shadeVy: ghost.shadeVy,
+      wobblePulses: ghost.wobblePulses,
+      wobbleEndAt: ghost.wobbleEndAt,
+    },
+    {
+      x: 940,
+      y: 710,
+      vx: 2.4,
+      vy: -1.2,
+      dragging: false,
+      shadeVx: 3,
+      shadeVy: -2,
+      wobblePulses,
+      wobbleEndAt: 640,
+    },
   );
 });
 

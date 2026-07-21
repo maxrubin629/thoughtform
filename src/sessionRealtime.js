@@ -11,6 +11,9 @@ const DEFAULT_AUDIO_CONSTRAINTS = {
   autoGainControl: true,
 };
 
+const MAX_RESPONSE_CREATE_ATTEMPTS = 2;
+const ACTIVE_RESPONSE_OVERLAP_ERROR = "conversation_already_has_active_response";
+
 const CALLBACK_NAMES = [
   "onStateChange",
   "onStatus",
@@ -30,6 +33,12 @@ function clientItemId() {
   const value = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
   return `item_${value.replaceAll("-", "")}`;
+}
+
+function clientEventId() {
+  const value = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  return `event_${value.replaceAll("-", "")}`;
 }
 
 function asError(value, fallback = "Realtime session error") {
@@ -58,14 +67,17 @@ function parseToolArguments(value) {
 function pendingTranscriptError(value) {
   const payload = value instanceof SessionApiError ? value.details : value;
   const error = payload?.error ?? payload?.details?.error;
-  if (error?.code !== "transcript_pending" || error?.retryable !== true) return null;
+  if (error?.retryable !== true
+    || (error?.code !== "transcript_pending" && error?.code !== "quote_not_found")) return null;
   return {
     payload,
-    itemId: error.realtime_item_id
-      ?? error.item_id
-      ?? payload?.realtime_item_id
-      ?? payload?.item_id
-      ?? null,
+    itemId: error.code === "quote_not_found"
+      ? "*"
+      : error.realtime_item_id
+        ?? error.item_id
+        ?? payload?.realtime_item_id
+        ?? payload?.item_id
+        ?? null,
   };
 }
 
@@ -154,6 +166,8 @@ export class SessionRealtimeClient {
         : null);
     this.mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
     this.channelOpenTimeoutMs = options.channelOpenTimeoutMs ?? 15_000;
+    this.toolCallTimeoutMs = options.toolCallTimeoutMs ?? 15_000;
+    this.pendingTranscriptTimeoutMs = options.pendingTranscriptTimeoutMs ?? 15_000;
 
     this.callbacks = { ...(options.callbacks ?? {}) };
     for (const name of CALLBACK_NAMES) {
@@ -168,15 +182,25 @@ export class SessionRealtimeClient {
     this._connectionGeneration = 0;
     this._lastConnectOptions = null;
     this._latestInputItemId = null;
+    this._conversationItemIds = [];
     this._inputTranscripts = new Map();
     this._partnerTranscripts = new Map();
     this._handledCallIds = new Set();
     this._inflightCallIds = new Set();
     this._pendingTranscriptCalls = new Map();
     this._committedTranscriptItems = new Set();
+    this._failedTranscriptItems = new Set();
+    this._toolAbortControllers = new Set();
     this._toolQueue = Promise.resolve();
+    this._transcriptQueue = Promise.resolve();
     this._queuedToolCalls = 0;
     this._toolOutputAwaitingResponse = false;
+    this._activeResponseIds = new Set();
+    this._pendingResponseRequest = null;
+    this._queuedUserResponse = null;
+    this._queuedToolContinuation = null;
+    this._toolContinuationInputIds = [];
+    this._responseRetryWaitForDone = false;
   }
 
   get connectionState() {
@@ -305,8 +329,13 @@ export class SessionRealtimeClient {
       return this;
     } catch (error) {
       const cancelled = error?.name === "AbortError";
-      this.disconnect({ state: cancelled ? "idle" : "failed" });
-      if (!cancelled) this._reportError(error, { phase: "connect" });
+      const ownsAttempt = generation === this._connectionGeneration;
+      if (ownsAttempt) {
+        this.disconnect({ state: cancelled ? "idle" : "failed" });
+      }
+      if (!cancelled && ownsAttempt) {
+        this._reportError(error, { phase: "connect" });
+      }
       throw error;
     }
   }
@@ -348,14 +377,26 @@ export class SessionRealtimeClient {
 
     if (this.audioElement?.srcObject) this.audioElement.srcObject = null;
     this._inflightCallIds.clear();
+    this._toolAbortControllers.forEach((controller) => controller.abort());
+    this._toolAbortControllers.clear();
     this._inputTranscripts.clear();
     this._partnerTranscripts.clear();
+    this._pendingTranscriptCalls.forEach((calls) => calls.forEach(({ timer }) => clearTimeout(timer)));
     this._pendingTranscriptCalls.clear();
     this._committedTranscriptItems.clear();
+    this._failedTranscriptItems.clear();
     this._latestInputItemId = null;
+    this._conversationItemIds = [];
     this._toolQueue = Promise.resolve();
+    this._transcriptQueue = Promise.resolve();
     this._queuedToolCalls = 0;
     this._toolOutputAwaitingResponse = false;
+    this._activeResponseIds.clear();
+    this._pendingResponseRequest = null;
+    this._queuedUserResponse = null;
+    this._queuedToolContinuation = null;
+    this._toolContinuationInputIds = [];
+    this._responseRetryWaitForDone = false;
     this._setState(state);
   }
 
@@ -371,10 +412,94 @@ export class SessionRealtimeClient {
   }
 
   requestResponse(response = {}) {
-    this._send({
-      type: "response.create",
-      ...(Object.keys(response).length ? { response } : {}),
+    if (!this.connected) throw new Error("Realtime is not connected");
+    this._queuedUserResponse = this._makeResponseRequest("user", response);
+    this._flushResponseRequest();
+  }
+
+  _makeResponseRequest(kind, response = {}) {
+    const requestId = clientEventId();
+    return {
+      kind,
+      requestId,
+      attempts: 0,
+      response: {
+        ...response,
+        metadata: {
+          ...(response.metadata ?? {}),
+          request_id: requestId,
+        },
+      },
+    };
+  }
+
+  _queueToolContinuation(contextItemIds = []) {
+    if (this._pendingResponseRequest?.kind === "tool" || this._queuedToolContinuation) return;
+    const input = [...new Set(contextItemIds.filter(Boolean))]
+      .map((id) => ({ type: "item_reference", id }));
+    this._queuedToolContinuation = this._makeResponseRequest("tool", {
+      tool_choice: "none",
+      ...(input.length ? { input } : {}),
     });
+  }
+
+  _requeueResponseRequest(request) {
+    if (request.kind === "tool") {
+      this._queuedToolContinuation ??= request;
+    } else {
+      this._queuedUserResponse ??= request;
+    }
+  }
+
+  _flushResponseRequest() {
+    if (this._pendingResponseRequest
+      || this._activeResponseIds.size !== 0
+      || this._responseRetryWaitForDone
+      || !this.connected) return false;
+
+    const request = this._queuedToolContinuation ?? this._queuedUserResponse;
+    if (!request) return false;
+    if (request.kind === "tool") this._queuedToolContinuation = null;
+    else this._queuedUserResponse = null;
+    const attemptEventId = clientEventId();
+    this._pendingResponseRequest = {
+      ...request,
+      attempts: request.attempts + 1,
+      attemptEventId,
+    };
+    try {
+      this._send({
+        type: "response.create",
+        event_id: attemptEventId,
+        response: request.response,
+      });
+      return true;
+    } catch (error) {
+      this._pendingResponseRequest = null;
+      this._requeueResponseRequest(request);
+      throw error;
+    }
+  }
+
+  _recordConversationItem(itemId, previousItemId = undefined) {
+    if (!itemId || this._conversationItemIds.includes(itemId)) return;
+    if (previousItemId === null || previousItemId === "root") {
+      this._conversationItemIds.unshift(itemId);
+      return;
+    }
+    const previousIndex = typeof previousItemId === "string"
+      ? this._conversationItemIds.indexOf(previousItemId)
+      : -1;
+    if (previousIndex >= 0) this._conversationItemIds.splice(previousIndex + 1, 0, itemId);
+    else this._conversationItemIds.push(itemId);
+  }
+
+  _conversationPrefixThrough(itemId) {
+    if (!itemId) return [...this._conversationItemIds];
+    const itemIndex = this._conversationItemIds.indexOf(itemId);
+    return itemIndex < 0
+      ? [...this._conversationItemIds]
+      : this._conversationItemIds.slice(0, itemIndex + 1);
   }
 
   async sendText(text, { beforeResponse, response } = {}) {
@@ -382,6 +507,8 @@ export class SessionRealtimeClient {
     if (!normalized) throw new TypeError("Text is required");
 
     const itemId = clientItemId();
+    this._latestInputItemId = itemId;
+    this._recordConversationItem(itemId);
     this._send({
       type: "conversation.item.create",
       item: {
@@ -438,26 +565,73 @@ export class SessionRealtimeClient {
     try {
       this.callbacks.onEvent?.(event);
       switch (event?.type) {
+        case "response.created": {
+          const responseId = event.response?.id ?? event.response_id ?? null;
+          const requestId = event.response?.metadata?.request_id ?? null;
+          if (requestId && requestId === this._pendingResponseRequest?.requestId) {
+            this._pendingResponseRequest = null;
+          }
+          if (responseId) this._activeResponseIds.add(responseId);
+          break;
+        }
+        case "response.done": {
+          const responseId = event.response?.id ?? event.response_id ?? null;
+          if (responseId) this._activeResponseIds.delete(responseId);
+          if (this._responseRetryWaitForDone && this._activeResponseIds.size === 0) {
+            this._responseRetryWaitForDone = false;
+          }
+          this._requestResponseWhenToolsReady();
+          this._flushResponseRequest();
+          break;
+        }
+        case "conversation.item.created":
+          this._recordConversationItem(event.item?.id, event.previous_item_id);
+          break;
+        case "conversation.item.deleted":
+          this._conversationItemIds = this._conversationItemIds
+            .filter((itemId) => itemId !== (event.item_id ?? event.itemId));
+          break;
+        case "input_audio_buffer.committed": {
+          const itemId = event.item_id ?? event.itemId ?? null;
+          if (itemId) this._latestInputItemId = itemId;
+          this._recordConversationItem(itemId, event.previous_item_id);
+          break;
+        }
         case "conversation.item.input_audio_transcription.delta":
           this._handleInputTranscriptDelta(event);
           break;
         case "conversation.item.input_audio_transcription.completed":
-          await this._handleInputTranscriptCompleted(event);
+          await this._queueTranscriptCompletion(() => this._handleInputTranscriptCompleted(event));
           break;
         case "conversation.item.input_audio_transcription.failed":
+          this._failPendingTranscript(
+            event.item_id ?? event.itemId ?? null,
+            event.error ?? event,
+          );
           this._reportError(event.error ?? event, { phase: "input_transcription", event });
           break;
         case "response.output_audio_transcript.delta":
           this._handlePartnerTranscriptDelta(event);
           break;
         case "response.output_audio_transcript.done":
-          this._handlePartnerTranscriptDone(event);
+          await this._queueTranscriptCompletion(() => this._handlePartnerTranscriptDone(event));
           break;
         case "response.function_call_arguments.done":
           await this._queueToolCall(event, { generation });
           break;
         case "error":
+          if (event.error?.event_id
+            && event.error.event_id === this._pendingResponseRequest?.attemptEventId) {
+            const rejected = this._pendingResponseRequest;
+            this._pendingResponseRequest = null;
+            if (event.error.code === ACTIVE_RESPONSE_OVERLAP_ERROR
+              && rejected.attempts < MAX_RESPONSE_CREATE_ATTEMPTS) {
+              this._requeueResponseRequest(rejected);
+              this._responseRetryWaitForDone = true;
+            }
+          }
           this._reportError(event.error ?? event, { phase: "realtime", event });
+          this._flushResponseRequest();
           break;
         default:
           break;
@@ -469,6 +643,7 @@ export class SessionRealtimeClient {
 
   _handleInputTranscriptDelta(event) {
     const itemId = event.item_id ?? event.itemId ?? "current";
+    if (itemId !== "current") this._latestInputItemId = itemId;
     const previous = this._inputTranscripts.get(itemId) ?? "";
     const text = `${previous}${event.delta ?? ""}`;
     this._inputTranscripts.set(itemId, text);
@@ -478,6 +653,12 @@ export class SessionRealtimeClient {
       itemId: itemId === "current" ? null : itemId,
       event,
     });
+  }
+
+  _queueTranscriptCompletion(task) {
+    const queued = this._transcriptQueue.then(task);
+    this._transcriptQueue = queued.catch(() => {});
+    return queued;
   }
 
   async _handleInputTranscriptCompleted(event) {
@@ -517,11 +698,11 @@ export class SessionRealtimeClient {
     });
   }
 
-  _handlePartnerTranscriptDone(event) {
+  async _handlePartnerTranscriptDone(event) {
     const key = event.item_id ?? event.response_id ?? "current";
     const text = event.transcript ?? this._partnerTranscripts.get(key) ?? "";
     this._partnerTranscripts.delete(key);
-    this.callbacks.onPartnerTranscriptFinal?.({
+    await this.callbacks.onPartnerTranscriptFinal?.({
       text,
       itemId: event.item_id ?? null,
       responseId: event.response_id ?? null,
@@ -536,8 +717,18 @@ export class SessionRealtimeClient {
   }
 
   async _queueToolCall(event, options = {}) {
+    const functionItemId = event.item_id ?? event.itemId ?? null;
+    this._recordConversationItem(functionItemId);
+    const queuedOptions = {
+      ...options,
+      fallbackInputItemId: Object.hasOwn(options, "fallbackInputItemId")
+        ? options.fallbackInputItemId
+        : this._latestInputItemId,
+      contextItemIds: options.contextItemIds
+        ?? this._conversationPrefixThrough(functionItemId),
+    };
     this._queuedToolCalls += 1;
-    const task = this._toolQueue.then(() => this._handleToolCall(event, options));
+    const task = this._toolQueue.then(() => this._handleToolCall(event, queuedOptions));
     this._toolQueue = task.catch(() => {});
     let outcome;
     try {
@@ -546,17 +737,28 @@ export class SessionRealtimeClient {
       return outcome;
     } finally {
       this._queuedToolCalls = Math.max(0, this._queuedToolCalls - 1);
-      if (this._queuedToolCalls === 0
-        && this._pendingTranscriptCalls.size === 0
-        && this._toolOutputAwaitingResponse
-        && this.connected) {
-        this._toolOutputAwaitingResponse = false;
-        this.requestResponse();
-      }
+      this._requestResponseWhenToolsReady();
     }
   }
 
-  async _handleToolCall(event, { retryCount = 0, generation = this._connectionGeneration } = {}) {
+  _requestResponseWhenToolsReady() {
+    if (this._queuedToolCalls !== 0
+      || this._pendingTranscriptCalls.size !== 0
+      || !this._toolOutputAwaitingResponse
+      || !this.connected) return;
+    this._toolOutputAwaitingResponse = false;
+    const contextItemIds = this._toolContinuationInputIds;
+    this._toolContinuationInputIds = [];
+    this._queueToolContinuation(contextItemIds);
+    this._flushResponseRequest();
+  }
+
+  async _handleToolCall(event, {
+    retryCount = 0,
+    generation = this._connectionGeneration,
+    fallbackInputItemId = null,
+    contextItemIds = [],
+  } = {}) {
     if (generation !== this._connectionGeneration) {
       return { outputSent: false, superseded: true };
     }
@@ -573,7 +775,7 @@ export class SessionRealtimeClient {
     try {
       toolArguments = parseToolArguments(event.arguments);
     } catch (error) {
-      this._sendToolFailure(callId, error);
+      this._sendToolFailure(callId, error, contextItemIds);
       this._handledCallIds.add(callId);
       return { outputSent: true };
     }
@@ -582,108 +784,253 @@ export class SessionRealtimeClient {
     const call = { callId, name, arguments: toolArguments, event };
     this.callbacks.onToolCall?.(call);
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.toolCallTimeoutMs);
+    this._toolAbortControllers.add(controller);
     try {
+      const hasDirectQuote = [
+        toolArguments.quote,
+        toolArguments.transcript_quote,
+        toolArguments.source_quote,
+      ].some((value) => typeof value === "string" && value.length > 0)
+        || (Array.isArray(toolArguments.quotes)
+          && toolArguments.quotes.some((value) => typeof value === "string" && value.length > 0));
+      const serverArguments = !hasDirectQuote
+        && !toolArguments.realtime_item_id
+        && fallbackInputItemId
+        ? { ...toolArguments, realtime_item_id: fallbackInputItemId }
+        : toolArguments;
       const result = await executeSessionToolCall(this.sessionId, {
         name,
-        arguments: toolArguments,
+        arguments: serverArguments,
         callId,
         expectedRevision: toolArguments.expected_revision ?? await this._expectedRevision(),
-      });
+      }, { signal: controller.signal });
       if (generation !== this._connectionGeneration) {
         return { outputSent: false, superseded: true };
       }
       const pending = pendingTranscriptError(result);
       if (pending) {
         if (retryCount >= 3) {
-          this._sendToolFailure(callId, pending.payload);
+          this._sendToolFailure(callId, pending.payload, contextItemIds);
           this._handledCallIds.add(callId);
           return { outputSent: true };
         }
-        this._bufferTranscriptCall(event, toolArguments, pending.itemId, retryCount);
-        return { outputSent: false, buffered: true };
+        const buffered = this._bufferTranscriptCall(
+          event,
+          toolArguments,
+          pending.itemId,
+          retryCount,
+          fallbackInputItemId,
+          contextItemIds,
+        );
+        return { outputSent: !buffered, buffered };
       }
 
-      this._sendToolResult(callId, result);
+      this._sendToolResult(callId, result, contextItemIds);
       this._handledCallIds.add(callId);
       this.callbacks.onToolResult?.({ ...call, result });
       return { outputSent: true };
-    } catch (error) {
+    } catch (caught) {
+      const error = caught?.name === "AbortError"
+        ? Object.assign(new Error("The map tool request timed out"), {
+            code: "tool_call_timeout",
+            retryable: true,
+          })
+        : caught;
       if (generation !== this._connectionGeneration) {
         return { outputSent: false, superseded: true };
       }
       const pending = pendingTranscriptError(error);
       if (pending) {
         if (retryCount >= 3) {
-          this._sendToolFailure(callId, error);
+          this._sendToolFailure(callId, error, contextItemIds);
           this._handledCallIds.add(callId);
           return { outputSent: true };
         }
-        this._bufferTranscriptCall(event, toolArguments, pending.itemId, retryCount);
-        return { outputSent: false, buffered: true };
+        const buffered = this._bufferTranscriptCall(
+          event,
+          toolArguments,
+          pending.itemId,
+          retryCount,
+          fallbackInputItemId,
+          contextItemIds,
+        );
+        return { outputSent: !buffered, buffered };
       }
 
       this._reportError(error, { phase: "tool_call", call });
-      this._sendToolFailure(callId, error);
+      this._sendToolFailure(callId, error, contextItemIds);
       this._handledCallIds.add(callId);
       return { outputSent: true };
     } finally {
+      clearTimeout(timeout);
+      this._toolAbortControllers.delete(controller);
       this._inflightCallIds.delete(callId);
     }
   }
 
-  _bufferTranscriptCall(event, toolArguments, serverItemId, retryCount) {
-    const itemId = serverItemId
-      ?? referencedTranscriptItem(toolArguments, this._latestInputItemId)
-      ?? "*";
+  _bufferTranscriptCall(
+    event,
+    toolArguments,
+    serverItemId,
+    retryCount,
+    fallbackInputItemId,
+    contextItemIds,
+  ) {
+    const fallbackItemId = referencedTranscriptItem(toolArguments, fallbackInputItemId);
+    const itemId = serverItemId ?? fallbackItemId ?? "*";
+    const associatedItemId = itemId === "*" && fallbackItemId !== "*"
+      ? fallbackItemId
+      : itemId === "*" ? null : itemId;
+    if (associatedItemId && this._failedTranscriptItems.has(associatedItemId)) {
+      this._sendToolFailure(event.call_id, {
+        code: "transcription_failed",
+        message: "The spoken turn could not be transcribed, so the map change was not applied.",
+        retryable: true,
+      }, contextItemIds);
+      this._handledCallIds.add(event.call_id);
+      return false;
+    }
     const calls = this._pendingTranscriptCalls.get(itemId) ?? [];
     if (!calls.some((pending) => pending.event.call_id === event.call_id)) {
-      calls.push({ event, retryCount });
+      const timer = setTimeout(() => {
+        this._failPendingTranscript(associatedItemId ?? itemId, {
+          code: "transcript_timeout",
+          message: "The spoken turn did not finish transcribing in time, so the map change was not applied.",
+          retryable: true,
+        }, { callId: event.call_id ?? event.callId });
+      }, this.pendingTranscriptTimeoutMs);
+      calls.push({
+        event,
+        retryCount,
+        timer,
+        associatedItemId,
+        fallbackInputItemId,
+        contextItemIds,
+      });
       this._pendingTranscriptCalls.set(itemId, calls);
     }
 
     // A completed transcript acknowledgment and a tool response can cross on
     // the wire. Give the canonical commit a brief opportunity to settle.
-    if (itemId !== "*" && this._committedTranscriptItems.has(itemId) && retryCount < 3) {
+    if (associatedItemId
+      && this._committedTranscriptItems.has(associatedItemId)
+      && retryCount < 3) {
       setTimeout(() => {
         if (!this.connected) return;
-        this.notifyTranscriptCommitted(itemId).catch((error) => {
-          this._reportError(error, { phase: "retry_pending_tool", itemId });
+        this.notifyTranscriptCommitted(associatedItemId).catch((error) => {
+          this._reportError(error, { phase: "retry_pending_tool", itemId: associatedItemId });
         });
       }, 120 * (retryCount + 1));
+    }
+    return true;
+  }
+
+  _takePendingTranscriptCalls(key, predicate) {
+    const entries = this._pendingTranscriptCalls.get(key) ?? [];
+    const selected = [];
+    const remaining = [];
+    entries.forEach((entry) => (predicate(entry) ? selected : remaining).push(entry));
+    if (remaining.length) this._pendingTranscriptCalls.set(key, remaining);
+    else this._pendingTranscriptCalls.delete(key);
+    return selected;
+  }
+
+  _failPendingTranscript(itemId, error, { callId: onlyCallId = null } = {}) {
+    if (itemId && itemId !== "*") this._failedTranscriptItems.add(itemId);
+    const directKeys = itemId && itemId !== "*" ? [itemId] : [];
+    let outputSent = false;
+    for (const key of directKeys) {
+      const pending = this._takePendingTranscriptCalls(
+        key,
+        (entry) => !onlyCallId || (entry.event.call_id ?? entry.event.callId) === onlyCallId,
+      );
+      pending.forEach((entry) => {
+        clearTimeout(entry.timer);
+        const callId = entry.event.call_id ?? entry.event.callId;
+        if (!callId || this._handledCallIds.has(callId)) return;
+        this._sendToolFailure(callId, {
+          code: error?.code ?? "transcription_failed",
+          message: error?.message ?? "The spoken turn could not be transcribed, so the map change was not applied.",
+          retryable: true,
+        }, entry.contextItemIds);
+        this._handledCallIds.add(callId);
+        outputSent = true;
+      });
+    }
+    const wildcard = this._takePendingTranscriptCalls("*", (entry) => {
+      const entryCallId = entry.event.call_id ?? entry.event.callId;
+      if (onlyCallId) return entryCallId === onlyCallId;
+      if (!itemId || itemId === "*") return true;
+      return entry.associatedItemId === itemId;
+    });
+    wildcard.forEach((entry) => {
+      clearTimeout(entry.timer);
+      const callId = entry.event.call_id ?? entry.event.callId;
+      if (!callId || this._handledCallIds.has(callId)) return;
+      this._sendToolFailure(callId, {
+        code: error?.code ?? "transcription_failed",
+        message: error?.message ?? "The spoken turn could not be transcribed, so the map change was not applied.",
+        retryable: true,
+      }, entry.contextItemIds);
+      this._handledCallIds.add(callId);
+      outputSent = true;
+    });
+    if (outputSent) {
+      this._toolOutputAwaitingResponse = true;
+      this._requestResponseWhenToolsReady();
     }
   }
 
   async notifyTranscriptCommitted(itemId) {
     if (!itemId) return [];
     this._committedTranscriptItems.add(itemId);
+    const direct = this._takePendingTranscriptCalls(itemId, () => true);
+    const wildcard = this._takePendingTranscriptCalls(
+      "*",
+      (entry) => !entry.associatedItemId || entry.associatedItemId === itemId,
+    );
     const pending = [
-      ...(this._pendingTranscriptCalls.get(itemId) ?? []),
-      ...(this._pendingTranscriptCalls.get("*") ?? []),
+      ...direct,
+      ...wildcard,
     ];
-    this._pendingTranscriptCalls.delete(itemId);
-    this._pendingTranscriptCalls.delete("*");
+    pending.forEach(({ timer }) => clearTimeout(timer));
+    this._failedTranscriptItems.delete(itemId);
 
     const retried = [];
     const retries = pending
       .filter((entry) => !this._handledCallIds.has(entry.event.call_id))
       .map((entry) => {
         retried.push(entry.event.call_id);
-        return this._queueToolCall(entry.event, { retryCount: entry.retryCount + 1 });
+        return this._queueToolCall(entry.event, {
+          retryCount: entry.retryCount + 1,
+          fallbackInputItemId: entry.fallbackInputItemId,
+          contextItemIds: entry.contextItemIds,
+        });
       });
     await Promise.all(retries);
     return retried;
   }
 
-  _sendToolResult(callId, result) {
+  _sendToolResult(callId, result, contextItemIds = []) {
+    const item = functionOutputFor(callId, result);
+    item.id ??= clientItemId();
     this._send({
       type: "conversation.item.create",
-      item: functionOutputFor(callId, result),
+      item,
     });
+    this._recordConversationItem(item.id);
+    for (const itemId of [...contextItemIds, item.id]) {
+      if (itemId && !this._toolContinuationInputIds.includes(itemId)) {
+        this._toolContinuationInputIds.push(itemId);
+      }
+    }
   }
 
-  _sendToolFailure(callId, error) {
+  _sendToolFailure(callId, error, contextItemIds = []) {
     if (error instanceof SessionApiError && error.details?.function_call_output) {
-      this._sendToolResult(callId, error.details);
+      this._sendToolResult(callId, error.details, contextItemIds);
       return;
     }
     const result = {
@@ -697,7 +1044,7 @@ export class SessionRealtimeClient {
       ...(error?.snapshot ? { snapshot: error.snapshot } : {}),
       ...(error?.details ? { details: error.details } : {}),
     };
-    this._sendToolResult(callId, result);
+    this._sendToolResult(callId, result, contextItemIds);
   }
 }
 

@@ -16,6 +16,7 @@ import {
   RevisionConflictError,
   SessionOperationError,
   applyOperation,
+  resolveQuoteSpan,
 } from "./sessionOperations.mjs";
 import {
   DEFAULT_REALTIME_MODEL,
@@ -23,7 +24,11 @@ import {
   buildRealtimeSessionConfig,
   forwardRealtimeSdp,
 } from "./realtime.mjs";
-import { createCurator, createCuratorScheduler } from "./curator.mjs";
+import {
+  DEFAULT_MAP_CONTROLLER_MODEL,
+  createMapController,
+  createMapControllerScheduler,
+} from "./mapController.mjs";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6";
@@ -65,7 +70,7 @@ function classicGraphFromSession(session) {
 }
 
 function errorPayload(error, snapshot) {
-  const details = error?.details ?? {};
+  const { snapshot: _nestedSnapshot, ...details } = error?.details ?? {};
   return {
     ok: false,
     error: {
@@ -78,15 +83,117 @@ function errorPayload(error, snapshot) {
   };
 }
 
+/** Queue SSE chunks per response when Node signals stream backpressure. */
+export function createSseEventWriter() {
+  const responses = new Map();
+
+  const detach = (response, state) => {
+    response.removeListener?.("drain", state.onDrain);
+    response.removeListener?.("close", state.onClose);
+    response.removeListener?.("error", state.onClose);
+  };
+
+  const cleanup = (response) => {
+    const state = responses.get(response);
+    if (!state) return;
+    state.queue.length = 0;
+    detach(response, state);
+    responses.delete(response);
+  };
+
+  const flush = (response, state) => {
+    if (response.destroyed || response.writableEnded) {
+      cleanup(response);
+      return false;
+    }
+    if (state.draining) return false;
+    while (state.queue.length) {
+      const chunk = state.queue.shift();
+      if (!response.write(chunk)) {
+        state.draining = true;
+        response.once?.("drain", state.onDrain);
+        return false;
+      }
+    }
+    cleanup(response);
+    return true;
+  };
+
+  const write = (response, chunk) => {
+    if (response.destroyed || response.writableEnded) {
+      cleanup(response);
+      return false;
+    }
+    let state = responses.get(response);
+    if (!state) {
+      state = {
+        queue: [],
+        draining: false,
+        onDrain: null,
+        onClose: null,
+      };
+      state.onDrain = () => {
+        state.draining = false;
+        flush(response, state);
+      };
+      state.onClose = () => cleanup(response);
+      responses.set(response, state);
+      response.once?.("close", state.onClose);
+      response.once?.("error", state.onClose);
+    }
+    state.queue.push(chunk);
+    return flush(response, state);
+  };
+
+  return { write, cleanup };
+}
+
 export async function createThoughtformServer({
   store = createSessionStore(),
   openaiClient = client,
   fetchImpl = globalThis.fetch,
+  env = process.env,
+  controllerEventEpoch = Date.now(),
+  mapController: suppliedMapController,
+  mapControllerScheduler: suppliedMapControllerScheduler,
+  mapControllerFactory = createMapController,
+  mapControllerSchedulerFactory = createMapControllerScheduler,
 } = {}) {
   await store.init();
   const app = express();
   const uiContexts = new Map();
   const eventClients = new Map();
+  const controllerEventSequences = new Map();
+  const sseWriter = createSseEventWriter();
+  const controllerConfigured = Boolean(openaiClient ?? env.OPENAI_API_KEY);
+  const controllerRequested = env.THOUGHTFORM_MAP_CONTROLLER_ENABLED !== "false";
+  const controllerRuntimeEnabled = controllerRequested && (
+    controllerConfigured || suppliedMapController || suppliedMapControllerScheduler
+  );
+  let mapController = null;
+  let mapControllerScheduler = null;
+
+  const controllerEventSequenceFor = (sessionId) => controllerEventSequences.get(sessionId) ?? 0;
+  const advanceControllerEventSequence = (sessionId) => {
+    const next = controllerEventSequenceFor(sessionId) + 1;
+    controllerEventSequences.set(sessionId, next);
+    return next;
+  };
+
+  const hasUnprocessedUserUtterance = (session) => (
+    session.transcript
+      .slice(session.map_controller.processed_transcript_count)
+      .some((item) => item.speaker === "you" && item.text?.trim())
+  );
+
+  const mapControllerStatusFor = (session) => {
+    if (!mapControllerScheduler) return "idle";
+    const state = mapControllerScheduler.state?.(session.id) ?? {};
+    if (state.active || state.preparing) return "running";
+    if (state.scheduled || state.queued) return "waiting";
+    if (session.map_controller.last_error) return "error";
+    return "idle";
+  };
 
   const snapshotFor = (session) => {
     const nodeIds = new Set(session.nodes.map((node) => node.id));
@@ -102,14 +209,58 @@ export async function createThoughtformServer({
       focus_id: nodeIds.has(storedContext.focus_id) ? storedContext.focus_id : null,
     };
     uiContexts.set(session.id, context);
-    return { ...session, ui_context: context };
+    const history = [...session.operations].reverse()
+      .find((operation) => Array.isArray(operation.history_entry_ids))?.history_entry_ids ?? [];
+    const operations = session.operations.map(({ change: _change, history_entry_ids: _history, ...record }) => record);
+    return {
+      ...session,
+      controller_event_epoch: controllerEventEpoch,
+      controller_event_sequence: controllerEventSequenceFor(session.id),
+      map_controller: {
+        ...session.map_controller,
+        status: mapControllerStatusFor(session),
+      },
+      operations,
+      history_length: history.length,
+      ui_context: context,
+    };
   };
 
-  const publish = (session, event = "snapshot", detail = {}) => {
+  const realtimeSnapshotFor = (snapshot) => ({
+    id: snapshot.id,
+    title: snapshot.title,
+    revision: snapshot.revision,
+    central_node_id: snapshot.nodes.find(({ depth }) => depth === 0)?.id ?? snapshot.nodes[0]?.id ?? null,
+    nodes: snapshot.nodes,
+    edges: snapshot.edges,
+    proposals: snapshot.proposals.filter((proposal) => proposal.status === "pending" || proposal.status === "stale"),
+    ui_context: snapshot.ui_context,
+  });
+
+  const functionOutputPayload = (payload) => ({
+    ...payload,
+    ...(payload.snapshot ? { snapshot: realtimeSnapshotFor(payload.snapshot) } : {}),
+  });
+
+  const writeEvent = (response, chunk) => sseWriter.write(response, chunk);
+
+  const publish = (session, event = "snapshot", detail = {}, publishedSnapshot = null) => {
     const listeners = eventClients.get(session.id);
     if (!listeners?.size) return;
-    const payload = JSON.stringify({ type: event, snapshot: snapshotFor(session), ...detail });
-    listeners.forEach((response) => response.write(`event: ${event}\ndata: ${payload}\n\n`));
+    const payload = JSON.stringify({
+      type: event,
+      snapshot: publishedSnapshot ?? snapshotFor(session),
+      ...detail,
+    });
+    listeners.forEach((response) => {
+      if (response.destroyed || response.writableEnded) {
+        sseWriter.cleanup(response);
+        listeners.delete(response);
+        return;
+      }
+      writeEvent(response, `event: ${event}\ndata: ${payload}\n\n`);
+    });
+    if (!listeners.size) eventClients.delete(session.id);
   };
 
   const performOperation = async (sessionId, operation) => {
@@ -135,25 +286,42 @@ export async function createThoughtformServer({
     };
   };
 
-  const curator = createCurator({ client: openaiClient ?? undefined });
-  const curatorScheduler = createCuratorScheduler({
-    curator,
-    loadSnapshot: (sessionId) => store.get(sessionId),
-    onProposal: async (sessionId, proposal) => {
-      const current = await store.get(sessionId);
-      if (current.proposals.some((candidate) => candidate.status === "pending")) return;
-      await performOperation(sessionId, {
-        type: "propose_changes",
-        actor: "curator",
-        expected_revision: current.revision,
-        proposal_id: proposal.id,
-        base_revision: proposal.base_revision,
-        rationale: proposal.rationale,
-        evidence: proposal.evidence,
-        operations: proposal.operations,
-      });
-    },
-  });
+  const publishMapControllerSnapshot = async (sessionId, committedSession = null) => {
+    advanceControllerEventSequence(sessionId);
+    const session = committedSession ?? await store.get(sessionId);
+    const snapshot = snapshotFor(session);
+    publish(session, "map_controller", {}, snapshot);
+    return snapshot;
+  };
+
+  if (controllerRuntimeEnabled) {
+    mapController = suppliedMapController ?? mapControllerFactory({
+      env,
+      client: openaiClient ?? undefined,
+      loadSnapshot: (sessionId) => store.get(sessionId),
+      transact: (sessionId, transform) => store.transact(sessionId, transform),
+    });
+    mapControllerScheduler = suppliedMapControllerScheduler ?? mapControllerSchedulerFactory({
+      controller: mapController,
+      loadSnapshot: (sessionId) => store.get(sessionId),
+      onStateChange: (sessionId) => publishMapControllerSnapshot(sessionId).catch(() => {}),
+      onComplete: (sessionId, result) => publishMapControllerSnapshot(
+        sessionId,
+        result?.session ?? null,
+      ).catch(() => {}),
+      onError: (_error, sessionId) => publishMapControllerSnapshot(sessionId).catch(() => {}),
+    });
+  }
+
+  const recoverMapController = (session) => {
+    if (!mapControllerScheduler || !hasUnprocessedUserUtterance(session)) return false;
+    return mapControllerScheduler.recover(session.id);
+  };
+
+  if (mapControllerScheduler) {
+    const { sessions } = await store.list();
+    for (const { id } of sessions) recoverMapController(await store.get(id));
+  }
 
   app.disable("x-powered-by");
   app.use(express.json({ limit: "1mb" }));
@@ -177,13 +345,14 @@ export async function createThoughtformServer({
         snapshot = await store.get(req.params.id).catch(() => null);
       }
       if (snapshot) snapshot = snapshotFor(snapshot);
-      if (status >= 500) console.error(error);
+      if (status >= 500 && !(error instanceof SessionOperationError)) console.error(error);
       const payload = errorPayload(error, snapshot);
       if (req.originalUrl?.endsWith("/tool-calls") && req.body?.call_id) {
+        const functionPayload = functionOutputPayload(payload);
         payload.function_call_output = {
           type: "function_call_output",
           call_id: req.body.call_id,
-          output: JSON.stringify(payload),
+          output: JSON.stringify(functionPayload),
         };
       }
       res.status(status).json(payload);
@@ -196,7 +365,11 @@ export async function createThoughtformServer({
       model: MODEL,
       mock: !hasKey,
       realtime: { configured: hasKey, model: REALTIME_MODEL },
-      curator: { enabled: curator.enabled, model: curator.model },
+      map_controller: {
+        configured: controllerConfigured,
+        enabled: Boolean(mapControllerScheduler),
+        model: mapController?.model ?? env.OPENAI_MAP_CONTROLLER_MODEL ?? DEFAULT_MAP_CONTROLLER_MODEL,
+      },
     });
   });
 
@@ -209,6 +382,7 @@ export async function createThoughtformServer({
   app.get("/api/sessions/:id", jsonRoute(async (req) => {
     const session = await store.get(req.params.id);
     await store.setActive(session.id);
+    recoverMapController(session);
     return snapshotFor(session);
   }));
 
@@ -217,10 +391,14 @@ export async function createThoughtformServer({
   )));
 
   app.delete("/api/sessions/:id", jsonRoute(async (req) => {
-    curatorScheduler.cancel(req.params.id);
+    mapControllerScheduler?.cancel(req.params.id);
     uiContexts.delete(req.params.id);
+    controllerEventSequences.delete(req.params.id);
     const listeners = eventClients.get(req.params.id);
-    listeners?.forEach((response) => response.end());
+    listeners?.forEach((response) => {
+      sseWriter.cleanup(response);
+      response.end();
+    });
     eventClients.delete(req.params.id);
     return store.delete(req.params.id);
   }));
@@ -250,10 +428,28 @@ export async function createThoughtformServer({
       ...(req.body?.actor ? { actor: req.body.actor } : {}),
     };
     const result = await performOperation(req.params.id, operation);
-    if (operation.type === "append_utterance" && operation.speaker === "you") {
-      curatorScheduler.notify(req.params.id);
+    if (!result.replayed && operation.type === "append_utterance" && operation.speaker === "you") {
+      const scheduled = mapControllerScheduler?.notify(req.params.id, result.snapshot.transcript.at(-1));
+      if (scheduled) {
+        const session = await store.get(req.params.id);
+        result.snapshot = await publishMapControllerSnapshot(session.id, session);
+      }
     }
     return result;
+  }));
+
+  app.post("/api/sessions/:id/map-controller/retry", jsonRoute(async (req) => {
+    const session = await store.get(req.params.id);
+    if (!mapControllerScheduler) {
+      throw new SessionOperationError("The map controller is not configured.", {
+        code: "map_controller_unavailable",
+        status: 503,
+        retryable: true,
+      });
+    }
+    mapControllerScheduler.retry(session.id);
+    const snapshot = await publishMapControllerSnapshot(session.id, session);
+    return { ok: true, scheduled: true, snapshot };
   }));
 
   app.post("/api/sessions/:id/tool-calls", jsonRoute(async (req) => {
@@ -279,15 +475,27 @@ export async function createThoughtformServer({
         function_call_output: {
           type: "function_call_output",
           call_id: callId,
-          output: JSON.stringify(payload),
+          output: JSON.stringify(functionOutputPayload(payload)),
         },
       };
     }
     const args = req.body?.arguments && typeof req.body.arguments === "object" ? req.body.arguments : {};
+    const quote = args.quote ?? args.transcript_quote ?? args.source_quote;
+    let resolvedProvenance = {};
+    if (typeof quote === "string" && quote.length) {
+      const source = resolveQuoteSpan(session, { ...args, quote });
+      const utterance = session.transcript.find(({ id }) => id === source.utterance_id);
+      resolvedProvenance = {
+        source,
+        ...(utterance?.realtime_item_id ? { realtime_item_id: utterance.realtime_item_id } : {}),
+      };
+    }
     const operation = {
       ...args,
+      ...resolvedProvenance,
       type: name,
       actor: "partner",
+      origin: "realtime",
       call_id: callId,
       // The model's tool argument describes the snapshot it reasoned from. A
       // newer browser revision must never silently upgrade that stale intent.
@@ -299,14 +507,31 @@ export async function createThoughtformServer({
       function_call_output: {
         type: "function_call_output",
         call_id: callId,
-        output: JSON.stringify(payload),
+        output: JSON.stringify(functionOutputPayload(payload)),
       },
     };
   }));
 
   app.get("/api/sessions/:id/events", async (req, res) => {
+    let sessionId = null;
+    let heartbeat = null;
+    const cleanup = () => {
+      if (heartbeat) clearInterval(heartbeat);
+      heartbeat = null;
+      sseWriter.cleanup(res);
+      if (!sessionId) return;
+      const listeners = eventClients.get(sessionId);
+      listeners?.delete(res);
+      if (!listeners?.size) eventClients.delete(sessionId);
+    };
+    req.once("close", cleanup);
     try {
       const session = await store.get(req.params.id);
+      sessionId = session.id;
+      if (req.destroyed) {
+        cleanup();
+        return;
+      }
       res.status(200);
       res.set({
         "Content-Type": "text/event-stream",
@@ -318,16 +543,15 @@ export async function createThoughtformServer({
       const listeners = eventClients.get(session.id) ?? new Set();
       listeners.add(res);
       eventClients.set(session.id, listeners);
-      res.write(`event: connected\ndata: ${JSON.stringify({ type: "connected", revision: session.revision })}\n\n`);
-      res.write(`event: snapshot\ndata: ${JSON.stringify({ type: "snapshot", snapshot: snapshotFor(session) })}\n\n`);
-      const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), 20_000);
-      req.on("close", () => {
-        clearInterval(heartbeat);
-        listeners.delete(res);
-        if (!listeners.size) eventClients.delete(session.id);
-      });
+      writeEvent(res, `event: connected\ndata: ${JSON.stringify({ type: "connected", revision: session.revision })}\n\n`);
+      writeEvent(res, `event: snapshot\ndata: ${JSON.stringify({ type: "snapshot", snapshot: snapshotFor(session) })}\n\n`);
+      heartbeat = setInterval(() => {
+        if (res.destroyed || res.writableEnded) cleanup();
+        else writeEvent(res, ": keep-alive\n\n");
+      }, 20_000);
     } catch (error) {
-      res.status(error?.status ?? 500).json(errorPayload(error));
+      cleanup();
+      if (!res.headersSent) res.status(error?.status ?? 500).json(errorPayload(error));
     }
   });
 
@@ -338,11 +562,16 @@ export async function createThoughtformServer({
       try {
         const session = await store.get(req.params.id);
         await store.setActive(session.id);
+        const controller = new AbortController();
+        req.once("aborted", () => controller.abort());
+        res.once("close", () => {
+          if (!res.writableEnded) controller.abort();
+        });
         const voiceMode = req.query.voice_mode === "push-to-talk" ? "push-to-talk" : "vad";
         const sessionConfig = buildRealtimeSessionConfig({
           model: REALTIME_MODEL,
           voiceMode,
-          instructions: buildRealtimeInstructions({ sessionTitle: session.title }),
+          instructions: buildRealtimeInstructions(),
         });
         const safetyIdentifier = createHash("sha256").update(`thoughtform:${session.id}`).digest("hex");
         const answer = await forwardRealtimeSdp({
@@ -350,6 +579,7 @@ export async function createThoughtformServer({
           fetchImpl,
           sessionConfig,
           safetyIdentifier,
+          signal: controller.signal,
         });
         res.status(201).type("application/sdp").send(answer);
       } catch (error) {
@@ -419,8 +649,16 @@ export async function createThoughtformServer({
   }));
 
   app.locals.sessionStore = store;
-  app.locals.curatorScheduler = curatorScheduler;
-  app.locals.dispose = () => curatorScheduler.dispose();
+  app.locals.mapController = mapController;
+  app.locals.mapControllerScheduler = mapControllerScheduler;
+  app.locals.dispose = () => {
+    mapControllerScheduler?.dispose();
+    eventClients.forEach((listeners) => listeners.forEach((response) => {
+      sseWriter.cleanup(response);
+      response.end();
+    }));
+    eventClients.clear();
+  };
   return app;
 }
 
@@ -433,6 +671,7 @@ if (isEntrypoint) {
   const shutdown = () => {
     app.locals.dispose?.();
     server.close(() => process.exit(0));
+    server.closeAllConnections?.();
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);

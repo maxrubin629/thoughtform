@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { UNTITLED_SESSION_TITLE, validateSession } from "./sessionStore.mjs";
 
 const ACTORS = new Set(["you", "partner", "curator"]);
+const OPERATION_ORIGINS = new Set(["ui", "realtime", "map_controller"]);
 const SPEAKERS = new Set(["you", "partner"]);
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const TYPE_ALIASES = new Map([
@@ -9,6 +10,9 @@ const TYPE_ALIASES = new Map([
   ["create_node", "create_bubble"],
   ["edit", "edit_bubble"],
   ["edit_node", "edit_bubble"],
+  ["set_root", "set_central_idea"],
+  ["set_central", "set_central_idea"],
+  ["promote_to_root", "set_central_idea"],
   ["revisit", "revisit_bubble"],
   ["revisit_node", "revisit_bubble"],
   ["connect", "connect_bubbles"],
@@ -63,7 +67,6 @@ export class RevisionConflictError extends SessionOperationError {
       details: {
         expected_revision: expectedRevision,
         current_revision: session.revision,
-        snapshot: structuredClone(session),
       },
     });
     this.current_revision = session.revision;
@@ -99,14 +102,13 @@ function textField(value, field, { allowEmpty = false } = {}) {
 }
 
 function finiteNumber(value, field) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new SessionOperationError(`${field} must be a finite number.`, {
       code: `invalid_${field}`,
       details: { field },
     });
   }
-  return number;
+  return value;
 }
 
 function nonnegativeInteger(value, field) {
@@ -120,7 +122,17 @@ function nonnegativeInteger(value, field) {
   return number;
 }
 
+function originOf(operation) {
+  const origin = operation.origin ?? "ui";
+  if (!OPERATION_ORIGINS.has(origin)) {
+    throw new SessionOperationError("origin must be ui, realtime, or map_controller.", { code: "invalid_origin" });
+  }
+  return origin;
+}
+
 function actorOf(operation) {
+  const origin = originOf(operation);
+  if (origin === "realtime" || origin === "map_controller") return "partner";
   const actor = operation.actor ?? "you";
   if (!ACTORS.has(actor)) {
     throw new SessionOperationError("actor must be you, partner, or curator.", { code: "invalid_actor" });
@@ -283,7 +295,8 @@ function exactSource(session, request) {
     if (!utterance
       || nested.start < 0
       || nested.end < nested.start
-      || utterance.text.slice(nested.start, nested.end) !== nested.quote) {
+      || nested.end > utterance.text.length
+      || utterance.text.slice(nested.start, nested.end) !== quote) {
       throw new SessionOperationError("The supplied provenance span is not exact.", {
         code: "invalid_source_span",
         status: 422,
@@ -294,10 +307,80 @@ function exactSource(session, request) {
       utterance_id: nested.utterance_id,
       start: nested.start,
       end: nested.end,
-      quote: nested.quote,
+      quote,
     };
   }
   return resolveQuoteSpan(session, { ...request, quote });
+}
+
+function exactSources(session, request) {
+  const candidates = [];
+  const sources = arrayField(request.sources, "sources");
+  sources.forEach((source) => candidates.push(exactSource(session, { source, quote: source?.quote })));
+  const source = exactSource(session, request);
+  if (source) candidates.push(source);
+  if (request.quotes !== undefined) {
+    arrayField(request.quotes, "quotes").forEach((quote) => {
+      if (typeof quote !== "string" || !quote.trim()) {
+        throw new SessionOperationError("quotes must contain non-empty exact transcript quotes.", {
+          code: "invalid_quotes",
+        });
+      }
+      candidates.push(resolveQuoteSpan(session, { ...request, quote }));
+    });
+  }
+  const seen = new Set();
+  return candidates.filter((source) => {
+    if (!source) return false;
+    const key = `${source.utterance_id}:${source.start}:${source.end}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function arrayField(value, field) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new SessionOperationError(`${field} must be an array.`, {
+      code: `invalid_${field}`,
+      details: { field },
+    });
+  }
+  return value;
+}
+
+function operationProvenance(session, operation) {
+  const sourceUtteranceIds = new Set();
+  const addUtteranceId = (id) => {
+    if (typeof id === "string" && id) sourceUtteranceIds.add(id);
+  };
+  arrayField(operation.source_utterance_ids, "source_utterance_ids").forEach(addUtteranceId);
+  addUtteranceId(operation.utterance_id);
+  addUtteranceId(operation.source?.utterance_id);
+  arrayField(operation.sources, "sources").forEach((source) => addUtteranceId(source?.utterance_id));
+  exactSources(session, operation).forEach((source) => addUtteranceId(source.utterance_id));
+
+  const sourceRealtimeItemId = operation.source_realtime_item_id
+    ?? operation.realtime_item_id
+    ?? operation.source?.realtime_item_id
+    ?? null;
+  if (sourceRealtimeItemId) {
+    session.transcript
+      .filter((utterance) => utterance.realtime_item_id === sourceRealtimeItemId)
+      .forEach((utterance) => sourceUtteranceIds.add(utterance.id));
+  }
+  const inferredRealtimeItems = new Set(
+    [...sourceUtteranceIds]
+      .map((id) => session.transcript.find((utterance) => utterance.id === id)?.realtime_item_id)
+      .filter(Boolean),
+  );
+  const resolvedRealtimeItemId = sourceRealtimeItemId
+    ?? (inferredRealtimeItems.size === 1 ? [...inferredRealtimeItems][0] : null);
+  return {
+    ...(sourceUtteranceIds.size ? { source_utterance_ids: [...sourceUtteranceIds] } : {}),
+    ...(resolvedRealtimeItemId ? { source_realtime_item_id: resolvedRealtimeItemId } : {}),
+  };
 }
 
 function appendSource(node, source) {
@@ -309,6 +392,27 @@ function appendSource(node, source) {
   ));
   if (!duplicate) node.sources.push(source);
   return !duplicate;
+}
+
+function appendSources(node, sources) {
+  return sources.reduce((changed, source) => appendSource(node, source) || changed, false);
+}
+
+function enforceUtteranceBubbleLimit(session, sources) {
+  const utteranceIds = new Set(sources.map(({ utterance_id: id }) => id));
+  for (const utteranceId of utteranceIds) {
+    const sourcedBubbleCount = session.nodes.filter((candidate) => (
+      candidate.sources.some((candidateSource) => candidateSource.utterance_id === utteranceId)
+    )).length;
+    if (sourcedBubbleCount >= 3) {
+      throw new SessionOperationError("A completed utterance can contribute at most three bubbles.", {
+        code: "utterance_bubble_limit",
+        status: 409,
+        retryable: true,
+        details: { utterance_id: utteranceId, maximum: 3 },
+      });
+    }
+  }
 }
 
 function anchorId(session) {
@@ -374,6 +478,34 @@ function defaultNodePosition(session, parent) {
   };
 }
 
+function assignDepthsFromRoot(session, rootId) {
+  const depths = new Map([[rootId, 0]]);
+  const queue = [rootId];
+  while (queue.length) {
+    const current = queue.shift();
+    const nextDepth = depths.get(current) + 1;
+    session.edges.forEach((edge) => {
+      let neighbor = null;
+      if (edge.from === current) neighbor = edge.to;
+      else if (edge.to === current) neighbor = edge.from;
+      if (neighbor && !depths.has(neighbor)) {
+        depths.set(neighbor, nextDepth);
+        queue.push(neighbor);
+      }
+    });
+  }
+  session.nodes.forEach((node) => {
+    node.depth = depths.get(node.id) ?? Math.max(1, node.depth ?? 1);
+  });
+  session.edges.forEach((edge) => {
+    const fromDepth = depths.get(edge.from);
+    const toDepth = depths.get(edge.to);
+    if (fromDepth !== undefined && toDepth !== undefined && fromDepth > toDepth) {
+      [edge.from, edge.to] = [edge.to, edge.from];
+    }
+  });
+}
+
 function mutateGraph(session, operation, context) {
   const type = canonicalType(operation.type);
   const actor = actorOf(operation);
@@ -393,8 +525,7 @@ function mutateGraph(session, operation, context) {
           details: { node_id: existing.id },
         });
       }
-      const source = exactSource(session, operation);
-      appendSource(existing, source);
+      appendSources(existing, exactSources(session, operation));
       existing.heat_at = timestamp;
       existing.updated_at = timestamp;
       affected.push(existing.id);
@@ -418,20 +549,8 @@ function mutateGraph(session, operation, context) {
         details: { node_id: nodeId },
       });
     }
-    const source = exactSource(session, operation);
-    if (source) {
-      const sourcedBubbleCount = session.nodes.filter((candidate) => (
-        candidate.sources.some((candidateSource) => candidateSource.utterance_id === source.utterance_id)
-      )).length;
-      if (sourcedBubbleCount >= 3) {
-        throw new SessionOperationError("A completed utterance can contribute at most three bubbles.", {
-          code: "utterance_bubble_limit",
-          status: 409,
-          retryable: true,
-          details: { utterance_id: source.utterance_id, maximum: 3 },
-        });
-      }
-    }
+    const sources = exactSources(session, operation);
+    enforceUtteranceBubbleLimit(session, sources);
     const node = {
       id: nodeId,
       text,
@@ -441,7 +560,7 @@ function mutateGraph(session, operation, context) {
       x: operation.x === undefined || operation.x === null ? position.x : finiteNumber(operation.x, "x"),
       y: operation.y === undefined || operation.y === null ? position.y : finiteNumber(operation.y, "y"),
       ...(operation.heat_at ? { heat_at: new Date(operation.heat_at).toISOString() } : {}),
-      sources: source ? [source] : [],
+      sources,
       created_by: actor,
       created_at: timestamp,
       updated_at: timestamp,
@@ -471,8 +590,7 @@ function mutateGraph(session, operation, context) {
     const id = resolveNodeReference(session, nodeRef(operation), selection);
     const node = session.nodes.find((candidate) => candidate.id === id);
     const text = textField(operation.text ?? operation.idea_text ?? operation.label, "text");
-    const source = exactSource(session, operation);
-    const sourceAdded = appendSource(node, source);
+    const sourceAdded = appendSources(node, exactSources(session, operation));
     const textChanged = node.text !== text;
     node.text = text;
     if (textChanged || sourceAdded) node.updated_at = timestamp;
@@ -481,10 +599,103 @@ function mutateGraph(session, operation, context) {
     return { changed: textChanged || sourceAdded, affected, warnings, effective_type: type };
   }
 
+  if (type === "set_central_idea") {
+    const reference = nodeRef(operation);
+    const hasReference = typeof reference === "string" && reference.trim().length > 0;
+    const hasText = typeof operation.text === "string" && operation.text.trim().length > 0;
+    if (hasReference === hasText) {
+      throw new SessionOperationError(
+        "set_central_idea requires either one existing bubble reference or new bubble text, but not both.",
+        { code: "invalid_central_idea_target" },
+      );
+    }
+
+    const beforeNodes = new Map(session.nodes.map((node) => [node.id, JSON.stringify(node)]));
+    const beforeEdges = new Map(session.edges.map((edge) => [edge.id, JSON.stringify(edge)]));
+    const previousRoot = session.nodes.find(({ depth }) => depth === 0) ?? session.nodes[0] ?? null;
+    let central;
+    let sourceAdded = false;
+    if (hasReference) {
+      const id = resolveNodeReference(session, reference, selection);
+      central = session.nodes.find((node) => node.id === id);
+      sourceAdded = appendSources(central, exactSources(session, operation));
+      if (previousRoot && previousRoot.id !== central.id) {
+        const priorPosition = { x: previousRoot.x, y: previousRoot.y };
+        previousRoot.x = central.x;
+        previousRoot.y = central.y;
+        central.x = priorPosition.x;
+        central.y = priorPosition.y;
+      }
+    } else {
+      const text = textField(operation.text, "text");
+      const sources = exactSources(session, operation);
+      const existing = session.nodes.find((node) => node.text.trim().toLocaleLowerCase() === text.toLocaleLowerCase());
+      if (existing) {
+        central = existing;
+        sourceAdded = appendSources(central, sources);
+        if (previousRoot && previousRoot.id !== central.id) {
+          const priorPosition = { x: previousRoot.x, y: previousRoot.y };
+          previousRoot.x = central.x;
+          previousRoot.y = central.y;
+          central.x = priorPosition.x;
+          central.y = priorPosition.y;
+        }
+        warnings.push("The matching existing bubble became the central idea instead of creating a duplicate.");
+      } else {
+        enforceUtteranceBubbleLimit(session, sources);
+        const nodeId = operation.node_id ?? operation.nodeId
+          ?? allocateId(session, "node", context, context.reservedIds);
+        if (!SAFE_ID.test(String(nodeId)) || session.nodes.some(({ id }) => id === nodeId)) {
+          throw new SessionOperationError("The central bubble ID is invalid or already exists.", {
+            code: "duplicate_node_id",
+            status: 409,
+            details: { node_id: nodeId },
+          });
+        }
+        const rootPosition = previousRoot
+          ? { x: previousRoot.x, y: previousRoot.y }
+          : defaultNodePosition(session, null);
+        central = {
+          id: nodeId,
+          text,
+          depth: 0,
+          x: rootPosition.x,
+          y: rootPosition.y,
+          sources,
+          created_by: actor,
+          created_at: timestamp,
+          updated_at: timestamp,
+        };
+        session.nodes.push(central);
+        context.reservedIds.add(nodeId);
+        if (previousRoot) {
+          const supportPosition = defaultNodePosition(session, central);
+          previousRoot.x = supportPosition.x;
+          previousRoot.y = supportPosition.y;
+        }
+      }
+    }
+
+    const alreadyCentral = previousRoot?.id === central.id;
+    assignDepthsFromRoot(session, central.id);
+    const changedIds = session.nodes
+      .filter((node) => beforeNodes.get(node.id) !== JSON.stringify(node))
+      .map(({ id }) => id);
+    const changedEdgeIds = session.edges
+      .filter((edge) => beforeEdges.get(edge.id) !== JSON.stringify(edge))
+      .map(({ id }) => id);
+    session.nodes.forEach((node) => {
+      if (changedIds.includes(node.id)) node.updated_at = timestamp;
+    });
+    affected.push(...(changedIds.length ? changedIds : [central.id]), ...changedEdgeIds);
+    if (alreadyCentral) warnings.push("That bubble is already the central idea.");
+    return { changed: changedIds.length > 0 || sourceAdded, affected, warnings, effective_type: type };
+  }
+
   if (type === "revisit_bubble") {
     const id = resolveNodeReference(session, nodeRef(operation), selection);
     const node = session.nodes.find((candidate) => candidate.id === id);
-    appendSource(node, exactSource(session, operation));
+    appendSources(node, exactSources(session, operation));
     node.heat_at = timestamp;
     node.updated_at = timestamp;
     affected.push(id);
@@ -608,6 +819,35 @@ function graphState(session) {
   };
 }
 
+function entityChanges(before, after) {
+  const prior = new Map(before.map((value, index) => [value.id, { value, index }]));
+  const next = new Map(after.map((value, index) => [value.id, { value, index }]));
+  return [...new Set([...prior.keys(), ...next.keys()])]
+    .filter((id) => JSON.stringify(prior.get(id)?.value) !== JSON.stringify(next.get(id)?.value))
+    .map((id) => ({
+      id,
+      before: prior.has(id) ? structuredClone(prior.get(id).value) : null,
+      after: next.has(id) ? structuredClone(next.get(id).value) : null,
+      before_index: prior.get(id)?.index ?? null,
+      after_index: next.get(id)?.index ?? null,
+    }));
+}
+
+function restoreEntityChanges(values, changes, direction) {
+  const indexField = direction === "before" ? "before_index" : "after_index";
+  const restored = [...values];
+  for (const change of changes ?? []) {
+    const currentIndex = restored.findIndex(({ id }) => id === change.id);
+    if (currentIndex >= 0) restored.splice(currentIndex, 1);
+    const value = change[direction];
+    if (value !== null) {
+      const targetIndex = Math.min(change[indexField] ?? restored.length, restored.length);
+      restored.splice(targetIndex, 0, structuredClone(value));
+    }
+  }
+  return restored;
+}
+
 function proposalChanges(before, after) {
   const prior = new Map(before.map((proposal) => [proposal.id, proposal]));
   const next = new Map(after.map((proposal) => [proposal.id, proposal]));
@@ -635,16 +875,22 @@ function restoreProposalChanges(session, changes, direction) {
 }
 
 function restoreHistoryChange(session, record, direction) {
-  const state = record.change?.[direction];
-  if (!state) {
+  const legacyState = record.change?.[direction];
+  const hasDelta = Array.isArray(record.change?.nodes) && Array.isArray(record.change?.edges);
+  if (!legacyState && !hasDelta) {
     throw new SessionOperationError("The history entry cannot be restored.", {
       code: "invalid_history_entry",
       status: 500,
       details: { operation_id: record.id },
     });
   }
-  session.nodes = structuredClone(state.nodes);
-  session.edges = structuredClone(state.edges);
+  if (legacyState) {
+    session.nodes = structuredClone(legacyState.nodes);
+    session.edges = structuredClone(legacyState.edges);
+  } else {
+    session.nodes = restoreEntityChanges(session.nodes, record.change.nodes, direction);
+    session.edges = restoreEntityChanges(session.edges, record.change.edges, direction);
+  }
   restoreProposalChanges(session, record.change.proposals, direction);
 }
 
@@ -667,6 +913,9 @@ function replayResult(session, record) {
 }
 
 function appendRecord(session, record, history) {
+  session.operations.forEach((operation) => {
+    delete operation.history_entry_ids;
+  });
   session.operations.push({
     ...record,
     history_entry_ids: [...history],
@@ -736,6 +985,7 @@ function transcriptOperation(session, operation, context) {
     id: operationId,
     type: "append_utterance",
     actor: speaker,
+    origin: originOf(operation),
     created_at: context.timestamp,
     ...(operation.call_id ? { call_id: operation.call_id } : {}),
     ...(realtimeItemId ? { realtime_item_id: realtimeItemId } : {}),
@@ -745,6 +995,8 @@ function transcriptOperation(session, operation, context) {
     affected_ids: [utteranceId],
     warnings: [],
     undoable: false,
+    source_utterance_ids: [utteranceId],
+    ...(realtimeItemId ? { source_realtime_item_id: realtimeItemId } : {}),
   }, history);
   session.updated_at = context.timestamp;
   return finalizeResult(session, operationId, [utteranceId], []);
@@ -823,9 +1075,9 @@ function normalizeProposalOperation(session, proposed, context, reserved) {
     normalized.node_id = resolveNodeReference(session, nodeRef(proposed), selection);
     if (type === "edit_bubble") normalized.text = textField(proposed.text ?? proposed.idea_text ?? proposed.label, "text");
   }
-  const source = exactSource(session, proposed);
-  if (source) {
-    normalized.source = source;
+  const sources = exactSources(session, proposed);
+  if (sources.length) {
+    normalized.sources = sources;
     delete normalized.quote;
     delete normalized.transcript_quote;
     delete normalized.source_quote;
@@ -985,6 +1237,7 @@ const STALE_PROPOSAL_CODES = new Set([
   "quote_not_found",
   "utterance_not_found",
   "invalid_source_span",
+  "utterance_bubble_limit",
 ]);
 
 function acceptProposal(session, operation, context) {
@@ -1044,6 +1297,7 @@ function operationResultRecord({ operationId, type, actor, operation, timestamp,
     id: operationId,
     type,
     actor,
+    origin: originOf(operation),
     created_at: timestamp,
     ...(operation.call_id ? { call_id: textField(operation.call_id, "call_id") } : {}),
     base_revision: baseRevision,
@@ -1052,6 +1306,7 @@ function operationResultRecord({ operationId, type, actor, operation, timestamp,
     warnings: [...warnings],
     undoable,
     ...(change ? { change } : {}),
+    ...operationProvenance(session, operation),
   };
   appendRecord(session, record, history);
 }
@@ -1202,8 +1457,8 @@ export function applyOperation(sessionInput, operationInput, options = {}) {
   const afterGraph = graphState(session);
   const changes = proposalChanges(beforeProposals, session.proposals);
   const change = historyAction ? {
-    before: beforeGraph,
-    after: afterGraph,
+    nodes: entityChanges(beforeGraph.nodes, afterGraph.nodes),
+    edges: entityChanges(beforeGraph.edges, afterGraph.edges),
     proposals: changes,
   } : null;
   operationResultRecord({

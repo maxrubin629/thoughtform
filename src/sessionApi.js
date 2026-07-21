@@ -155,6 +155,38 @@ export function synthesizeSession(sessionId, { expectedRevision, signal } = {}) 
   });
 }
 
+export function retrySessionMapController(sessionId, { signal } = {}) {
+  return request(sessionPath(sessionId, "/map-controller/retry"), {
+    method: "POST",
+    body: {},
+    signal,
+  });
+}
+
+export function shouldApplySessionSnapshot(current, incoming) {
+  if (!incoming?.id) return false;
+  if (!current || current.id !== incoming.id) return true;
+  const currentRevision = Number.isFinite(current.revision) ? current.revision : -1;
+  const incomingRevision = Number.isFinite(incoming.revision) ? incoming.revision : -1;
+  if (incomingRevision !== currentRevision) return incomingRevision > currentRevision;
+  const currentControllerEpoch = Number.isFinite(current.controller_event_epoch)
+    ? current.controller_event_epoch
+    : 0;
+  const incomingControllerEpoch = Number.isFinite(incoming.controller_event_epoch)
+    ? incoming.controller_event_epoch
+    : 0;
+  if (incomingControllerEpoch !== currentControllerEpoch) {
+    return incomingControllerEpoch > currentControllerEpoch;
+  }
+  const currentControllerSequence = Number.isFinite(current.controller_event_sequence)
+    ? current.controller_event_sequence
+    : 0;
+  const incomingControllerSequence = Number.isFinite(incoming.controller_event_sequence)
+    ? incoming.controller_event_sequence
+    : 0;
+  return incomingControllerSequence >= currentControllerSequence;
+}
+
 export async function negotiateRealtimeSession(
   sessionId,
   sdp,
@@ -222,7 +254,12 @@ function decodeEvent(event) {
 export function subscribeSessionEvents(
   sessionId,
   handlers = {},
-  { EventSourceImpl = globalThis.EventSource } = {},
+  {
+    EventSourceImpl = globalThis.EventSource,
+    reconnectDelayMs = 500,
+    setTimeoutImpl = globalThis.setTimeout,
+    clearTimeoutImpl = globalThis.clearTimeout,
+  } = {},
 ) {
   if (!EventSourceImpl) {
     throw new SessionApiError("This browser does not support live session updates", {
@@ -231,29 +268,11 @@ export function subscribeSessionEvents(
   }
 
   const normalized = typeof handlers === "function" ? { onSnapshot: handlers } : handlers;
-  const source = new EventSourceImpl(sessionPath(sessionId, "/events"));
+  const eventUrl = sessionPath(sessionId, "/events");
+  let source = null;
+  let retryTimer = null;
+  let retryCount = 0;
   let closed = false;
-
-  const dispatch = (event) => {
-    if (closed) return;
-    const payload = decodeEvent(event);
-    normalized.onEvent?.(payload, event);
-
-    const carriesSnapshot = ["snapshot", "session", "update"].includes(event.type)
-      || payload?.type === "snapshot";
-    const snapshot = payload?.snapshot
-      ?? payload?.session
-      ?? (carriesSnapshot ? payload?.data ?? payload : null);
-    if (snapshot) normalized.onSnapshot?.(snapshot, event);
-  };
-
-  source.onopen = (event) => {
-    if (!closed) normalized.onOpen?.(event);
-  };
-  source.onerror = (event) => {
-    if (!closed) normalized.onError?.(event);
-  };
-  source.onmessage = dispatch;
 
   // EventSource only routes named SSE events to explicitly registered listeners.
   const namedEvents = [
@@ -264,14 +283,53 @@ export function subscribeSessionEvents(
     "proposal",
     "transcript",
     "activity",
+    "map_controller",
     "connected",
   ];
-  for (const eventName of namedEvents) source.addEventListener?.(eventName, dispatch);
+
+  const connect = () => {
+    if (closed) return;
+    const current = new EventSourceImpl(eventUrl);
+    source = current;
+    const dispatch = (event) => {
+      if (closed || source !== current) return;
+      const payload = decodeEvent(event);
+      normalized.onEvent?.(payload, event);
+
+      const carriesSnapshot = ["snapshot", "session", "update"].includes(event.type)
+        || payload?.type === "snapshot";
+      const snapshot = payload?.snapshot
+        ?? payload?.session
+        ?? (carriesSnapshot ? payload?.data ?? payload : null);
+      if (snapshot) normalized.onSnapshot?.(snapshot, event);
+    };
+
+    current.onopen = (event) => {
+      if (closed || source !== current) return;
+      retryCount = 0;
+      normalized.onOpen?.(event);
+    };
+    current.onerror = (event) => {
+      if (closed || source !== current) return;
+      normalized.onError?.(event);
+      current.close();
+      source = null;
+      const delay = Math.min(reconnectDelayMs * (2 ** retryCount), 2_000);
+      retryCount += 1;
+      retryTimer = setTimeoutImpl(connect, delay);
+    };
+    current.onmessage = dispatch;
+    for (const eventName of namedEvents) current.addEventListener?.(eventName, dispatch);
+  };
+
+  connect();
 
   return () => {
     if (closed) return;
     closed = true;
-    source.close();
+    if (retryTimer) clearTimeoutImpl(retryTimer);
+    source?.close();
+    source = null;
   };
 }
 
@@ -280,3 +338,4 @@ export const patchSessionUiContext = updateSessionUiContext;
 export const performSessionOperation = applySessionOperation;
 export const postSessionToolCall = executeSessionToolCall;
 export const requestSessionSynthesis = synthesizeSession;
+export const retryMapController = retrySessionMapController;

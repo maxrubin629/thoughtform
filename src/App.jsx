@@ -734,6 +734,31 @@ export function MindMap({
       });
     };
 
+    const drawRevisitGlow = (context, visualNodes, now) => {
+      if (reducedMotion) return;
+      visualNodes.forEach((node) => {
+        if (node.ghost || node.heatAt == null) return;
+        const progress = clamp((now - node.heatAt) / 900, 0, 1);
+        if (progress <= 0 || progress >= 1) return;
+        const alpha = Math.sin(progress * Math.PI) * 0.16;
+        const radius = Math.max(node.radiusX, node.radiusY) * (1.08 + progress * 0.12);
+        const glow = context.createRadialGradient(
+          node.x,
+          node.y,
+          Math.max(node.radius * 0.82, 1),
+          node.x,
+          node.y,
+          radius,
+        );
+        glow.addColorStop(0, `rgba(247, 130, 105, ${alpha})`);
+        glow.addColorStop(1, "rgba(247, 130, 105, 0)");
+        context.fillStyle = glow;
+        context.beginPath();
+        context.arc(node.x, node.y, radius, 0, Math.PI * 2);
+        context.fill();
+      });
+    };
+
     const drawCommittedMaterial = (context, visualNodes, now) => {
       const materialEdges = renderedEdges.filter((edge) => !connectionIsPopping(edge, now));
       drawFluidMaterial(context, visualNodes, materialEdges, {
@@ -843,6 +868,7 @@ export function MindMap({
     const hasMaterialAnimation = (now) => (
       (!reducedMotion && renderedNodes.some((node) => (
         (node.createdAt != null && now - node.createdAt < 900)
+        || (node.heatAt != null && now - node.heatAt < 900)
         || (node.wobbleEndAt != null
           ? now < node.wobbleEndAt + 80
           : node.wobbleStart != null && now - node.wobbleStart < 760)
@@ -864,6 +890,7 @@ export function MindMap({
       if (concept === "paper") {
         beginWorld(underlayCtx, dpr);
         drawTethers(underlayCtx, visualNodes);
+        drawRevisitGlow(underlayCtx, visualNodes, now);
         const hoveredNode = visualNodes.get(hoveredNodeId);
         if (hoveredNode && !marqueeActive) {
           drawHoverGlow(underlayCtx, hoveredNode, concept, transform.scale);
@@ -992,7 +1019,7 @@ export function MindMap({
     const seed = [...seedText].reduce((value, character) => (
       ((value * 31) + character.charCodeAt(0)) >>> 0
     ), Math.round(now));
-    poppingConnectionsRef.current.push({
+    const pop = {
       edgeId: connection.link.id,
       aId: connection.a.id,
       bId: connection.b.id,
@@ -1002,12 +1029,17 @@ export function MindMap({
       seed,
       start: now,
       duration,
-    });
-    onRemoveConnection(connection.link, {
+    };
+    poppingConnectionsRef.current.push(pop);
+    const accepted = onRemoveConnection(connection.link, {
       hitT: connection.hit.t,
       sourceImpactAt: impacts.source,
       targetImpactAt: impacts.target,
     });
+    if (accepted === false) {
+      const index = poppingConnectionsRef.current.indexOf(pop);
+      if (index >= 0) poppingConnectionsRef.current.splice(index, 1);
+    }
   };
 
   const touchPointers = () => [...activePointersRef.current.values()]

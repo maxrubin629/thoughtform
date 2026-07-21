@@ -1642,7 +1642,7 @@ button:disabled {
   outline-offset: 1px;
 }
 
-.session-utterance span {
+.session-utterance > time {
   display: block;
   margin-bottom: 3px;
   font-size: 10px;
@@ -1656,6 +1656,37 @@ button:disabled {
   margin: 0;
   font-size: 13.5px;
   line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.session-utterance-fragment {
+  display: inline;
+}
+
+.session-turn-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(83, 69, 57, 0.1);
+}
+
+.session-turn-actions span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #9b5e50;
+}
+
+.session-turn-actions span::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #d6755f;
+  content: "";
 }
 
 .session-utterance mark {
@@ -2270,6 +2301,54 @@ button:disabled {
   background: transparent;
   font-weight: 700;
   cursor: pointer;
+}
+
+.session-controller-status {
+  position: absolute;
+  z-index: 16;
+  left: 50%;
+  bottom: 148px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(470px, calc(100vw - 110px));
+  padding: 8px 12px;
+  border: 1px solid rgba(167, 74, 56, 0.14);
+  border-radius: 999px;
+  color: #80675b;
+  background: rgba(255, 250, 242, 0.97);
+  box-shadow: 0 9px 24px rgba(64, 50, 39, 0.1);
+  font-size: 11.5px;
+}
+
+.session-controller-status.is-active::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d6755f;
+  animation: ai-status-pulse 1.2s ease-in-out infinite;
+  content: "";
+}
+
+.session-controller-status.is-error {
+  color: #8f493c;
+  border-color: rgba(167, 74, 56, 0.18);
+}
+
+.session-controller-status button {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.session-controller-status button:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .canonical-session-shell .voice-control > .icon-button + .icon-button {
