@@ -88,7 +88,7 @@ test("function calls return canonical server output through the data channel", a
     assert.equal(url, "/api/sessions/session-1/tool-calls");
     assert.deepEqual(JSON.parse(options.body), {
       name: "create_bubble",
-      arguments: { text: "A distinct idea" },
+      arguments: { text: "A distinct idea", expected_revision: 3 },
       call_id: "call-1",
       expected_revision: 3,
     });
@@ -642,12 +642,12 @@ test("a queued text response is discarded when the connection is replaced", asyn
   assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
 });
 
-test("the model revision remains authoritative over a newer browser snapshot", async () => {
+test("the current browser revision rebases a stale model revision", async () => {
+  const bodies = [];
   globalThis.fetch = async (_url, options) => {
     const body = JSON.parse(options.body);
-    assert.equal(body.arguments.expected_revision, 1);
-    assert.equal(body.expected_revision, 1);
-    return new Response(JSON.stringify({ ok: false, revision: 3 }), {
+    bodies.push(body);
+    return new Response(JSON.stringify({ ok: true, revision: 4 }), {
       headers: { "Content-Type": "application/json" },
     });
   };
@@ -659,6 +659,52 @@ test("the model revision remains authoritative over a newer browser snapshot", a
     name: "edit_bubble",
     arguments: JSON.stringify({ node_reference: "node-1", text: "Stale", expected_revision: 1 }),
   }) });
+
+  assert.equal(bodies[0].arguments.expected_revision, 3);
+  assert.equal(bodies[0].expected_revision, 3);
+});
+
+test("a Realtime tool retries once against the conflict snapshot revision", async () => {
+  const bodies = [];
+  let revision = 12;
+  let errors = 0;
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (bodies.length === 1) {
+      revision = 15;
+      const conflict = {
+        error: {
+          code: "revision_conflict",
+          message: "Expected revision 12, but session is at revision 15",
+        },
+        revision: 15,
+        snapshot: { id: "session-1", revision: 15, nodes: [], edges: [], proposals: [] },
+      };
+      return new Response(JSON.stringify(conflict), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true, revision: 16 }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  const { client } = connectedClient({
+    getExpectedRevision: () => revision,
+    onError: () => { errors += 1; },
+  });
+  await client._receiveEvent({ data: JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-rebase",
+    name: "edit_bubble",
+    arguments: JSON.stringify({ node_reference: "node-1", text: "Updated", expected_revision: 12 }),
+  }) });
+
+  assert.deepEqual(bodies.map((body) => body.expected_revision), [12, 15]);
+  assert.deepEqual(bodies.map((body) => body.arguments.expected_revision), [12, 15]);
+  assert.equal(errors, 0);
 });
 
 test("multiple tool events execute serially and request one follow-up response", async () => {

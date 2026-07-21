@@ -41,6 +41,39 @@ test("session operations carry revision and call id through the shared endpoint"
   assert.equal(result.revision, 8);
 });
 
+test("session operations retry once at the revision returned by a conflict", async () => {
+  const bodies = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (bodies.length === 1) {
+      return new Response(JSON.stringify({
+        error: {
+          code: "revision_conflict",
+          message: "Expected revision 12, but session is at revision 15",
+        },
+        revision: 15,
+        snapshot: { id: "session-1", revision: 15 },
+      }), {
+        status: 409,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true, revision: 16 }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  const result = await applySessionOperation(
+    "session-1",
+    { type: "move_bubble", node_reference: "node-1", x: 10, y: 20 },
+    { expectedRevision: 12, actor: "you" },
+  );
+
+  assert.deepEqual(bodies.map((body) => body.expected_revision), [12, 15]);
+  assert.equal(result.revision, 16);
+});
+
 test("map controller retry posts to the session retry endpoint and returns its snapshot", async () => {
   let request;
   globalThis.fetch = async (url, options) => {

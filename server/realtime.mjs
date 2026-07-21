@@ -285,6 +285,7 @@ export function buildRealtimeSessionConfig({
   return {
     type: "realtime",
     model,
+    reasoning: { effort: "low" },
     output_modalities: ["audio"],
     instructions,
     audio: {
@@ -293,7 +294,7 @@ export function buildRealtimeSessionConfig({
         turn_detection: normalizedMode === "vad"
           ? {
               type: "semantic_vad",
-              eagerness: "medium",
+              eagerness: "auto",
               create_response: true,
               interrupt_response: true,
             }

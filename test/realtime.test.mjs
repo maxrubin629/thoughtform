@@ -61,9 +61,10 @@ test("Realtime exposes the complete supported tool surface", () => {
 test("Realtime session balances pause tolerance with responsive Semantic VAD", () => {
   const vad = buildRealtimeSessionConfig({ voice: "verse" });
   assert.equal(vad.model, DEFAULT_REALTIME_MODEL);
+  assert.deepEqual(vad.reasoning, { effort: "low" });
   assert.equal(vad.audio.output.voice, "verse");
   assert.equal(vad.audio.input.turn_detection.type, "semantic_vad");
-  assert.equal(vad.audio.input.turn_detection.eagerness, "medium");
+  assert.equal(vad.audio.input.turn_detection.eagerness, "auto");
   assert.equal(vad.audio.input.turn_detection.create_response, true);
   assert.equal(vad.audio.input.turn_detection.interrupt_response, true);
   assert.equal(vad.tool_choice, "auto");

@@ -113,21 +113,36 @@ export function updateSessionUiContext(sessionId, context, { signal } = {}) {
   });
 }
 
-export function applySessionOperation(
+export async function applySessionOperation(
   sessionId,
   operation,
   { expectedRevision, callId, actor, signal } = {},
 ) {
-  return request(sessionPath(sessionId, "/operations"), {
-    method: "POST",
-    body: {
-      operation,
-      ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision }),
-      ...(callId ? { call_id: callId } : {}),
-      ...(actor ? { actor } : {}),
-    },
-    signal,
-  });
+  let revision = expectedRevision;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await request(sessionPath(sessionId, "/operations"), {
+        method: "POST",
+        body: {
+          operation,
+          ...(revision === undefined ? {} : { expected_revision: revision }),
+          ...(callId ? { call_id: callId } : {}),
+          ...(actor ? { actor } : {}),
+        },
+        signal,
+      });
+    } catch (error) {
+      if (attempt === 0
+        && error instanceof SessionApiError
+        && error.code === "revision_conflict"
+        && Number.isInteger(error.revision)) {
+        revision = error.revision;
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("Session operation retry exhausted");
 }
 
 export function executeSessionToolCall(

@@ -795,17 +795,40 @@ export class SessionRealtimeClient {
       ].some((value) => typeof value === "string" && value.length > 0)
         || (Array.isArray(toolArguments.quotes)
           && toolArguments.quotes.some((value) => typeof value === "string" && value.length > 0));
-      const serverArguments = !hasDirectQuote
+      const baseServerArguments = !hasDirectQuote
         && !toolArguments.realtime_item_id
         && fallbackInputItemId
         ? { ...toolArguments, realtime_item_id: fallbackInputItemId }
         : toolArguments;
-      const result = await executeSessionToolCall(this.sessionId, {
-        name,
-        arguments: serverArguments,
-        callId,
-        expectedRevision: toolArguments.expected_revision ?? await this._expectedRevision(),
-      }, { signal: controller.signal });
+      const liveRevision = await this._expectedRevision();
+      let expectedRevision = Number.isInteger(liveRevision)
+        ? liveRevision
+        : toolArguments.expected_revision;
+      let result;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const serverArguments = expectedRevision === undefined
+          ? baseServerArguments
+          : { ...baseServerArguments, expected_revision: expectedRevision };
+        try {
+          result = await executeSessionToolCall(this.sessionId, {
+            name,
+            arguments: serverArguments,
+            callId,
+            expectedRevision,
+          }, { signal: controller.signal });
+          break;
+        } catch (error) {
+          const conflictRevision = error instanceof SessionApiError
+            && error.code === "revision_conflict"
+            ? error.revision ?? error.snapshot?.revision
+            : null;
+          if (attempt === 0 && Number.isInteger(conflictRevision)) {
+            expectedRevision = conflictRevision;
+            continue;
+          }
+          throw error;
+        }
+      }
       if (generation !== this._connectionGeneration) {
         return { outputSent: false, superseded: true };
       }
