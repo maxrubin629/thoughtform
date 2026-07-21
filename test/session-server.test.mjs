@@ -371,7 +371,7 @@ test("the controller publishes its runtime status and applied snapshots over SSE
   };
   const app = await createThoughtformServer({
     store: createSessionStore({ directory }),
-    env: { OPENAI_API_KEY: "test-key" },
+    env: { OPENAI_API_KEY: "test-key", THOUGHTFORM_CURATOR_ENABLED: "false" },
     mapController: { model: "controller-test-model" },
     controllerEventEpoch: 41,
     mapControllerSchedulerFactory: (options) => {
@@ -478,6 +478,101 @@ test("the controller publishes its runtime status and applied snapshots over SSE
   assert.equal("controller_event_sequence" in stored, false);
   assert.equal("controller_event_epoch" in stored, false);
   await reader.cancel();
+});
+
+test("the creative curator starts only after the map controller has completed", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-curator-ordering-"));
+  let controllerHooks;
+  let curatorHooks;
+  const curatorNotifications = [];
+  const curatorScheduler = {
+    notify: (sessionId) => { curatorNotifications.push(sessionId); return true; },
+    cancel: () => false,
+    dispose: () => {},
+  };
+  const app = await createThoughtformServer({
+    store: createSessionStore({ directory }),
+    env: {
+      OPENAI_API_KEY: "test-key",
+      THOUGHTFORM_CURATOR_ENABLED: "true",
+    },
+    mapController: { model: "controller-test-model" },
+    mapControllerSchedulerFactory: (options) => {
+      controllerHooks = options;
+      return {
+        notify: () => true,
+        recover: () => false,
+        retry: () => true,
+        cancel: () => false,
+        state: () => ({ scheduled: true, preparing: false, active: false, queued: false }),
+        dispose: () => {},
+      };
+    },
+    curator: { enabled: true, model: "curator-test-model" },
+    curatorSchedulerFactory: (options) => {
+      curatorHooks = options;
+      return curatorScheduler;
+    },
+  });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  t.after(async () => {
+    app.locals.dispose?.();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const created = await (await fetch(`${base}/api/sessions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  })).json();
+  const appended = await (await fetch(`${base}/api/sessions/${created.id}/operations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      expected_revision: 0,
+      operation: {
+        type: "append_utterance",
+        speaker: "you",
+        text: "A complete thought for both background models.",
+      },
+    }),
+  })).json();
+
+  assert.equal(appended.ok, true);
+  assert.deepEqual(curatorNotifications, []);
+  await controllerHooks.onStateChange(created.id);
+  assert.deepEqual(curatorNotifications, []);
+  await controllerHooks.onComplete(created.id, {
+    decision: "apply",
+    session: await app.locals.sessionStore.get(created.id),
+  });
+  assert.deepEqual(curatorNotifications, [created.id]);
+  assert.equal(app.locals.curator.model, "curator-test-model");
+  assert.equal(app.locals.curatorScheduler, curatorScheduler);
+
+  await curatorHooks.onProposal(created.id, {
+    id: "proposal-creative-1",
+    status: "pending",
+    base_revision: 0,
+    actor: "curator",
+    rationale: "A non-obvious implication may be worth exploring.",
+    evidence: [],
+    operations: [{
+      id: "proposal-operation-creative-1",
+      type: "create_bubble",
+      node_id: "proposed-node-creative-1",
+      text: "A useful implication beyond the transcript",
+      excluded: false,
+    }],
+  });
+  const withProposal = await app.locals.sessionStore.get(created.id);
+  assert.equal(withProposal.revision, 1);
+  assert.equal(withProposal.proposals[0].id, "proposal-creative-1");
+  assert.equal(withProposal.proposals[0].actor, "curator");
 });
 
 test("controller recovery only schedules unprocessed user work and disabling it keeps editing available", async (t) => {

@@ -1459,7 +1459,7 @@ export function CanonicalSessionApp() {
       )}
 
       {(voiceStarting || voiceConnected || liveCaption || partnerCaption) && (
-        <div className="voice-caption session-caption" role="status" aria-live="polite"><span /><p>{partnerCaption ? "Partner" : voiceStarting ? "Connecting securely…" : voiceMode === "push-to-talk" ? "Hold the mic while you speak…" : "Listening for a complete thought…"}</p><small>{partnerCaption || liveCaption || "Partial speech stays here until the utterance completes."}</small></div>
+        <div className="voice-caption session-caption" role="status" aria-live="polite"><span /><p>{partnerCaption ? "Partner" : voiceStarting ? "Connecting…" : voiceMode === "push-to-talk" ? "Hold the mic while you speak…" : "Listening for a complete thought…"}</p><small>{partnerCaption || liveCaption || "Speak naturally."}</small></div>
       )}
 
       {controllerStatus && (

@@ -29,6 +29,7 @@ import {
   createMapController,
   createMapControllerScheduler,
 } from "./mapController.mjs";
+import { createCurator, createCuratorScheduler, isCuratorEnabled } from "./curator.mjs";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6";
@@ -158,6 +159,10 @@ export async function createThoughtformServer({
   mapControllerScheduler: suppliedMapControllerScheduler,
   mapControllerFactory = createMapController,
   mapControllerSchedulerFactory = createMapControllerScheduler,
+  curator: suppliedCurator,
+  curatorScheduler: suppliedCuratorScheduler,
+  curatorFactory = createCurator,
+  curatorSchedulerFactory = createCuratorScheduler,
 } = {}) {
   await store.init();
   const app = express();
@@ -172,6 +177,8 @@ export async function createThoughtformServer({
   );
   let mapController = null;
   let mapControllerScheduler = null;
+  let curator = null;
+  let curatorScheduler = null;
 
   const controllerEventSequenceFor = (sessionId) => controllerEventSequences.get(sessionId) ?? 0;
   const advanceControllerEventSequence = (sessionId) => {
@@ -294,6 +301,24 @@ export async function createThoughtformServer({
     return snapshot;
   };
 
+  const commitCuratorProposal = async (sessionId, proposal) => {
+    const result = await store.transact(sessionId, (session) => applyOperation(session, {
+      type: "propose_changes",
+      actor: "curator",
+      origin: "ui",
+      call_id: `curator-${proposal.id}`,
+      expected_revision: proposal.base_revision,
+      proposal_id: proposal.id,
+      base_revision: proposal.base_revision,
+      rationale: proposal.rationale,
+      evidence: proposal.evidence,
+      operations: proposal.operations,
+    }));
+    const snapshot = snapshotFor(result.session);
+    publish(result.session, "operation", { operation_id: result.operation_id }, snapshot);
+    return { ...result, snapshot };
+  };
+
   if (controllerRuntimeEnabled) {
     mapController = suppliedMapController ?? mapControllerFactory({
       env,
@@ -305,11 +330,33 @@ export async function createThoughtformServer({
       controller: mapController,
       loadSnapshot: (sessionId) => store.get(sessionId),
       onStateChange: (sessionId) => publishMapControllerSnapshot(sessionId).catch(() => {}),
-      onComplete: (sessionId, result) => publishMapControllerSnapshot(
-        sessionId,
-        result?.session ?? null,
-      ).catch(() => {}),
+      onComplete: async (sessionId, result) => {
+        await publishMapControllerSnapshot(sessionId, result?.session ?? null).catch(() => {});
+        curatorScheduler?.notify(sessionId);
+      },
       onError: (_error, sessionId) => publishMapControllerSnapshot(sessionId).catch(() => {}),
+    });
+  }
+
+  const curatorRuntimeEnabled = Boolean(
+    mapControllerScheduler
+    && isCuratorEnabled(env)
+    && (controllerConfigured || suppliedCurator || suppliedCuratorScheduler),
+  );
+  if (curatorRuntimeEnabled) {
+    curator = suppliedCurator ?? curatorFactory({
+      env,
+      client: openaiClient ?? undefined,
+    });
+    curatorScheduler = suppliedCuratorScheduler ?? curatorSchedulerFactory({
+      curator,
+      loadSnapshot: (sessionId) => store.get(sessionId),
+      isBlocked: (sessionId) => {
+        const state = mapControllerScheduler?.state?.(sessionId) ?? {};
+        return Boolean(state.scheduled || state.preparing || state.active || state.queued);
+      },
+      onProposal: commitCuratorProposal,
+      onError: (error) => console.error(error),
     });
   }
 
@@ -370,6 +417,12 @@ export async function createThoughtformServer({
         enabled: Boolean(mapControllerScheduler),
         model: mapController?.model ?? env.OPENAI_MAP_CONTROLLER_MODEL ?? DEFAULT_MAP_CONTROLLER_MODEL,
       },
+      ...(curator ? {
+        curator: {
+          enabled: true,
+          model: curator.model,
+        },
+      } : {}),
     });
   });
 
@@ -392,6 +445,7 @@ export async function createThoughtformServer({
 
   app.delete("/api/sessions/:id", jsonRoute(async (req) => {
     mapControllerScheduler?.cancel(req.params.id);
+    curatorScheduler?.cancel(req.params.id);
     uiContexts.delete(req.params.id);
     controllerEventSequences.delete(req.params.id);
     const listeners = eventClients.get(req.params.id);
@@ -651,8 +705,11 @@ export async function createThoughtformServer({
   app.locals.sessionStore = store;
   app.locals.mapController = mapController;
   app.locals.mapControllerScheduler = mapControllerScheduler;
+  if (curator) app.locals.curator = curator;
+  if (curatorScheduler) app.locals.curatorScheduler = curatorScheduler;
   app.locals.dispose = () => {
     mapControllerScheduler?.dispose();
+    curatorScheduler?.dispose();
     eventClients.forEach((listeners) => listeners.forEach((response) => {
       sseWriter.cleanup(response);
       response.end();
