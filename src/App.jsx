@@ -36,7 +36,7 @@ import {
   CONNECTION_CREATE_DURATION,
   CONNECTION_CREATE_RETURN_DELAY,
   CONNECTION_POP_DURATION,
-  DEFAULT_MATERIAL_SETTINGS,
+  PAPER_MATERIAL_SETTINGS,
   buildFluidVisualNodes,
   clamp,
   drawFluidConnectionPop,
@@ -67,13 +67,6 @@ const initialFluidEdges = captureFluidRestLengths(initialNodes, initialEdges, { 
 const MIN_ZOOM = 0.72;
 const MAX_ZOOM = 1.36;
 const ZOOM_STEP = 0.08;
-
-const paperMaterialSettings = {
-  ...DEFAULT_MATERIAL_SETTINGS,
-  bridgeWidth: 0.62,
-  flare: 0.29,
-  filletReach: 0.22,
-};
 
 const palettes = {
   paper: {
@@ -175,7 +168,7 @@ function getFocusIds(focusId, edges) {
   return included;
 }
 
-function layoutHierarchy(nodes, edges) {
+export function layoutHierarchy(nodes, edges) {
   const committed = nodes.filter((node) => !node.ghost);
   const byDepth = new Map();
   committed.forEach((node) => {
@@ -451,7 +444,7 @@ export function IconButton({
   );
 }
 
-function FloatingPanel({ panel, onClose, children }) {
+export function FloatingPanel({ panel, onClose, children }) {
   const meta = panelMeta[panel];
   const PanelIcon = meta.icon;
   return (
@@ -477,7 +470,7 @@ function FloatingPanel({ panel, onClose, children }) {
   );
 }
 
-function ToggleRow({ label, description, checked, onChange, disabled = false }) {
+export function ToggleRow({ label, description, checked, onChange, disabled = false }) {
   return (
     <label className={`toggle-row ${disabled ? "is-disabled" : ""}`}>
       <span>
@@ -522,6 +515,7 @@ export function MindMap({
   focusId,
   reducedMotion,
   marqueeActive,
+  connectionPopQueueRef,
 }) {
   const canvasRef = useRef(null);
   const underlayCanvasRef = useRef(null);
@@ -534,7 +528,9 @@ export function MindMap({
   const dragRef = useRef(null);
   const activePointersRef = useRef(new Map());
   const interactionRef = useRef(null);
-  const poppingConnectionsRef = useRef([]);
+  const internalPoppingConnectionsRef = useRef([]);
+  const poppingConnectionsRef = connectionPopQueueRef ?? internalPoppingConnectionsRef;
+  const previousRenderedEdgeKeysRef = useRef(new Set());
   const lastConnectionPopRef = useRef(null);
   const [viewport, setViewport] = useState({ width: BASE_WIDTH, height: BASE_HEIGHT });
   const [fontReady, setFontReady] = useState(false);
@@ -555,6 +551,17 @@ export function MindMap({
     [edges, renderedIds],
   );
 
+  const connectionIsPopping = (edge, now = performance.now()) => (
+    Boolean(connectionPopQueueRef) && poppingConnectionsRef.current.some((pop) => {
+      if (now >= pop.start + pop.duration) return false;
+      if (pop.edgeId && edge.id && pop.edgeId === edge.id) return true;
+      return (
+        (pop.aId === edge.from && pop.bId === edge.to)
+        || (pop.aId === edge.to && pop.bId === edge.from)
+      );
+    })
+  );
+
   useEffect(() => {
     const shell = shellRef.current;
     if (!shell) return undefined;
@@ -573,6 +580,32 @@ export function MindMap({
     if (dragRef.current?.type === "marquee") dragRef.current = null;
     setMarqueeRect(null);
   }, [marqueeActive]);
+
+  useEffect(() => {
+    if (reducedMotion) poppingConnectionsRef.current = [];
+  }, [poppingConnectionsRef, reducedMotion]);
+
+  useEffect(() => {
+    const edgeKey = (edge) => {
+      if (edge.id) return `id:${edge.id}`;
+      return String(edge.from) < String(edge.to)
+        ? `ends:${edge.from}:${edge.to}`
+        : `ends:${edge.to}:${edge.from}`;
+    };
+    const committedEdges = renderedEdges.filter((edge) => !edge.ghost);
+    const previousKeys = previousRenderedEdgeKeysRef.current;
+    const restoredEdges = committedEdges.filter((edge) => !previousKeys.has(edgeKey(edge)));
+    if (connectionPopQueueRef && restoredEdges.length && poppingConnectionsRef.current.length) {
+      poppingConnectionsRef.current = poppingConnectionsRef.current.filter((pop) => (
+        !restoredEdges.some((edge) => (
+          (pop.edgeId && edge.id && pop.edgeId === edge.id)
+          || (pop.aId === edge.from && pop.bId === edge.to)
+          || (pop.aId === edge.to && pop.bId === edge.from)
+        ))
+      ));
+    }
+    previousRenderedEdgeKeysRef.current = new Set(committedEdges.map(edgeKey));
+  }, [connectionPopQueueRef, poppingConnectionsRef, renderedEdges]);
 
   useEffect(() => {
     Promise.all([
@@ -724,14 +757,15 @@ export function MindMap({
     };
 
     const drawCommittedMaterial = (context, visualNodes, now) => {
-      drawFluidMaterial(context, visualNodes, renderedEdges, {
+      const materialEdges = renderedEdges.filter((edge) => !connectionIsPopping(edge, now));
+      drawFluidMaterial(context, visualNodes, materialEdges, {
         color: palette.material,
         colorForNode: (node) => concept === "paper"
           ? palette.material
           : palette.materialByDepth[clamp(node.depth ?? 0, 0, palette.materialByDepth.length - 1)],
         now,
         reducedMotion,
-        settings: paperMaterialSettings,
+        settings: PAPER_MATERIAL_SETTINGS,
       });
     };
 
@@ -750,7 +784,7 @@ export function MindMap({
     const drawConnectionPops = (context, visualNodes, now) => {
       poppingConnectionsRef.current = poppingConnectionsRef.current.filter((pop) => {
         const progress = clamp((now - pop.start) / pop.duration, 0, 1);
-        if (progress >= 1) return false;
+        if (progress >= 1) return Boolean(pop.hideUntilResolved);
         const a = visualNodes.get(pop.aId) ?? pop.a;
         const b = visualNodes.get(pop.bId) ?? pop.b;
         const fill = context.createLinearGradient(a.x, a.y, b.x, b.y);
@@ -762,7 +796,7 @@ export function MindMap({
           : palette.materialByDepth[clamp(b.depth ?? 0, 0, palette.materialByDepth.length - 1)];
         fill.addColorStop(0, colorA);
         fill.addColorStop(1, colorB);
-        drawFluidConnectionPop(context, a, b, paperMaterialSettings, pop, progress, fill);
+        drawFluidConnectionPop(context, a, b, PAPER_MATERIAL_SETTINGS, pop, progress, fill);
         return true;
       });
     };
@@ -838,7 +872,7 @@ export function MindMap({
       || (!reducedMotion && renderedEdges.some((edge) => (
         edge.createdAt != null && now - edge.createdAt < CONNECTION_CREATE_DURATION + 80
       )))
-      || poppingConnectionsRef.current.length > 0
+      || poppingConnectionsRef.current.some((pop) => now < pop.start + pop.duration)
     );
 
     const draw = (now) => {
@@ -947,7 +981,11 @@ export function MindMap({
     .reverse()
     .find((node) => Math.hypot(node.x - point.x, node.y - point.y) <= node.r + 4);
 
-  const hitConnection = (point) => findFluidConnectionHit(point, renderedNodes, renderedEdges);
+  const hitConnection = (point) => findFluidConnectionHit(
+    point,
+    renderedNodes,
+    renderedEdges.filter((edge) => !connectionIsPopping(edge)),
+  );
 
   const nodesIntersectingRect = (start, end) => {
     const left = Math.min(start.x, end.x);
@@ -970,7 +1008,7 @@ export function MindMap({
       duration,
       connection.a,
       connection.b,
-      paperMaterialSettings,
+      PAPER_MATERIAL_SETTINGS,
     );
     const seedText = `${connection.link.from}:${connection.link.to}`;
     const seed = [...seedText].reduce((value, character) => (

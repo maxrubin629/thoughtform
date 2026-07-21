@@ -27,6 +27,13 @@ export const DEFAULT_MATERIAL_SETTINGS = {
   slenderSpanEnabled: false,
 };
 
+export const PAPER_MATERIAL_SETTINGS = {
+  ...DEFAULT_MATERIAL_SETTINGS,
+  bridgeWidth: 0.62,
+  flare: 0.29,
+  filletReach: 0.22,
+};
+
 export function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }

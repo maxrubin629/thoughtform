@@ -1,13 +1,14 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.jsx";
-import { SessionApp } from "./SessionApp.jsx";
+import { CanonicalSessionApp } from "./CanonicalSessionApp.jsx";
 import "./styles.css";
 
-const sessionMode = new URLSearchParams(window.location.search).get("mode") === "session";
+const mode = new URLSearchParams(window.location.search).get("mode");
+const classicMode = mode === "classic";
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    {sessionMode ? <SessionApp /> : <App />}
+    {classicMode ? <App /> : <CanonicalSessionApp />}
   </React.StrictMode>,
 );
