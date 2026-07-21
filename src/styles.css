@@ -1943,9 +1943,13 @@ button:disabled {
 
 .session-proposal footer .session-evidence {
   padding: 6px 10px;
+  max-width: 100%;
+  overflow: hidden;
   color: #9b5e50;
   background: rgba(239, 122, 99, 0.1);
   border-color: transparent;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-composer {
@@ -1992,4 +1996,312 @@ button:disabled {
 
 .session-caption small {
   font-style: italic;
+}
+
+/* ---- Server-owned session additions ---- */
+
+.session-audio {
+  display: none;
+}
+
+.canonical-session-shell .session-side-rail {
+  gap: 18px;
+}
+
+.session-loading {
+  position: absolute;
+  z-index: 5;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #8a7466;
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.canonical-session-shell .session-drawer {
+  top: 88px;
+  width: 342px;
+  max-height: calc(100vh - 112px);
+}
+
+.session-maps-panel,
+.session-panel-copy {
+  padding: 14px;
+  overflow-y: auto;
+}
+
+.session-new-map {
+  width: 100%;
+  justify-content: center;
+  margin-bottom: 12px;
+}
+
+.session-map-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 12px;
+}
+
+.session-map-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px 34px;
+  align-items: center;
+  gap: 3px;
+  padding: 4px;
+  border: 1px solid transparent;
+  border-radius: 15px;
+  background: rgba(83, 69, 57, 0.045);
+}
+
+.session-map-row.is-current {
+  border-color: rgba(213, 103, 82, 0.22);
+  background: rgba(239, 122, 99, 0.1);
+}
+
+.session-map-row > .icon-button {
+  width: 32px;
+  height: 32px;
+}
+
+.session-map-row > .icon-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.session-map-open {
+  min-width: 0;
+  padding: 8px 7px;
+  border: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #4c3d33;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.session-map-open span,
+.session-map-open strong,
+.session-map-open small {
+  display: block;
+  min-width: 0;
+}
+
+.session-map-open strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+
+.session-map-open small {
+  margin-top: 3px;
+  color: #8a7466;
+  font-size: 10.5px;
+}
+
+.session-map-open > svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: #b7503e;
+}
+
+.session-map-row form {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px 34px;
+  gap: 4px;
+}
+
+.session-map-row form input {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(83, 69, 57, 0.16);
+  border-radius: 10px;
+  background: #fffdf9;
+}
+
+.session-map-row form .icon-button {
+  width: 32px;
+  height: 32px;
+}
+
+.session-panel-copy > p,
+.session-panel-copy .panel-description {
+  margin: 0 0 14px;
+  color: #7d6b5d;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.session-panel-copy .map-stats {
+  margin-bottom: 14px;
+}
+
+.session-panel-copy .wide-action {
+  width: 100%;
+  justify-content: center;
+}
+
+.session-synthesis {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 14px;
+  color: #4c3d33;
+  background: rgba(83, 69, 57, 0.05);
+}
+
+.session-synthesis p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.session-voice-mode {
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(83, 69, 57, 0.05);
+}
+
+.session-voice-mode > span,
+.session-voice-mode strong,
+.session-voice-mode small {
+  display: block;
+}
+
+.session-voice-mode strong {
+  margin-bottom: 3px;
+  font-size: 12.5px;
+}
+
+.session-voice-mode small {
+  color: #8a7466;
+  font-size: 10.5px;
+}
+
+.session-voice-mode .segmented-control {
+  margin-top: 10px;
+}
+
+.canonical-session-shell .session-provenance {
+  top: 88px;
+}
+
+.canonical-session-shell .selection-toolbar ~ .session-provenance {
+  top: 136px;
+}
+
+.canonical-session-shell .session-proposals {
+  top: 88px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  padding: 2px 2px 18px;
+  scrollbar-width: thin;
+}
+
+.session-proposal.is-stale {
+  opacity: 0.72;
+}
+
+.session-proposal-operations {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 9px;
+}
+
+.session-proposal-operations > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 31px;
+  padding: 5px 6px 5px 10px;
+  border-radius: 10px;
+  color: #604b41;
+  background: rgba(245, 132, 109, 0.09);
+  font-size: 11px;
+}
+
+.session-proposal-operations > div.is-excluded {
+  color: #9b8878;
+  text-decoration: line-through;
+  background: rgba(83, 69, 57, 0.045);
+}
+
+.session-proposal-operations .icon-button {
+  flex: none;
+  width: 25px;
+  height: 25px;
+}
+
+.session-proposal-operations .icon-button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.session-voice-error {
+  position: absolute;
+  z-index: 16;
+  left: 50%;
+  bottom: 104px;
+  transform: translateX(-50%);
+  max-width: min(470px, calc(100vw - 110px));
+  padding: 8px 12px;
+  border: 1px solid rgba(167, 74, 56, 0.18);
+  border-radius: 999px;
+  color: #8f493c;
+  background: rgba(255, 250, 242, 0.97);
+  box-shadow: 0 9px 24px rgba(64, 50, 39, 0.12);
+  font-size: 11.5px;
+}
+
+.session-voice-error button {
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.canonical-session-shell .voice-control > .icon-button + .icon-button {
+  width: 34px;
+  height: 34px;
+}
+
+.canonical-session-shell .voice-control button {
+  touch-action: none;
+}
+
+@media (max-width: 760px) {
+  .canonical-session-shell .session-drawer {
+    left: calc(var(--workspace-rail-width) + 8px);
+    width: min(330px, calc(100vw - var(--workspace-rail-width) - 18px));
+  }
+
+  .canonical-session-shell .session-proposals {
+    right: 10px;
+    width: min(300px, calc(100vw - var(--workspace-rail-width) - 24px));
+  }
+
+  .canonical-session-shell .session-drawer ~ .session-proposals {
+    top: auto;
+    right: 10px;
+    bottom: 100px;
+    left: calc(var(--workspace-rail-width) + 8px);
+    width: auto;
+    max-height: min(38vh, 280px);
+  }
+
+  .canonical-session-shell .session-provenance {
+    max-width: calc(100vw - 100px);
+  }
 }
