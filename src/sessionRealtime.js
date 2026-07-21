@@ -32,7 +32,7 @@ const CALLBACK_NAMES = [
 function clientItemId() {
   const value = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
-  return `item_${value.replaceAll("-", "")}`;
+  return `item_${value.replaceAll("-", "").slice(0, 27)}`;
 }
 
 function clientEventId() {

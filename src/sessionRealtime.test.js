@@ -44,6 +44,7 @@ test("sendText assigns a stable item ID and awaits transcript commit before resp
   });
 
   assert.match(itemId, /^item_/);
+  assert.ok(itemId.length <= 32, `client item ID must fit Realtime's 32-character limit: ${itemId}`);
   assert.equal(callbackItemId, itemId);
   assert.equal(sent[0].item.id, itemId);
   assert.equal(sent[0].item.content[0].text, "A complete idea");
@@ -109,9 +110,11 @@ test("function calls return canonical server output through the data channel", a
   assert.equal(sent[0].type, "conversation.item.create");
   assert.equal(sent[0].item.type, "function_call_output");
   assert.equal(sent[0].item.call_id, "call-1");
+  assert.ok(sent[0].item.id.length <= 32);
   assert.equal(JSON.parse(sent[0].item.output).revision, 4);
   assert.equal(sent[1].type, "response.create");
   assert.equal(sent[1].response.tool_choice, "none");
+  assert.equal(sent[1].response.input.at(-1).id, sent[0].item.id);
   assert.notEqual(sent[1].response.metadata.request_id, sent[1].event_id);
 });
 
