@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  SESSION_SCHEMA_VERSION,
   SessionRevisionConflictError,
   SessionSchemaError,
   SessionStore,
@@ -30,7 +31,7 @@ test("creates, lists, renames, resumes, and deletes local sessions", async () =>
 
   const first = await store.create();
   assert.equal(first.title, UNTITLED_SESSION_TITLE);
-  assert.equal(first.schema_version, 2);
+  assert.equal(first.schema_version, SESSION_SCHEMA_VERSION);
   assert.equal(first.revision, 0);
   assert.deepEqual(first.nodes, []);
   assert.deepEqual(first.map_controller, {
@@ -133,7 +134,7 @@ test("strictly rejects unsupported or malformed persisted schemas", async () => 
   const session = await store.create();
   const filename = path.join(directory, `${session.id}.json`);
 
-  await writeFile(filename, `${JSON.stringify({ ...session, schema_version: 3 })}\n`, "utf8");
+  await writeFile(filename, `${JSON.stringify({ ...session, schema_version: 999 })}\n`, "utf8");
   await assert.rejects(store.get(session.id), SessionSchemaError);
 
   await writeFile(filename, `${JSON.stringify({ ...session, unexpected: true })}\n`, "utf8");
@@ -154,6 +155,7 @@ test("migrates v1 session and index files without backfilling historical transcr
     }],
   };
   delete legacy.map_controller;
+  for (const key of ["preferences", "synthesis", "transcript_fragments", "live_capture"]) delete legacy[key];
   await writeFile(path.join(directory, `${current.id}.json`), `${JSON.stringify(legacy)}\n`, "utf8");
   await writeFile(path.join(directory, "_index.json"), `${JSON.stringify({
     schema_version: 1,
@@ -162,11 +164,11 @@ test("migrates v1 session and index files without backfilling historical transcr
 
   const migratedStore = new SessionStore({ directory, idFactory: () => "unused" });
   const migrated = await migratedStore.get(current.id);
-  assert.equal(migrated.schema_version, 2);
+  assert.equal(migrated.schema_version, SESSION_SCHEMA_VERSION);
   assert.equal(migrated.map_controller.processed_transcript_count, 1);
   assert.equal(migrated.map_controller.last_run_id, null);
-  assert.equal(JSON.parse(await readFile(path.join(directory, "_index.json"), "utf8")).schema_version, 2);
-  assert.equal(JSON.parse(await readFile(path.join(directory, `${current.id}.json`), "utf8")).schema_version, 2);
+  assert.equal(JSON.parse(await readFile(path.join(directory, "_index.json"), "utf8")).schema_version, SESSION_SCHEMA_VERSION);
+  assert.equal(JSON.parse(await readFile(path.join(directory, `${current.id}.json`), "utf8")).schema_version, SESSION_SCHEMA_VERSION);
 });
 
 test("migrates legacy curator records to the conservative ui origin", async () => {
@@ -183,6 +185,7 @@ test("migrates legacy curator records to the conservative ui origin", async () =
     }],
   };
   delete legacy.map_controller;
+  for (const key of ["preferences", "synthesis", "transcript_fragments", "live_capture"]) delete legacy[key];
   await writeFile(path.join(directory, `${current.id}.json`), `${JSON.stringify(legacy)}\n`, "utf8");
 
   const migrated = await store.get(current.id);

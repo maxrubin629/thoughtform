@@ -2,6 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { captureFluidRestLengths, stepFluidPhysics } from "./fluidPhysics.js";
 
+test("pinned lobes hold their position while neighbors settle away from them", () => {
+  const nodes = [
+    { id: "anchor", x: 300, y: 300, r: 60, vx: 8, vy: -5, pinned: true },
+    { id: "neighbor", x: 350, y: 300, r: 60, vx: 0, vy: 0 },
+  ];
+  const result = stepFluidPhysics(nodes, [], { frameStep: 1, width: 1440, height: 1000 });
+  assert.equal(result.nodes[0].x, 300);
+  assert.equal(result.nodes[0].y, 300);
+  assert.equal(result.nodes[0].vx, 0);
+  assert.equal(result.nodes[0].vy, 0);
+  assert.ok(result.nodes[1].x > 350);
+});
+
 test("session presentation can capture a stable rest length for proposal tethers", () => {
   const nodes = [
     { id: "committed", x: 100, y: 100, r: 60, ghost: false },

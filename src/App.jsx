@@ -1,35 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  IconAdjustments,
-  IconAffiliate,
-  IconArrowBackUp,
-  IconArrowForwardUp,
-  IconArrowRight,
-  IconBulb,
-  IconCheck,
-  IconClock,
-  IconEye,
-  IconFocusCentered,
-  IconGridDots,
-  IconHierarchy2,
-  IconLink,
-  IconMap2,
-  IconMarquee,
-  IconMessageCircle,
-  IconMicrophone,
-  IconMinus,
-  IconPencil,
-  IconPlus,
-  IconSearch,
-  IconSend,
-  IconSettings,
-  IconSparkles,
-  IconStack2,
-  IconStar,
-  IconTrash,
-  IconUser,
-  IconX,
-} from "@tabler/icons-react";
+import { IconCheck, IconLink, IconParking, IconPin, IconPinnedOff, IconPencil, IconPlus, IconQuote, IconSparkles, IconTrash, IconX } from "@tabler/icons-react";
+import { lassoIntersectsNode } from "./lassoSelection.js";
+import { canConnect, connectionTargetAt, connectionBud, connectionPreviewPath } from "./connectionGesture.js";
 import paperTextureUrl from "./assets/paper-texture.png";
 import {
   CONNECTION_CREATE_DURATION,
@@ -40,36 +12,13 @@ import {
   drawFluidConnectionPop,
   drawFluidMaterial,
   findFluidConnectionHit,
-  findGrowthPlacement,
   getConnectionPopImpactTimes,
-  withWobble,
 } from "./fluidMaterial.js";
 import { createFluidShaderRenderer } from "./fluidShaderRenderer.js";
-import {
-  FLUID_PHYSICS_SETTINGS,
-  captureFluidRestLengths,
-  stepFluidPhysics,
-} from "./fluidPhysics.js";
-import {
-  applyConnectionGrowthMotion,
-  buildConnectionPopTransition,
-} from "./connectionVisualMotion.js";
-import {
-  BASE_HEIGHT,
-  BASE_WIDTH,
-  aiPrompts,
-  initialEdges,
-  initialNodes,
-  voiceThoughts,
-} from "./mapData.js";
-import { serializeGraph } from "./graphContext.js";
-import { requestCompanion, requestDictation, requestProposals, requestSynthesis } from "./aiClient.js";
-import { radiusForThought, wrapThought } from "./thoughtSizing.js";
+import { BASE_HEIGHT, BASE_WIDTH } from "./mapData.js";
 
-const initialFluidEdges = captureFluidRestLengths(initialNodes, initialEdges, { reset: true });
 const MIN_ZOOM = 0.72;
 const MAX_ZOOM = 1.36;
-const ZOOM_STEP = 0.08;
 
 const palettes = {
   paper: {
@@ -88,33 +37,8 @@ const palettes = {
   },
 };
 
-const panelMeta = {
-  maps: { eyebrow: "Workspace", title: "Your maps", icon: IconMap2, side: "left" },
-  search: { eyebrow: "Find", title: "Search this map", icon: IconSearch, side: "left" },
-  history: { eyebrow: "Timeline", title: "Map history", icon: IconClock, side: "left" },
-  profile: { eyebrow: "Local profile", title: "MR", icon: IconUser, side: "left" },
-  ai: { eyebrow: "Creative partner", title: "Ask this map", icon: IconSparkles, side: "right" },
-  layouts: { eyebrow: "One graph", title: "Switch the view", icon: IconHierarchy2, side: "right" },
-  overview: { eyebrow: "Working artifact", title: "Map overview", icon: IconGridDots, side: "right" },
-  layers: { eyebrow: "Visibility", title: "Canvas layers", icon: IconStack2, side: "right" },
-  settings: { eyebrow: "Preferences", title: "Thoughtform settings", icon: IconSettings, side: "right" },
-  composer: { eyebrow: "Complete thought", title: "Add to the map", icon: IconPencil, side: "right" },
-};
-
-function cloneNodes(nodes) {
-  return nodes.map((node) => ({ ...node, lines: [...node.lines] }));
-}
-
-function cloneEdges(edges) {
-  return edges.map((edge) => ({ ...edge }));
-}
-
 function nodeLabel(node) {
   return node?.lines?.join(" ") ?? "Thought";
-}
-
-function formatTimer(seconds) {
-  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
 function getFocusIds(focusId, edges) {
@@ -195,75 +119,29 @@ function drawWobblyCircle(ctx, node) {
   ctx.closePath();
 }
 
-function auraSeed(id) {
-  return [...String(id)].reduce(
-    (value, character) => ((value * 31) + character.charCodeAt(0)) >>> 0,
-    17,
-  );
-}
-
-function fluidAuraPath(node, gap, phase) {
-  const points = 28;
+function drawHoverGlow(ctx, node, concept, scale) {
   const radiusX = node.radiusX ?? node.radius ?? node.r;
   const radiusY = node.radiusY ?? node.radius ?? node.r;
-  const rotation = node.rotation ?? 0;
-  const path = new Path2D();
-  const samples = [];
+  const spread = 24 / scale;
+  const outerX = radiusX + spread;
+  const outerY = radiusY + spread;
+  const edge = Math.min(radiusX / outerX, radiusY / outerY);
+  const color = concept === "nocturne" ? "255, 164, 121" : "255, 174, 138";
 
-  for (let index = 0; index < points; index += 1) {
-    const angle = (index / points) * Math.PI * 2;
-    const drift = Math.sin(angle * 3 + phase) * gap * 0.22
-      + Math.sin(angle * 5 - phase * 0.72) * gap * 0.11;
-    const localX = Math.cos(angle) * (radiusX + gap + drift);
-    const localY = Math.sin(angle) * (radiusY + gap + drift * 0.8);
-    samples.push({
-      x: node.x + localX * Math.cos(rotation) - localY * Math.sin(rotation),
-      y: node.y + localX * Math.sin(rotation) + localY * Math.cos(rotation),
-    });
-  }
-
-  const midpoint = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-  const start = midpoint(samples[points - 1], samples[0]);
-  path.moveTo(start.x, start.y);
-  samples.forEach((point, index) => {
-    const next = samples[(index + 1) % points];
-    const end = midpoint(point, next);
-    path.quadraticCurveTo(point.x, point.y, end.x, end.y);
-  });
-  path.closePath();
-  return path;
-}
-
-function drawHoverGlow(ctx, node, concept, scale) {
-  const seed = auraSeed(node.id);
-  const phase = seed * 0.019;
-  const gap = 3.5 / scale;
-  const path = fluidAuraPath(node, gap, phase);
-  const colors = concept === "nocturne"
-    ? {
-      bloom: "rgba(255, 102, 72, 0.58)",
-      light: "rgba(255, 188, 151, 0.72)",
-    }
-    : {
-      bloom: "rgba(230, 106, 78, 0.34)",
-      light: "rgba(255, 229, 202, 0.76)",
-    };
-
+  // A continuous falloff beneath the material, with no stroked outer boundary.
   ctx.save();
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-  ctx.globalAlpha = concept === "nocturne" ? 0.5 : 0.34;
-  ctx.shadowColor = colors.bloom;
-  ctx.shadowBlur = 22 / scale;
-  ctx.strokeStyle = colors.bloom;
-  ctx.lineWidth = 18 / scale;
-  ctx.stroke(path);
-
-  ctx.shadowBlur = 0;
-  ctx.globalAlpha = concept === "nocturne" ? 0.3 : 0.22;
-  ctx.strokeStyle = colors.light;
-  ctx.lineWidth = 8 / scale;
-  ctx.stroke(path);
+  ctx.translate(node.x, node.y);
+  ctx.rotate(node.rotation ?? 0);
+  ctx.scale(outerX, outerY);
+  const glow = ctx.createRadialGradient(0, 0, edge, 0, 0, 1);
+  glow.addColorStop(0, `rgba(${color}, 0.56)`);
+  glow.addColorStop(0.35, `rgba(${color}, 0.30)`);
+  glow.addColorStop(0.7, `rgba(${color}, 0.07)`);
+  glow.addColorStop(1, `rgba(${color}, 0)`);
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(0, 0, 1, 0, Math.PI * 2);
+  ctx.fill();
   ctx.restore();
 }
 
@@ -417,45 +295,6 @@ export function IconButton({
   );
 }
 
-export function FloatingPanel({ panel, onClose, children }) {
-  const meta = panelMeta[panel];
-  const PanelIcon = meta.icon;
-  return (
-    <aside
-      className={`floating-panel panel-${meta.side}`}
-      role="dialog"
-      aria-modal="false"
-      aria-label={meta.title}
-      data-testid={`${panel}-panel`}
-    >
-      <header className="panel-header">
-        <div className="panel-title-mark"><PanelIcon /></div>
-        <div>
-          <span>{meta.eyebrow}</span>
-          <h2>{meta.title}</h2>
-        </div>
-        <IconButton label={`Close ${meta.title}`} onClick={onClose} className="panel-close">
-          <IconX />
-        </IconButton>
-      </header>
-      <div className="panel-body">{children}</div>
-    </aside>
-  );
-}
-
-export function ToggleRow({ label, description, checked, onChange, disabled = false }) {
-  return (
-    <label className={`toggle-row ${disabled ? "is-disabled" : ""}`}>
-      <span>
-        <strong>{label}</strong>
-        <small>{description}</small>
-      </span>
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
-      <i aria-hidden="true" />
-    </label>
-  );
-}
-
 export function MindMap({
   concept,
   nodes,
@@ -471,8 +310,16 @@ export function MindMap({
   onEdit,
   onAdd,
   onAskAI,
+  onPin,
+  onPark,
+  onSources,
+  controlsHidden = false,
   onArmConnect,
-  onConnectTarget,
+  onCancelConnect,
+  onConnect,
+  actionsNodeId,
+  onActionsChange,
+  rootId,
   onSpawnFreeform,
   onDelete,
   onAcceptGhost,
@@ -488,6 +335,7 @@ export function MindMap({
   focusId,
   reducedMotion,
   marqueeActive,
+  lassoActive = false,
   connectionPopQueueRef,
 }) {
   const canvasRef = useRef(null);
@@ -499,6 +347,9 @@ export function MindMap({
   const shellRef = useRef(null);
   const textureRef = useRef(null);
   const dragRef = useRef(null);
+  const longPressRef = useRef(null);
+  const suppressBudClickRef = useRef(false);
+  const bubbleMenuRef = useRef(null);
   const activePointersRef = useRef(new Map());
   const interactionRef = useRef(null);
   const internalPoppingConnectionsRef = useRef([]);
@@ -510,7 +361,9 @@ export function MindMap({
   const [textureReady, setTextureReady] = useState(false);
   const [shaderAvailable, setShaderAvailable] = useState(false);
   const [marqueeRect, setMarqueeRect] = useState(null);
+  const [lassoPoints, setLassoPoints] = useState([]);
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
+  const [connectionPreview, setConnectionPreview] = useState(null);
   const palette = palettes[concept];
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const focusIds = useMemo(() => getFocusIds(focusId, edges), [edges, focusId]);
@@ -546,13 +399,43 @@ export function MindMap({
   }, []);
 
   useEffect(() => {
-    if (marqueeActive) {
-      setHoveredNodeId(null);
-      return;
-    }
-    if (dragRef.current?.type === "marquee") dragRef.current = null;
+    if (marqueeActive) setHoveredNodeId(null);
+    if (["marquee", "lasso", "connect"].includes(dragRef.current?.type)) dragRef.current = null;
+    setConnectionPreview(null);
     setMarqueeRect(null);
-  }, [marqueeActive]);
+    setLassoPoints([]);
+  }, [marqueeActive, lassoActive]);
+
+  useEffect(() => {
+    const cancel = (event) => {
+      if (event.type !== "blur" && event.key !== "Escape") return;
+      if (dragRef.current?.type === "connect") dragRef.current = null;
+      suppressBudClickRef.current = true;
+      window.clearTimeout(longPressRef.current);
+      setConnectionPreview(null);
+      onActionsChange(null);
+    };
+    window.addEventListener("keydown", cancel);
+    window.addEventListener("blur", cancel);
+    return () => {
+      window.removeEventListener("keydown", cancel);
+      window.removeEventListener("blur", cancel);
+      window.clearTimeout(longPressRef.current);
+    };
+  }, [onActionsChange]);
+
+  useEffect(() => {
+    if (!actionsNodeId && !connectFromId) return undefined;
+    bubbleMenuRef.current?.querySelector('button:not(:disabled)')?.focus();
+    const close = (event) => {
+      if (!event.target.closest('.bubble-menu, [data-testid="thought-more-actions"], .connection-bud')) {
+        onActionsChange(null);
+        if (connectFromId) onCancelConnect();
+      }
+    };
+    window.addEventListener("pointerdown", close);
+    return () => window.removeEventListener("pointerdown", close);
+  }, [actionsNodeId, connectFromId, onActionsChange, onCancelConnect]);
 
   useEffect(() => {
     if (reducedMotion) {
@@ -848,17 +731,6 @@ export function MindMap({
         drawSelectionContour(context, visual, concept, transform.scale);
       });
 
-      const connecting = visualNodes.get(connectFromId);
-      if (connecting) {
-        context.beginPath();
-        context.arc(connecting.x, connecting.y, connecting.r + 8, 0, Math.PI * 2);
-        context.setLineDash([5, 4]);
-        context.lineWidth = 1.4;
-        context.strokeStyle = palette.ink;
-        context.stroke();
-        context.setLineDash([]);
-      }
-
       renderedNodes.forEach((node) => {
         const visual = visualNodes.get(node.id) ?? node;
         drawWrappedText(context, node, visual.x, visual.y, palette, showProvenance);
@@ -891,7 +763,7 @@ export function MindMap({
         beginWorld(underlayCtx, dpr);
         drawTethers(underlayCtx, visualNodes);
         drawRevisitGlow(underlayCtx, visualNodes, now);
-        const hoveredNode = visualNodes.get(hoveredNodeId);
+        const hoveredNode = visualNodes.get(connectionPreview?.targetId ?? hoveredNodeId);
         if (hoveredNode && !marqueeActive) {
           drawHoverGlow(underlayCtx, hoveredNode, concept, transform.scale);
         }
@@ -936,7 +808,7 @@ export function MindMap({
           ctx.arc(root.x, root.y, root.r * 1.48, 0, Math.PI * 2);
           ctx.fill();
         }
-        const hoveredNode = visualNodes.get(hoveredNodeId);
+        const hoveredNode = visualNodes.get(connectionPreview?.targetId ?? hoveredNodeId);
         if (hoveredNode && !marqueeActive) {
           drawHoverGlow(ctx, hoveredNode, concept, transform.scale);
         }
@@ -959,6 +831,7 @@ export function MindMap({
   }, [
     concept,
     connectFromId,
+    connectionPreview,
     fontReady,
     hoveredNodeId,
     marqueeActive,
@@ -1067,8 +940,40 @@ export function MindMap({
     };
   };
 
+  const beginConnection = (event, source) => {
+    if (event.button !== 0 || marqueeActive || source.ghost) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(longPressRef.current);
+    suppressBudClickRef.current = false;
+    onSelect(source.id);
+    onActionsChange(null);
+    if (connectFromId) onCancelConnect();
+    activePointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY, pointerType: event.pointerType });
+    if (touchPointers().length > 1) {
+      suppressBudClickRef.current = true;
+      if (dragRef.current?.type === "node") onMoveCancel(dragRef.current.id);
+      setConnectionPreview(null);
+      dragRef.current = beginTouchGesture(touchPointers());
+    } else {
+      const point = screenToWorld(event.clientX, event.clientY);
+      dragRef.current = { type: "connect", id: source.id, pointerId: event.pointerId, startClientX: event.clientX, startClientY: event.clientY };
+      setConnectionPreview({ sourceId: source.id, point, targetId: null });
+    }
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const updateConnection = (event, drag) => {
+    const point = screenToWorld(event.clientX, event.clientY);
+    const target = connectionTargetAt(point, drag.id, renderedNodes, edges, 12 / transform.scale);
+    if (Math.hypot(event.clientX - drag.startClientX, event.clientY - drag.startClientY) > 5) suppressBudClickRef.current = true;
+    setConnectionPreview({ sourceId: drag.id, point, targetId: target?.id ?? null });
+    return target;
+  };
+
   const handlePointerDown = (event) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || controlsHidden) return;
+    window.clearTimeout(longPressRef.current);
     activePointersRef.current.set(event.pointerId, {
       x: event.clientX,
       y: event.clientY,
@@ -1076,8 +981,10 @@ export function MindMap({
     });
     const touches = touchPointers();
     if (event.pointerType === "touch" && touches.length >= 2) {
+      suppressBudClickRef.current = true;
+      setConnectionPreview(null);
       if (dragRef.current?.type === "node") onMoveCancel(dragRef.current.id);
-      if (dragRef.current?.type === "marquee") setMarqueeRect(null);
+      if (["marquee", "lasso"].includes(dragRef.current?.type)) { setMarqueeRect(null); setLassoPoints([]); onSelectMany([]); }
       dragRef.current = beginTouchGesture(touches);
       event.currentTarget.setPointerCapture(event.pointerId);
       event.preventDefault();
@@ -1089,9 +996,11 @@ export function MindMap({
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
       onSelectMany([]);
-      setMarqueeRect({ left: x, top: y, width: 0, height: 0 });
+      if (lassoActive) setLassoPoints([point]);
+      else setMarqueeRect({ left: x, top: y, width: 0, height: 0 });
       dragRef.current = {
-        type: "marquee",
+        type: lassoActive ? "lasso" : "marquee",
+        points: [point],
         pointerId: event.pointerId,
         startClientX: event.clientX,
         startClientY: event.clientY,
@@ -1102,10 +1011,6 @@ export function MindMap({
       return;
     }
     const hit = hitNode(point);
-    if (connectFromId && hit) {
-      if (!hit.ghost && hit.id !== connectFromId) onConnectTarget(hit.id);
-      return;
-    }
     if (hit) {
       onSelect(hit.id);
       onMoveStart(hit.id);
@@ -1124,6 +1029,14 @@ export function MindMap({
         vy: 0,
         moved: false,
       };
+      if (event.pointerType === "touch" && !hit.ghost) {
+        longPressRef.current = window.setTimeout(() => {
+          if (dragRef.current?.type !== "node" || dragRef.current.moved) return;
+          onMoveCancel(hit.id);
+          dragRef.current = null;
+          onActionsChange(hit.id);
+        }, 550);
+      }
     } else {
       const connectionHit = hitConnection(point);
       if (!connectionHit) onSelect(null);
@@ -1152,7 +1065,14 @@ export function MindMap({
     const drag = dragRef.current;
     if (!drag) {
       if (event.pointerType !== "touch" && !marqueeActive) {
-        const hovered = hitNode(screenToWorld(event.clientX, event.clientY));
+        const point = screenToWorld(event.clientX, event.clientY);
+        const hovered = hitNode(point);
+        const previous = renderedNodes.find((node) => node.id === hoveredNodeId);
+        if (!hovered && previous && !previous.ghost) {
+          const bud = connectionBud(previous, renderedNodes, transform, viewport);
+          const rect = canvasRef.current.getBoundingClientRect();
+          if (Math.hypot(event.clientX - rect.left - bud.x, event.clientY - rect.top - bud.y) <= 30) return;
+        }
         setHoveredNodeId((current) => current === hovered?.id ? current : hovered?.id ?? null);
       }
       return;
@@ -1180,6 +1100,22 @@ export function MindMap({
       return;
     }
     if (drag.pointerId !== event.pointerId) return;
+    if (drag.type === "connect") {
+      updateConnection(event, drag);
+      event.preventDefault();
+      return;
+    }
+    if (drag.type === "lasso") {
+      const point = screenToWorld(event.clientX, event.clientY);
+      const last = drag.points.at(-1);
+      if (Math.hypot(point.x - last.x, point.y - last.y) * transform.scale >= 2) {
+        drag.points.push(point);
+        setLassoPoints([...drag.points]);
+        onSelectMany(renderedNodes.filter((node) => lassoIntersectsNode(drag.points, node)).map((node) => node.id));
+      }
+      event.preventDefault();
+      return;
+    }
     if (drag.type === "marquee") {
       const rect = canvasRef.current.getBoundingClientRect();
       const startX = drag.startClientX - rect.left;
@@ -1215,7 +1151,10 @@ export function MindMap({
     drag.lastX = point.x;
     drag.lastY = point.y;
     drag.lastAt = now;
-    if (Math.hypot(point.x - drag.startX, point.y - drag.startY) > 5) drag.moved = true;
+    if (Math.hypot(point.x - drag.startX, point.y - drag.startY) > 5) {
+      drag.moved = true;
+      window.clearTimeout(longPressRef.current);
+    }
     onMoveNode(
       drag.id,
       clamp(point.x - drag.offsetX, 30, BASE_WIDTH - 30),
@@ -1224,6 +1163,7 @@ export function MindMap({
   };
 
   const handlePointerEnd = (event) => {
+    window.clearTimeout(longPressRef.current);
     const drag = dragRef.current;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
@@ -1240,8 +1180,24 @@ export function MindMap({
       return;
     }
     if (drag.pointerId !== event.pointerId) return;
-    if (drag.type === "marquee") {
+    if (drag.type === "connect") {
+      const target = event.type === "pointercancel" ? null : updateConnection(event, drag);
+      if (event.type === "pointercancel") suppressBudClickRef.current = true;
+      setConnectionPreview(null);
+      dragRef.current = null;
+      if (target && suppressBudClickRef.current) {
+        suppressBudClickRef.current = true;
+        onConnect(drag.id, target.id);
+      }
+      return;
+    }
+    if (drag.type === "marquee" || drag.type === "lasso") {
       if (event.type === "pointercancel") onSelectMany([]);
+      else if (drag.type === "lasso") {
+        const points = [...drag.points, screenToWorld(event.clientX, event.clientY)];
+        onSelectMany(renderedNodes.filter((node) => lassoIntersectsNode(points, node)).map((node) => node.id));
+      }
+      setLassoPoints([]);
       setMarqueeRect(null);
       dragRef.current = null;
       return;
@@ -1267,12 +1223,18 @@ export function MindMap({
     dragRef.current = null;
   };
 
-  const handlePointerLeave = () => {
+  const handlePointerLeave = (event) => {
+    if (event.relatedTarget?.closest?.('.connection-bud')) return;
     if (!dragRef.current) setHoveredNodeId(null);
   };
 
+  const handleLostCapture = (event) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return;
+    handlePointerEnd({ type: "pointercancel", pointerId: event.pointerId, pointerType: event.pointerType, currentTarget: event.currentTarget, clientX: event.clientX, clientY: event.clientY });
+  };
+
   const handleDoubleClick = (event) => {
-    if (marqueeActive) return;
+    if (marqueeActive || controlsHidden) return;
     const point = screenToWorld(event.clientX, event.clientY);
     const hit = hitNode(point);
     if (hit) {
@@ -1290,6 +1252,22 @@ export function MindMap({
   };
 
   const selected = renderedNodes.find((node) => node.id === selectedId);
+  const budNode = renderedNodes.find((node) => node.id === (connectionPreview?.sourceId ?? hoveredNodeId)) ?? selected;
+  const bud = budNode && !budNode.ghost ? connectionBud(budNode, renderedNodes, transform, viewport) : null;
+  const previewSource = renderedNodes.find((node) => node.id === connectionPreview?.sourceId);
+  const previewTarget = renderedNodes.find((node) => node.id === connectionPreview?.targetId);
+  const previewHit = connectionPreview ? hitNode(connectionPreview.point) : null;
+  const connectionHint = previewTarget ? "Release to connect" : previewHit?.ghost ? "Accept this suggestion first" : previewHit && previewHit.id !== previewSource?.id ? "Already connected" : "Drag onto an existing thought";
+  let previewEnd = connectionPreview?.point;
+  if (previewSource && previewTarget) {
+    const angle = Math.atan2(previewSource.y - previewTarget.y, previewSource.x - previewTarget.x);
+    previewEnd = { x: previewTarget.x + Math.cos(angle) * previewTarget.r, y: previewTarget.y + Math.sin(angle) * previewTarget.r };
+  }
+  const menuNode = renderedNodes.find((node) => node.id === (connectFromId ?? actionsNodeId));
+  const menuX = menuNode ? clamp(transform.offsetX + menuNode.x * transform.scale, 120, Math.max(120, viewport.width - 120)) : 0;
+  const menuY = menuNode ? clamp(transform.offsetY + (menuNode.y + menuNode.r) * transform.scale + 18, 80, Math.max(80, viewport.height - 240)) : 0;
+  const closeMenu = () => { onActionsChange(null); if (connectFromId) onCancelConnect(); };
+  const menuAction = (action) => { closeMenu(); action(menuNode.id); };
   const actionX = selected
     ? clamp(transform.offsetX + (selected.x + selected.r - (selected.r > 100 ? 12 : 0)) * transform.scale, 94, viewport.width - 54)
     : 0;
@@ -1299,14 +1277,17 @@ export function MindMap({
 
   return (
     <div
-      className={`map-shell ${marqueeActive ? "is-marquee" : ""}`}
+      className={`map-shell ${marqueeActive ? "is-marquee" : ""} ${connectionPreview ? "is-connecting" : ""}`}
       ref={shellRef}
+      data-selection-mode={marqueeActive ? (lassoActive ? "lasso" : "rectangle") : "none"}
       data-marquee-active={marqueeActive ? "true" : "false"}
       data-selected-count={selectedIds.length}
       data-zoom={zoom.toFixed(2)}
       data-pan-x={Math.round(pan.x)}
       data-pan-y={Math.round(pan.y)}
       data-material-renderer={concept === "paper" && shaderAvailable ? "webgl2" : "canvas2d"}
+      data-connecting-from={connectionPreview?.sourceId ?? ""}
+      data-connection-target={connectionPreview?.targetId ?? ""}
     >
       <canvas
         ref={underlayCanvasRef}
@@ -1321,14 +1302,91 @@ export function MindMap({
       <canvas
         ref={canvasRef}
         className="map-interaction-canvas"
-        aria-label="Interactive organic idea map. Drag thoughts to move them. Double-click empty space to create a freeform thought. Use two fingers, a trackpad, or the empty canvas to pan."
+        aria-label="Interactive organic idea map. Drag a thought to move it; drag its outer handle to connect it. Right-click or long-press a thought for actions. Double-click empty space to create a freeform thought. Use two fingers, a trackpad, or the empty canvas to pan."
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerEnd}
         onPointerCancel={handlePointerEnd}
+        onLostPointerCapture={handleLostCapture}
         onPointerLeave={handlePointerLeave}
         onDoubleClick={handleDoubleClick}
+        onContextMenu={(event) => {
+          const hit = hitNode(screenToWorld(event.clientX, event.clientY));
+          if (marqueeActive || controlsHidden || !hit || hit.ghost) return;
+          event.preventDefault();
+          onSelect(hit.id);
+          onActionsChange(hit.id);
+        }}
       />
+
+      {previewSource && previewEnd && <svg className="connection-preview" viewBox={`0 0 ${viewport.width} ${viewport.height}`} aria-hidden="true" data-testid="connection-preview">
+        <path transform={`translate(${transform.offsetX} ${transform.offsetY}) scale(${transform.scale})`} d={connectionPreviewPath(previewSource, previewEnd, transform.scale)} fill={palette.material} />
+      </svg>}
+
+      {connectionPreview && <div className="connection-drag-hint" role="status" style={{ left: clamp(transform.offsetX + connectionPreview.point.x * transform.scale, 160, Math.max(160, viewport.width - 160)), top: clamp(transform.offsetY + connectionPreview.point.y * transform.scale + 28, 80, viewport.height - 60) }}><IconLink /><span>{connectionHint}</span><kbd>esc</kbd></div>}
+
+      {bud && !marqueeActive && !menuNode && !controlsHidden && <button
+        type="button"
+        className={`connection-bud ${connectionPreview ? "is-dragging" : ""}`}
+        style={{ left: bud.x, top: bud.y }}
+        data-testid="connection-bud"
+        aria-label={`Connect from ${nodeLabel(budNode)}`}
+        aria-describedby="connection-handle-help"
+        aria-haspopup="menu"
+        onPointerDown={(event) => beginConnection(event, budNode)}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
+        onLostPointerCapture={handleLostCapture}
+        onPointerEnter={() => setHoveredNodeId(budNode.id)}
+        onPointerLeave={handlePointerLeave}
+        onClick={(event) => {
+          if (event.detail > 0 && suppressBudClickRef.current) return;
+          onSelect(budNode.id);
+          onArmConnect(budNode.id);
+        }}
+      ><span className="connection-bud-shape" aria-hidden="true"><IconLink stroke={1.7} /></span><span id="connection-handle-help" className="connection-handle-help" role="tooltip"><strong>Connect existing</strong><span>Drag to another thought</span></span></button>}
+
+      {menuNode && !menuNode.ghost && !marqueeActive && <div
+        ref={bubbleMenuRef}
+        className="bubble-menu"
+        role="menu"
+        aria-label={connectFromId ? "Connect to a thought" : "Thought actions"}
+        style={{ left: menuX, top: menuY }}
+        onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) closeMenu(); }}
+        onKeyDown={(event) => {
+          if (!["ArrowDown", "ArrowUp", "Home", "End", "Escape"].includes(event.key)) return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (event.key === "Escape") { closeMenu(); window.requestAnimationFrame(() => shellRef.current?.querySelector('.connection-bud')?.focus()); return; }
+          const items = [...event.currentTarget.querySelectorAll('button:not(:disabled)')];
+          const index = items.indexOf(document.activeElement);
+          const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+          items[next]?.focus();
+        }}
+      >
+        {connectFromId ? <>
+          <span className="bubble-menu-heading">Connect existing thought</span>
+          {renderedNodes.filter((node) => canConnect(connectFromId, node.id, renderedNodes, edges)).map((node) => <button type="button" role="menuitem" key={node.id} onClick={() => { closeMenu(); onConnect(menuNode.id, node.id); }}>{nodeLabel(node)}</button>)}
+          {!renderedNodes.some((node) => canConnect(connectFromId, node.id, renderedNodes, edges)) && <span className="bubble-menu-empty">{renderedNodes.filter((node) => !node.ghost).length < 2 ? "Add another thought to connect to." : "All visible thoughts are already connected to this one."}</span>}
+          <button type="button" role="menuitem" onClick={closeMenu}><IconX />Cancel</button>
+        </> : <>
+          <button type="button" role="menuitem" data-testid="add-thought" onClick={() => menuAction(onAdd)}><IconPlus />New connected thought</button>
+          <button type="button" role="menuitem" onClick={() => { onActionsChange(null); onArmConnect(menuNode.id); }}><IconLink />Connect existing…</button>
+          <div className="bubble-menu-divider" role="separator" />
+          <button type="button" role="menuitem" onClick={() => menuAction(onEdit)}><IconPencil />Edit thought</button>
+          <button type="button" role="menuitem" data-testid="node-ai" onClick={() => menuAction(onAskAI)}><IconSparkles />Explore with Partner</button>
+          <button type="button" role="menuitem" onClick={() => menuAction(onSources)}><IconQuote />View sources</button>
+          <button type="button" role="menuitem" onClick={() => menuAction(onPin)}>{menuNode.pinned ? <IconPinnedOff /> : <IconPin />}{menuNode.pinned ? "Unpin position" : "Pin position"}</button>
+          <button type="button" role="menuitem" onClick={() => menuAction(onPark)}><IconParking />{menuNode.parked ? "Bring thought back" : "Keep thought aside"}</button>
+          <div className="bubble-menu-divider" role="separator" />
+          <button type="button" role="menuitem" data-testid="delete-thought" className="danger-action" disabled={menuNode.id === rootId} onClick={() => menuAction(onDelete)}><IconTrash />Delete thought</button>
+        </>}
+      </div>}
+
+      {lassoPoints.length > 1 && <svg className="lasso-overlay" viewBox={`0 0 ${viewport.width} ${viewport.height}`} aria-hidden="true" data-testid="lasso-outline">
+        <polygon fillRule="evenodd" points={lassoPoints.map((point) => `${transform.offsetX + point.x * transform.scale},${transform.offsetY + point.y * transform.scale}`).join(" ")} />
+      </svg>}
 
       {marqueeRect && (
         <div
@@ -1356,7 +1414,7 @@ export function MindMap({
         </button>
       ))}
 
-      {selected && (
+      {selected?.ghost && !marqueeActive && (
         <div
           className={`node-actions ${selected.ghost ? "ghost-actions" : ""}`}
           style={{ left: actionX, top: actionY }}
@@ -1371,1076 +1429,9 @@ export function MindMap({
                 <IconX />
               </IconButton>
             </>
-          ) : (
-            <>
-              <IconButton label="Add child thought" onClick={() => onAdd(selected.id)} testId="add-thought">
-                <IconPlus />
-              </IconButton>
-              <IconButton label="Generate child ideas" onClick={() => onAskAI(selected.id)} testId="node-ai">
-                <IconSparkles />
-              </IconButton>
-              <IconButton
-                label={connectFromId === selected.id ? "Cancel connection" : "Connect thought"}
-                active={connectFromId === selected.id}
-                onClick={() => onArmConnect(selected.id)}
-                testId="connect-thought"
-              >
-                <IconLink />
-              </IconButton>
-              <IconButton label="Delete thought" onClick={() => onDelete(selected.id)} className="danger-action" testId="delete-thought">
-                <IconTrash />
-              </IconButton>
-            </>
-          )}
+          ) : null}
         </div>
       )}
     </div>
-  );
-}
-
-export function App() {
-  const concept = new URLSearchParams(window.location.search).get("concept") === "nocturne" ? "nocturne" : "paper";
-  const [nodes, setNodes] = useState(() => cloneNodes(initialNodes));
-  const [edges, setEdges] = useState(() => cloneEdges(initialFluidEdges));
-  const nodesRef = useRef(nodes);
-  const edgesRef = useRef(edges);
-  const nextIdRef = useRef(1);
-  const organicPositionsRef = useRef(new Map(initialNodes.map((node) => [node.id, { x: node.x, y: node.y }])));
-  const [selectedId, setSelectedId] = useState("root");
-  const [selectedIds, setSelectedIds] = useState(["root"]);
-  const [marqueeActive, setMarqueeActive] = useState(false);
-  const [activePanel, setActivePanel] = useState(null);
-  const [composer, setComposer] = useState(null);
-  const [composerValue, setComposerValue] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [aiQuery, setAiQuery] = useState("");
-  const [aiMode, setAiMode] = useState("quiet");
-  const [aiBusy, setAiBusy] = useState(false);
-  const [aiActivity, setAiActivity] = useState("");
-  const aiModeRef = useRef("quiet");
-  const lastProactiveAtRef = useRef(0);
-  const [synthesis, setSynthesis] = useState("This map explores a private, voice-first thinking space where complete thoughts become flexible structure. AI helps surface connections and alternative framings, but every change remains yours to accept.");
-  const [synthesisBusy, setSynthesisBusy] = useState(false);
-  const [companion, setCompanion] = useState({
-    line: "Keep going, this is getting interesting…",
-    followup: "What if we explored the flow a bit more?",
-  });
-  const [viewMode, setViewMode] = useState("clusters");
-  const viewModeRef = useRef(viewMode);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [showSuggestions, setShowSuggestions] = useState(true);
-  const [showProvenance, setShowProvenance] = useState(false);
-  const [showPrivateIsland, setShowPrivateIsland] = useState(true);
-  const [reducedMotion, setReducedMotion] = useState(
-    () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
-  );
-  const [focusId, setFocusId] = useState(null);
-  const [connectFromId, setConnectFromId] = useState(null);
-  const [favorite, setFavorite] = useState(true);
-  const [listening, setListening] = useState(false);
-  const [seconds, setSeconds] = useState(0);
-  const [voiceIndex, setVoiceIndex] = useState(0);
-  const [liveTranscript, setLiveTranscript] = useState("");
-  const [distilling, setDistilling] = useState(false);
-  const recognitionRef = useRef(null);
-  const transcriptRef = useRef("");
-  const [toast, setToast] = useState("");
-  const [history, setHistory] = useState(() => [{
-    label: "Opened map",
-    nodes: cloneNodes(initialNodes),
-    edges: cloneEdges(initialFluidEdges),
-    time: "Now",
-  }]);
-  const [historyIndex, setHistoryIndex] = useState(0);
-
-  const selectOne = (id) => {
-    setSelectedId(id);
-    setSelectedIds(id ? [id] : []);
-  };
-
-  const selectMany = (ids) => {
-    const nextIds = [...new Set(ids)];
-    setSelectedId(null);
-    setSelectedIds((current) => (
-      current.length === nextIds.length && current.every((id, index) => id === nextIds[index])
-        ? current
-        : nextIds
-    ));
-  };
-
-  // Physics and graph actions update these refs before mirroring into React state.
-  // Syncing them back from a committed render can rewind a newer animation frame,
-  // which becomes a visible two-frame shake on high-refresh displays.
-  useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
-  useEffect(() => { aiModeRef.current = aiMode; }, [aiMode]);
-  useEffect(() => {
-    let animationFrame;
-    let lastTime = performance.now();
-    const animatePhysics = (now) => {
-      if (viewModeRef.current !== "clusters") {
-        lastTime = now;
-        animationFrame = window.requestAnimationFrame(animatePhysics);
-        return;
-      }
-      const frameStep = clamp((now - lastTime) / 16.67, 0.35, 2);
-      lastTime = now;
-      const result = stepFluidPhysics(nodesRef.current, edgesRef.current, {
-        frameStep,
-        width: BASE_WIDTH,
-        height: BASE_HEIGHT,
-        settings: FLUID_PHYSICS_SETTINGS,
-      });
-      if (result.active) {
-        nodesRef.current = result.nodes;
-        setNodes(result.nodes);
-        if (viewModeRef.current === "clusters") {
-          result.nodes.forEach((node) => {
-            if (!node.ghost) organicPositionsRef.current.set(node.id, { x: node.x, y: node.y });
-          });
-        }
-      }
-      animationFrame = window.requestAnimationFrame(animatePhysics);
-    };
-    animationFrame = window.requestAnimationFrame(animatePhysics);
-    return () => window.cancelAnimationFrame(animationFrame);
-  }, []);
-  useEffect(() => {
-    if (!listening) return undefined;
-    const timer = window.setInterval(() => setSeconds((value) => value + 1), 1000);
-    return () => window.clearInterval(timer);
-  }, [listening]);
-  useEffect(() => {
-    if (!toast) return undefined;
-    const timer = window.setTimeout(() => setToast(""), 2800);
-    return () => window.clearTimeout(timer);
-  }, [toast]);
-  const selected = nodes.find((node) => node.id === selectedId);
-  const visibleNodes = showPrivateIsland ? nodes : nodes.filter((node) => !node.island);
-  const searchResults = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-    if (!query) return nodes.filter((node) => !node.ghost).slice(0, 7);
-    return nodes.filter((node) => nodeLabel(node).toLowerCase().includes(query)).slice(0, 9);
-  }, [nodes, searchQuery]);
-  const timer = formatTimer(seconds);
-  const committedCount = nodes.filter((node) => !node.ghost).length;
-  const suggestionCount = nodes.filter((node) => node.ghost).length;
-  const deletableSelectionCount = selectedIds.filter((id) => id !== "root").length;
-
-  const showToast = (message) => setToast(message);
-
-  const pushHistory = (label, nextNodes, nextEdges) => {
-    const snapshot = {
-      label,
-      nodes: cloneNodes(nextNodes),
-      edges: cloneEdges(nextEdges),
-      time: new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date()),
-    };
-    const nextHistory = [...history.slice(0, historyIndex + 1), snapshot].slice(-18);
-    setHistory(nextHistory);
-    setHistoryIndex(nextHistory.length - 1);
-  };
-
-  const applyGraph = (nextNodes, nextEdges, label, { rebasePhysics = false } = {}) => {
-    const physicsEdges = captureFluidRestLengths(nextNodes, nextEdges, { reset: rebasePhysics });
-    nodesRef.current = nextNodes;
-    edgesRef.current = physicsEdges;
-    setNodes(nextNodes);
-    setEdges(physicsEdges);
-    if (label) pushHistory(label, nextNodes, physicsEdges);
-  };
-
-  function restoreHistory(index) {
-    const snapshot = history[index];
-    if (!snapshot) return;
-    const nextNodes = cloneNodes(snapshot.nodes);
-    const nextEdges = captureFluidRestLengths(nextNodes, cloneEdges(snapshot.edges));
-    nodesRef.current = nextNodes;
-    edgesRef.current = nextEdges;
-    setNodes(nextNodes);
-    setEdges(nextEdges);
-    setHistoryIndex(index);
-    selectOne(nextNodes.some((node) => node.id === selectedId) ? selectedId : "root");
-    showToast(snapshot.label);
-  }
-
-  function undo() {
-    if (historyIndex > 0) restoreHistory(historyIndex - 1);
-  }
-
-  function redo() {
-    if (historyIndex < history.length - 1) restoreHistory(historyIndex + 1);
-  }
-
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (event.key === "Escape") {
-        if (listening) {
-          cancelVoice();
-          return;
-        }
-        setActivePanel(null);
-        setConnectFromId(null);
-        if (marqueeActive) {
-          setMarqueeActive(false);
-          selectOne(null);
-        }
-      }
-      const target = event.target;
-      const editingText = target instanceof HTMLInputElement
-        || target instanceof HTMLTextAreaElement
-        || target.isContentEditable;
-      if (
-        marqueeActive
-        && selectedIds.length
-        && !editingText
-        && (event.key === "Delete" || event.key === "Backspace")
-      ) {
-        event.preventDefault();
-        deleteSelectedThoughts();
-      }
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        if (event.shiftKey) redo();
-        else undo();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [history, historyIndex, listening, marqueeActive, selectedId, selectedIds]);
-
-  const togglePanel = (panel) => {
-    if (marqueeActive) {
-      setMarqueeActive(false);
-      selectOne(null);
-    }
-    setActivePanel((current) => current === panel ? null : panel);
-    if (panel !== "composer") setComposer(null);
-  };
-
-  const toggleMarquee = () => {
-    setMarqueeActive((current) => !current);
-    setActivePanel(null);
-    setComposer(null);
-    setConnectFromId(null);
-    selectOne(null);
-  };
-
-  const startMoveNode = (id) => {
-    const next = nodesRef.current.map((node) => node.id === id ? {
-      ...node,
-      dragging: true,
-      vx: 0,
-      vy: 0,
-      shadeVx: 0,
-      shadeVy: 0,
-    } : node);
-    nodesRef.current = next;
-    setNodes(next);
-  };
-
-  const moveNode = (id, x, y) => {
-    const next = nodesRef.current.map((node) => node.id === id ? {
-      ...node,
-      x,
-      y,
-      dragging: true,
-      vx: 0,
-      vy: 0,
-      shadeVx: x - node.x,
-      shadeVy: y - node.y,
-    } : node);
-    nodesRef.current = next;
-    setNodes(next);
-    if (viewMode === "clusters") organicPositionsRef.current.set(id, { x, y });
-  };
-
-  const finishMoveNode = (id, vx, vy, moved) => {
-    const release = 0.08 + (1 - FLUID_PHYSICS_SETTINGS.viscosity) * 0.08;
-    const next = nodesRef.current.map((node) => {
-      if (node.id !== id) return node;
-      const released = {
-        ...node,
-        dragging: false,
-        vx: moved ? clamp(vx, -24, 24) * release : 0,
-        vy: moved ? clamp(vy, -24, 24) * release : 0,
-        shadeVx: 0,
-        shadeVy: 0,
-      };
-      return moved ? released : withWobble(released, 1, 0, 0.082);
-    });
-    nodesRef.current = next;
-    setNodes(next);
-    if (moved) {
-      pushHistory(`Moved “${nodeLabel(next.find((node) => node.id === id))}”`, next, edgesRef.current);
-    }
-  };
-
-  const cancelMoveNode = (id) => {
-    const next = nodesRef.current.map((node) => node.id === id ? {
-      ...node,
-      dragging: false,
-      vx: 0,
-      vy: 0,
-      shadeVx: 0,
-      shadeVy: 0,
-    } : node);
-    nodesRef.current = next;
-    setNodes(next);
-  };
-
-  const addThought = (text, parentId, options = {}) => {
-    const parent = nodesRef.current.find((node) => node.id === parentId && !node.ghost)
-      ?? nodesRef.current.find((node) => node.id === "root");
-    if (!parent) return null;
-    const id = `${options.ghost ? "ghost" : "thought"}-${Date.now()}-${nextIdRef.current++}`;
-    const lines = wrapThought(text);
-    const baseRadius = options.ghost ? 52 : clamp(parent.r * 0.52, 36, 58);
-    const radius = radiusForThought(lines, baseRadius, Boolean(options.ghost));
-    const placement = findGrowthPlacement(parent, radius, nodesRef.current, edgesRef.current, BASE_WIDTH, BASE_HEIGHT);
-    const createdAt = performance.now();
-    const node = {
-      id,
-      x: placement.x,
-      y: placement.y,
-      r: radius,
-      depth: clamp((parent.depth ?? 0) + 1, 1, 4),
-      lines,
-      ghost: Boolean(options.ghost),
-      provenance: options.provenance,
-      createdAt,
-    };
-    const edge = {
-      from: parent.id,
-      to: id,
-      bend: 0,
-      ghost: Boolean(options.ghost),
-      createdAt,
-    };
-    const nextNodes = [...nodesRef.current, node];
-    const nextEdges = [...edgesRef.current, edge];
-    applyGraph(nextNodes, nextEdges, options.ghost ? "AI proposed a thought" : "Added a thought");
-    if (viewMode === "clusters") organicPositionsRef.current.set(id, { x: node.x, y: node.y });
-    if (!options.quiet) selectOne(id);
-    if (options.ghost) setShowSuggestions(true);
-    return id;
-  };
-
-  const spawnFreeformThought = (x, y) => {
-    const lines = ["New thought"];
-    const radius = radiusForThought(lines, 46, false);
-    const id = `thought-${Date.now()}-${nextIdRef.current++}`;
-    const node = {
-      id,
-      x: clamp(x, radius + 20, BASE_WIDTH - radius - 20),
-      y: clamp(y, radius + 20, BASE_HEIGHT - radius - 20),
-      r: radius,
-      depth: 0,
-      lines,
-      provenance: "You",
-      createdAt: performance.now(),
-      vx: 0,
-      vy: 0,
-      dragging: false,
-    };
-    const nextNodes = [...nodesRef.current, node];
-    applyGraph(nextNodes, edgesRef.current, "Added a freeform thought");
-    if (viewMode === "clusters") organicPositionsRef.current.set(id, { x: node.x, y: node.y });
-    setFocusId(null);
-    selectOne(id);
-    showToast("New thought added");
-  };
-
-  const openComposer = (parentId) => {
-    setComposer({ mode: "add", parentId });
-    setComposerValue("");
-    setActivePanel("composer");
-  };
-
-  const openEditor = (id) => {
-    const node = nodesRef.current.find((candidate) => candidate.id === id);
-    if (!node || node.ghost) return;
-    setComposer({ mode: "edit", id });
-    setComposerValue(nodeLabel(node));
-    setActivePanel("composer");
-  };
-
-  const submitComposer = (event) => {
-    event.preventDefault();
-    const value = composerValue.trim();
-    if (!value || !composer) return;
-    if (composer.mode === "edit") {
-      const next = nodesRef.current.map((node) => {
-        if (node.id !== composer.id) return node;
-        const lines = wrapThought(value);
-        return { ...node, lines, r: radiusForThought(lines, node.r, false) };
-      });
-      applyGraph(next, edgesRef.current, "Edited a thought");
-      selectOne(composer.id);
-      showToast("Thought updated");
-    } else {
-      addThought(value, composer.parentId, { provenance: "You" });
-      showToast("Thought added to the map");
-    }
-    setActivePanel(null);
-    setComposer(null);
-    setComposerValue("");
-  };
-
-  const createSuggestion = async (prompt = aiQuery) => {
-    const text = prompt.trim();
-    if (!text || aiBusy) return;
-    const parentId = selected && !selected.ghost ? selected.id : "root";
-    setAiQuery("");
-    setActivePanel(null);
-    setAiBusy(true);
-    setAiActivity("Sketching proposals…");
-    try {
-      const proposals = await requestProposals({
-        graph: serializeGraph(nodesRef.current, edgesRef.current),
-        prompt: text,
-        selectedId: parentId,
-      });
-      if (!proposals.length) {
-        showToast("The map already covers that — no proposals");
-        return;
-      }
-      proposals.forEach((proposal) => {
-        addThought(proposal.text, proposal.parent_id, {
-          ghost: true,
-          provenance: `GPT-5.6 · ${proposal.reason}`,
-        });
-      });
-      showToast(proposals.length === 1 ? "1 proposal ready for review" : `${proposals.length} proposals ready for review`);
-    } catch (error) {
-      showToast(error.message);
-    } finally {
-      setAiBusy(false);
-      setAiActivity("");
-    }
-  };
-
-  const refreshSynthesis = async () => {
-    if (synthesisBusy) return;
-    setSynthesisBusy(true);
-    setAiActivity("Synthesizing the map…");
-    try {
-      setSynthesis(await requestSynthesis(serializeGraph(nodesRef.current, edgesRef.current)));
-      showToast("Synthesis refreshed from the current map");
-    } catch (error) {
-      showToast(error.message);
-    } finally {
-      setSynthesisBusy(false);
-      setAiActivity("");
-    }
-  };
-
-  // Nocturne's ambient caption reads the actual map instead of a canned line.
-  // Refreshes quietly after edits settle; failures keep the last good caption.
-  useEffect(() => {
-    if (concept !== "nocturne") return undefined;
-    const timer = window.setTimeout(async () => {
-      try {
-        const next = await requestCompanion(serializeGraph(nodesRef.current, edgesRef.current));
-        if (next?.line && next?.followup) setCompanion(next);
-      } catch {
-        // Ambient copy is not worth an error toast.
-      }
-    }, 6000);
-    return () => window.clearTimeout(timer);
-  }, [concept, historyIndex]);
-
-  // Proactive mode: after the map settles, quietly sketch one ghost branch.
-  // Never more than one pending at a time, and never touch the user's selection.
-  useEffect(() => {
-    if (aiMode !== "proactive" || aiBusy || listening) return undefined;
-    if (nodesRef.current.some((node) => node.ghost)) return undefined;
-    const wait = Math.max(7000, lastProactiveAtRef.current + 25000 - Date.now());
-    const timer = window.setTimeout(async () => {
-      if (aiModeRef.current !== "proactive" || document.hidden) return;
-      if (nodesRef.current.some((node) => node.ghost)) return;
-      lastProactiveAtRef.current = Date.now();
-      setAiBusy(true);
-      setAiActivity("Noticing where you're heading…");
-      try {
-        const proposals = await requestProposals({
-          graph: serializeGraph(nodesRef.current, edgesRef.current),
-          prompt: "Offer one gentle branch the thinker seems to be circling but has not written down yet.",
-          selectedId: "root",
-        });
-        const proposal = proposals[0];
-        if (proposal && aiModeRef.current === "proactive") {
-          addThought(proposal.text, proposal.parent_id, {
-            ghost: true,
-            quiet: true,
-            provenance: `GPT-5.6 · ${proposal.reason}`,
-          });
-          showToast("AI sketched a branch — review when ready");
-        }
-      } catch {
-        // Proactive suggestions fail silently; asking directly surfaces errors.
-      } finally {
-        setAiBusy(false);
-        setAiActivity("");
-      }
-    }, wait);
-    return () => window.clearTimeout(timer);
-  }, [aiMode, aiBusy, historyIndex, listening]);
-
-  const acceptGhost = (id) => {
-    const createdAt = performance.now();
-    const nextNodes = nodesRef.current.map((node) => node.id === id
-      ? { ...node, ghost: false, provenance: `${node.provenance ?? "AI suggestion"} · accepted`, createdAt }
-      : node);
-    const nextEdges = edgesRef.current.map((edge) => edge.to === id
-      ? { ...edge, ghost: false, createdAt }
-      : edge);
-    applyGraph(nextNodes, nextEdges, "Accepted an AI suggestion");
-    selectOne(id);
-    showToast("Suggestion accepted");
-  };
-
-  const dismissGhost = (id) => {
-    const nextNodes = nodesRef.current.filter((node) => node.id !== id);
-    const nextEdges = edgesRef.current.filter((edge) => edge.from !== id && edge.to !== id);
-    applyGraph(nextNodes, nextEdges, "Dismissed an AI suggestion");
-    selectOne("root");
-    showToast("Suggestion dismissed");
-  };
-
-  const deleteThought = (id) => {
-    if (id === "root") {
-      showToast("The starting thought anchors this map");
-      return;
-    }
-    const nextNodes = nodesRef.current.filter((node) => node.id !== id);
-    const nextEdges = edgesRef.current.filter((edge) => edge.from !== id && edge.to !== id);
-    applyGraph(nextNodes, nextEdges, "Removed a thought");
-    organicPositionsRef.current.delete(id);
-    selectOne("root");
-    showToast("Thought removed");
-  };
-
-  const deleteSelectedThoughts = () => {
-    const selectedSet = new Set(selectedIds);
-    selectedSet.delete("root");
-    if (!selectedSet.size) {
-      showToast("The starting thought anchors this map");
-      return;
-    }
-    const nextNodes = nodesRef.current.filter((node) => !selectedSet.has(node.id));
-    const nextEdges = edgesRef.current.filter((edge) => (
-      !selectedSet.has(edge.from) && !selectedSet.has(edge.to)
-    ));
-    applyGraph(
-      nextNodes,
-      nextEdges,
-      selectedSet.size === 1 ? "Removed a selected thought" : `Removed ${selectedSet.size} selected thoughts`,
-    );
-    selectedSet.forEach((id) => organicPositionsRef.current.delete(id));
-    if (focusId && selectedSet.has(focusId)) setFocusId(null);
-    setConnectFromId(null);
-    selectMany([]);
-    const rootWasSelected = selectedIds.includes("root");
-    showToast(`${selectedSet.size} ${selectedSet.size === 1 ? "thought" : "thoughts"} removed${rootWasSelected ? "; starting thought kept" : ""}`);
-  };
-
-  const armConnection = (id) => {
-    setConnectFromId((current) => current === id ? null : id);
-    showToast(connectFromId === id ? "Connection cancelled" : "Choose another thought to connect");
-  };
-
-  const connectTarget = (targetId) => {
-    if (!connectFromId || connectFromId === targetId) return;
-    const source = nodesRef.current.find((node) => node.id === connectFromId);
-    const target = nodesRef.current.find((node) => node.id === targetId);
-    if (!source || !target || source.ghost || target.ghost) {
-      setConnectFromId(null);
-      showToast("Accept a proposal before connecting it");
-      return;
-    }
-    const exists = edgesRef.current.some((edge) => (
-      (edge.from === connectFromId && edge.to === targetId)
-      || (edge.from === targetId && edge.to === connectFromId)
-    ));
-    if (exists) {
-      setConnectFromId(null);
-      showToast("Those thoughts are already connected");
-      return;
-    }
-    const createdAt = performance.now();
-    const nextEdge = {
-      from: connectFromId,
-      to: targetId,
-      bend: 0,
-      createdAt,
-    };
-    const nextNodes = applyConnectionGrowthMotion(
-      nodesRef.current,
-      nextEdge,
-      { reducedMotion },
-    );
-    const nextEdges = [...edgesRef.current, nextEdge];
-    applyGraph(nextNodes, nextEdges, "Connected two thoughts");
-    setConnectFromId(null);
-    selectOne(targetId);
-    showToast("Thoughts connected");
-  };
-
-  const removeConnection = (targetEdge, motion = {}) => {
-    const source = nodesRef.current.find((node) => node.id === targetEdge.from);
-    const target = nodesRef.current.find((node) => node.id === targetEdge.to);
-    if (!source || !target) return;
-    const matches = (edge) => (
-      (edge.from === targetEdge.from && edge.to === targetEdge.to)
-      || (edge.from === targetEdge.to && edge.to === targetEdge.from)
-    );
-    const nextEdges = edgesRef.current.filter((edge) => !matches(edge));
-    const transition = buildConnectionPopTransition(
-      nodesRef.current,
-      targetEdge,
-      motion,
-      { reducedMotion, includePop: false },
-    );
-    applyGraph(transition.nodes, nextEdges, "Removed a connection");
-    setConnectFromId(null);
-    showToast("Connection popped");
-  };
-
-  const finishDictation = async (transcript) => {
-    const text = transcript.trim();
-    if (!text) {
-      setDistilling(false);
-      setLiveTranscript("");
-      showToast("Didn't catch anything — try again closer to the mic");
-      return;
-    }
-    const parentId = selected && !selected.ghost ? selected.id : "root";
-    try {
-      const thought = await requestDictation(text);
-      addThought(thought, parentId, { provenance: "Voice · GPT-5.6 dictation" });
-      showToast("Complete thought added to the map");
-    } catch (error) {
-      showToast(error.message);
-    } finally {
-      setDistilling(false);
-      setLiveTranscript("");
-    }
-  };
-
-  const cancelVoice = () => {
-    const recognition = recognitionRef.current;
-    recognitionRef.current = null;
-    recognition?.stop();
-    transcriptRef.current = "";
-    setListening(false);
-    setLiveTranscript("");
-    showToast("Voice capture discarded");
-  };
-
-  const toggleVoice = () => {
-    const SpeechRecognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-    if (!listening) {
-      setSeconds(0);
-      transcriptRef.current = "";
-      setLiveTranscript("");
-      if (!SpeechRecognition) {
-        setListening(true);
-        showToast("Speech recognition unsupported in this browser — using canned voice");
-        return;
-      }
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = navigator.language || "en-US";
-      recognition.onresult = (event) => {
-        let interim = "";
-        for (let i = event.resultIndex; i < event.results.length; i += 1) {
-          const result = event.results[i];
-          if (result.isFinal) transcriptRef.current += `${result[0].transcript} `;
-          else interim += result[0].transcript;
-        }
-        setLiveTranscript(`${transcriptRef.current}${interim}`.trim());
-      };
-      recognition.onerror = (event) => {
-        if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-          recognitionRef.current = null;
-          setListening(false);
-          showToast("Microphone blocked — allow mic access for this site and retry");
-        } else if (event.error !== "no-speech" && event.error !== "aborted") {
-          showToast(`Voice error: ${event.error}`);
-        }
-      };
-      // Chrome ends recognition after a silence gap; restart until the user finishes.
-      recognition.onend = () => {
-        if (recognitionRef.current === recognition) recognition.start();
-      };
-      recognitionRef.current = recognition;
-      recognition.start();
-      setListening(true);
-      showToast("Listening for a complete thought…");
-      return;
-    }
-    setListening(false);
-    const recognition = recognitionRef.current;
-    recognitionRef.current = null;
-    if (!recognition) {
-      const text = voiceThoughts[voiceIndex % voiceThoughts.length];
-      const parentId = selected && !selected.ghost ? selected.id : "root";
-      addThought(text, parentId, { provenance: "Voice · complete thought" });
-      setVoiceIndex((value) => value + 1);
-      showToast("Complete thought added to the map");
-      return;
-    }
-    recognition.onend = () => {
-      setDistilling(true);
-      finishDictation(transcriptRef.current);
-    };
-    recognition.stop();
-  };
-
-  const changeLayout = (nextMode) => {
-    if (nextMode === viewMode) {
-      setActivePanel(null);
-      return;
-    }
-    let nextNodes;
-    if (nextMode === "hierarchy") {
-      nodesRef.current.forEach((node) => organicPositionsRef.current.set(node.id, { x: node.x, y: node.y }));
-      nextNodes = layoutHierarchy(nodesRef.current, edgesRef.current);
-    } else {
-      nextNodes = nodesRef.current.map((node) => ({ ...node, ...(organicPositionsRef.current.get(node.id) ?? {}) }));
-    }
-    applyGraph(nextNodes, edgesRef.current, `Switched to ${nextMode} view`, { rebasePhysics: true });
-    setViewMode(nextMode);
-    setPan({ x: 0, y: 0 });
-    setZoom(1);
-    setActivePanel(null);
-    showToast(`${nextMode === "clusters" ? "Cluster" : "Hierarchy"} view`);
-  };
-
-  const toggleFocus = () => {
-    if (focusId) {
-      setFocusId(null);
-      showToast("Showing the full map");
-    } else {
-      setFocusId(selectedId ?? "root");
-      showToast(`Focused on “${nodeLabel(selected ?? nodes.find((node) => node.id === "root"))}”`);
-    }
-  };
-
-  const panelContent = () => {
-    if (!activePanel) return null;
-    if (activePanel === "maps") {
-      return (
-        <>
-          <button type="button" className="map-row is-current" onClick={() => setActivePanel(null)}>
-            <span className="map-row-icon"><IconAffiliate /></span>
-            <span><strong>Thinking visible</strong><small>{committedCount} thoughts · Local</small></span>
-            <IconCheck />
-          </button>
-          <div className="panel-note"><IconEye /><span>Saved locally on this device. Nothing is shared unless you choose to export it.</span></div>
-        </>
-      );
-    }
-    if (activePanel === "search") {
-      return (
-        <>
-          <label className="search-field">
-            <IconSearch />
-            <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search thoughts…" />
-          </label>
-          <div className="panel-list search-results">
-            {searchResults.map((node) => (
-              <button type="button" key={node.id} onClick={() => {
-                selectOne(node.id);
-                setActivePanel(null);
-                setFocusId(null);
-              }}>
-                <span>{nodeLabel(node)}</span><IconArrowRight />
-              </button>
-            ))}
-            {!searchResults.length && <p className="empty-state">No matching thoughts yet.</p>}
-          </div>
-        </>
-      );
-    }
-    if (activePanel === "history") {
-      return (
-        <>
-          <div className="history-actions">
-            <IconButton label="Undo" onClick={undo} disabled={historyIndex <= 0}><IconArrowBackUp /></IconButton>
-            <IconButton label="Redo" onClick={redo} disabled={historyIndex >= history.length - 1}><IconArrowForwardUp /></IconButton>
-          </div>
-          <div className="panel-list history-list">
-            {[...history].reverse().slice(0, 8).map((entry, reverseIndex) => {
-              const index = history.length - 1 - reverseIndex;
-              return (
-                <button type="button" key={`${entry.label}-${index}`} className={index === historyIndex ? "is-current" : ""} onClick={() => restoreHistory(index)}>
-                  <span><strong>{entry.label}</strong><small>{entry.time}</small></span>
-                  {index === historyIndex ? <IconCheck /> : <IconClock />}
-                </button>
-              );
-            })}
-          </div>
-        </>
-      );
-    }
-    if (activePanel === "profile") {
-      return (
-        <>
-          <div className="profile-card"><span>MR</span><div><strong>Solo workspace</strong><small>Private by default</small></div></div>
-          <div className="panel-note"><IconUser /><span>Multi-speaker maps can layer onto this same graph later without changing the solo-first flow.</span></div>
-        </>
-      );
-    }
-    if (activePanel === "ai") {
-      return (
-        <>
-          <div className="segmented-control" aria-label="AI presence">
-            <button type="button" className={aiMode === "quiet" ? "is-active" : ""} onClick={() => setAiMode("quiet")}>Quiet</button>
-            <button
-              type="button"
-              className={aiMode === "proactive" ? "is-active" : ""}
-              onClick={() => {
-                if (aiMode !== "proactive") showToast("Proactive on — ghost branches appear as you think");
-                setAiMode("proactive");
-              }}
-            >
-              Proactive
-            </button>
-          </div>
-          <p className="panel-description">
-            {aiMode === "quiet" ? "AI waits until you ask, then proposes changes for review." : "AI surfaces occasional ghost branches while you think."}
-          </p>
-          <div className="prompt-list">
-            {aiPrompts.map((prompt) => (
-              <button type="button" key={prompt} disabled={aiBusy} onClick={() => createSuggestion(prompt)}><IconBulb /><span>{prompt}</span><IconArrowRight /></button>
-            ))}
-          </div>
-          <form className="ask-form" onSubmit={(event) => { event.preventDefault(); createSuggestion(); }}>
-            <input value={aiQuery} onChange={(event) => setAiQuery(event.target.value)} placeholder="Ask the map…" />
-            <IconButton type="submit" label="Send question" disabled={!aiQuery.trim() || aiBusy}><IconSend /></IconButton>
-          </form>
-        </>
-      );
-    }
-    if (activePanel === "layouts") {
-      return (
-        <div className="view-options">
-          <button type="button" className={viewMode === "clusters" ? "is-current" : ""} onClick={() => changeLayout("clusters")}>
-            <IconAffiliate /><span><strong>Clusters</strong><small>Organic, spatial thinking</small></span><IconCheck />
-          </button>
-          <button type="button" className={viewMode === "hierarchy" ? "is-current" : ""} onClick={() => changeLayout("hierarchy")}>
-            <IconHierarchy2 /><span><strong>Hierarchy</strong><small>The same graph, left to right</small></span><IconCheck />
-          </button>
-        </div>
-      );
-    }
-    if (activePanel === "overview") {
-      return (
-        <>
-          <div className="map-stats"><span><strong>{committedCount}</strong><small>Thoughts</small></span><span><strong>{edges.filter((edge) => !edge.ghost).length}</strong><small>Links</small></span><span><strong>{suggestionCount}</strong><small>Proposals</small></span></div>
-          <article className="synthesis-card">
-            <div><span>Working synthesis</span><IconMessageCircle /></div>
-            <p>{synthesis}</p>
-          </article>
-          <button type="button" className="wide-action" disabled={synthesisBusy} onClick={refreshSynthesis}><IconSparkles /><span>{synthesisBusy ? "Synthesizing…" : "Refresh synthesis"}</span></button>
-        </>
-      );
-    }
-    if (activePanel === "layers") {
-      return (
-        <>
-          <ToggleRow label="AI proposals" description="Show ghost branches awaiting review" checked={showSuggestions} onChange={setShowSuggestions} />
-          <ToggleRow label="Provenance" description="Reveal where each thought came from" checked={showProvenance} onChange={setShowProvenance} />
-          <ToggleRow label="Loose notes" description="Show the separate private-note island" checked={showPrivateIsland} onChange={setShowPrivateIsland} />
-        </>
-      );
-    }
-    if (activePanel === "settings") {
-      return (
-        <>
-          <ToggleRow label="Complete-thought detection" description="Create nodes at semantic turn boundaries" checked onChange={() => {}} disabled />
-          <ToggleRow label="Reduced motion" description="Remove lobe wobble and pulse animation" checked={reducedMotion} onChange={setReducedMotion} />
-          <ToggleRow label="Show AI proposals" description="Keep pending changes visible on the canvas" checked={showSuggestions} onChange={setShowSuggestions} />
-          <div className="panel-note"><IconAdjustments /><span>Proposals, synthesis, dictation, and the nocturne companion route through the local AI server. Voice uses the browser's speech recognition (Chrome/Edge recommended).</span></div>
-        </>
-      );
-    }
-    if (activePanel === "composer") {
-      return (
-        <form className="composer-form" onSubmit={submitComposer}>
-          <label>
-            <span>{composer?.mode === "edit" ? "Thought" : "What belongs next?"}</span>
-            <textarea autoFocus rows="4" value={composerValue} onChange={(event) => setComposerValue(event.target.value)} placeholder="Finish the thought…" />
-          </label>
-          <div><small>Double-click any lobe to edit it later.</small><IconButton type="submit" label={composer?.mode === "edit" ? "Save thought" : "Add thought"} disabled={!composerValue.trim()}><IconArrowRight /></IconButton></div>
-        </form>
-      );
-    }
-    return null;
-  };
-
-  return (
-    <main className={`app-shell ${concept}`}>
-      <MindMap
-        concept={concept}
-        nodes={visibleNodes}
-        edges={edges}
-        selectedId={selectedId}
-        selectedIds={selectedIds}
-        onSelect={selectOne}
-        onSelectMany={selectMany}
-        onMoveStart={startMoveNode}
-        onMoveNode={moveNode}
-        onMoveEnd={finishMoveNode}
-        onMoveCancel={cancelMoveNode}
-        onEdit={openEditor}
-        onAdd={openComposer}
-        onAskAI={(id) => { selectOne(id); setActivePanel("ai"); }}
-        onArmConnect={armConnection}
-        onConnectTarget={connectTarget}
-        onSpawnFreeform={spawnFreeformThought}
-        onDelete={deleteThought}
-        onAcceptGhost={acceptGhost}
-        onDismissGhost={dismissGhost}
-        onRemoveConnection={removeConnection}
-        connectFromId={connectFromId}
-        zoom={zoom}
-        setZoom={setZoom}
-        pan={pan}
-        setPan={setPan}
-        showSuggestions={showSuggestions}
-        showProvenance={showProvenance}
-        focusId={focusId}
-        reducedMotion={reducedMotion}
-        marqueeActive={marqueeActive}
-      />
-
-      <nav className="side-rail" aria-label="Workspace tools">
-        <IconButton label="Maps" active={activePanel === "maps"} onClick={() => togglePanel("maps")} testId="maps-tool"><IconAffiliate /></IconButton>
-        {concept === "nocturne" && (
-          <>
-            <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={toggleMarquee} testId="marquee-tool"><IconMarquee /></IconButton>
-            <IconButton
-              label={suggestionCount ? `Ask AI · ${suggestionCount} ${suggestionCount === 1 ? "proposal" : "proposals"} waiting` : "Ask AI"}
-              active={activePanel === "ai"}
-              onClick={() => togglePanel("ai")}
-              testId="ai-tool"
-            >
-              <IconSparkles />
-              {suggestionCount > 0 && <i className="tool-pip">{suggestionCount}</i>}
-            </IconButton>
-            <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconHierarchy2 /></IconButton>
-          </>
-        )}
-        <IconButton label="Search" active={activePanel === "search"} onClick={() => togglePanel("search")} testId="search-tool"><IconSearch /></IconButton>
-        <IconButton label={focusId ? "Show full map" : "Focus selected branch"} active={Boolean(focusId)} onClick={toggleFocus} testId="focus-tool"><IconFocusCentered /></IconButton>
-        <IconButton label="History" active={activePanel === "history"} onClick={() => togglePanel("history")} testId="history-tool"><IconClock /></IconButton>
-        {concept === "paper" && (
-          <>
-            <IconButton label={favorite ? "Remove favorite" : "Add favorite"} pressed={favorite} onClick={() => { setFavorite((value) => !value); showToast(favorite ? "Removed from favorites" : "Added to favorites"); }} testId="favorite-tool"><IconStar /></IconButton>
-            <IconButton label="Account" active={activePanel === "profile"} onClick={() => togglePanel("profile")} className="avatar-button rail-bottom" testId="profile-tool">MR</IconButton>
-          </>
-        )}
-        <IconButton label="Settings" active={activePanel === "settings"} onClick={() => togglePanel("settings")} className={concept === "nocturne" ? "rail-bottom" : ""} testId="settings-tool"><IconSettings /></IconButton>
-      </nav>
-
-      {concept === "paper" && (
-        <div className="top-dock" aria-label="Canvas modes">
-          <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={toggleMarquee} testId="marquee-tool"><IconMarquee /></IconButton>
-          <IconButton
-            label={suggestionCount ? `Ask AI · ${suggestionCount} ${suggestionCount === 1 ? "proposal" : "proposals"} waiting` : "Ask AI"}
-            active={activePanel === "ai"}
-            onClick={() => togglePanel("ai")}
-            testId="ai-tool"
-          >
-            <IconSparkles />
-            {suggestionCount > 0 && <i className="tool-pip">{suggestionCount}</i>}
-          </IconButton>
-          <IconButton label="Switch graph view" active={activePanel === "layouts"} onClick={() => togglePanel("layouts")} testId="layout-tool"><IconAffiliate /></IconButton>
-          <IconButton label="Map overview and synthesis" active={activePanel === "overview"} onClick={() => togglePanel("overview")} testId="overview-tool"><IconGridDots /></IconButton>
-          <IconButton label="Layers" active={activePanel === "layers"} onClick={() => togglePanel("layers")} testId="layers-tool"><IconStack2 /></IconButton>
-          <IconButton label="Canvas settings" active={activePanel === "settings"} onClick={() => togglePanel("settings")} testId="canvas-settings-tool"><IconSettings /></IconButton>
-        </div>
-      )}
-
-      {marqueeActive && selectedIds.length > 0 && (
-        <div
-          className="selection-toolbar"
-          role="toolbar"
-          aria-label="Rectangle selection actions"
-          data-testid="selection-toolbar"
-          data-deletable-count={deletableSelectionCount}
-        >
-          <span role="status">
-            {selectedIds.length} selected{selectedIds.includes("root") ? " · starting thought protected" : ""}
-          </span>
-          <IconButton
-            label={`Delete ${deletableSelectionCount} selected ${deletableSelectionCount === 1 ? "thought" : "thoughts"}`}
-            disabled={deletableSelectionCount === 0}
-            onClick={deleteSelectedThoughts}
-            className="danger-action"
-            testId="delete-selection"
-          >
-            <IconTrash />
-          </IconButton>
-        </div>
-      )}
-
-      {activePanel && (
-        <FloatingPanel panel={activePanel} onClose={() => { setActivePanel(null); setComposer(null); }}>
-          {panelContent()}
-        </FloatingPanel>
-      )}
-
-      {(listening || distilling) && (
-        <div className={`voice-caption ${distilling && !listening ? "is-distilling" : ""}`} role="status" aria-live="polite">
-          <span />
-          <p>{listening ? "Listening for a complete thought…" : "Distilling into a complete thought…"}</p>
-          <small>{liveTranscript || (listening ? "Waiting for your voice…" : "One moment…")}</small>
-        </div>
-      )}
-
-      {aiActivity && !listening && !distilling && (
-        <div className="ai-status" role="status" aria-live="polite">
-          <IconSparkles />
-          <span>{aiActivity}</span>
-        </div>
-      )}
-
-      {concept === "nocturne" && !listening && !distilling && (
-        <div className="nocturne-companion-caption" aria-label="AI companion prompt">
-          <p><span />{companion.line}</p>
-          <small>{companion.followup}</small>
-        </div>
-      )}
-
-      <div className={`voice-control ${listening ? "is-listening" : ""}`}>
-        <span className="voice-timer">{timer}</span>
-        <IconButton
-          label={listening ? "Finish thought" : "Start voice capture"}
-          pressed={listening}
-          onClick={toggleVoice}
-          testId="voice-control"
-        >
-          {listening ? <IconCheck /> : <IconMicrophone />}
-        </IconButton>
-      </div>
-
-      <div className="zoom-controls" aria-label="Canvas zoom">
-        <IconButton label="Center map" onClick={() => { setPan({ x: 0, y: 0 }); setZoom(1); }} testId="center-map"><IconFocusCentered /></IconButton>
-        <IconButton label="Zoom out" onClick={() => setZoom((value) => clamp(value - ZOOM_STEP, MIN_ZOOM, MAX_ZOOM))} testId="zoom-out"><IconMinus /></IconButton>
-        <span>{Math.round(zoom * 100)}%</span>
-        <IconButton label="Zoom in" onClick={() => setZoom((value) => clamp(value + ZOOM_STEP, MIN_ZOOM, MAX_ZOOM))} testId="zoom-in"><IconPlus /></IconButton>
-      </div>
-
-      {connectFromId && (
-        <div className={`connect-hint ${listening ? "is-raised" : ""}`} role="status"><IconLink /><span>Select another lobe to connect</span><IconButton label="Cancel connection" onClick={() => setConnectFromId(null)}><IconX /></IconButton></div>
-      )}
-
-      {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
-    </main>
   );
 }

@@ -316,6 +316,27 @@ test("repeated create warms the existing bubble instead of duplicating it", () =
   assert.ok(h.session.nodes[0].heat_at);
 });
 
+test("explicit manual creation makes distinct placeholders and can undo just the new bubble", () => {
+  const h = harness();
+  h.apply({ type: "create_bubble", text: "New thought", actor: "you", create_distinct: true, x: 100, y: 200, expected_revision: 0 });
+  const first = h.session.nodes[0];
+  h.apply({ type: "create_bubble", text: "New thought", actor: "you", create_distinct: true, x: 400, y: 200, expected_revision: 1 });
+  assert.equal(h.session.nodes.length, 2);
+  assert.notEqual(h.session.nodes[0].id, h.session.nodes[1].id);
+  assert.equal(h.session.nodes[1].x, 400);
+  assert.equal(h.session.edges.length, 0);
+  h.apply({ type: "undo_map_change", expected_revision: 2 });
+  assert.deepEqual(h.session.nodes, [first]);
+});
+
+test("Partner cannot bypass semantic deduplication with the manual creation flag", () => {
+  const h = harness();
+  createRoot(h, "One idea");
+  const result = h.apply({ type: "create_bubble", text: "One idea", actor: "partner", create_distinct: true, expected_revision: 1 });
+  assert.equal(result.effective_type, "revisit_bubble");
+  assert.equal(h.session.nodes.length, 1);
+});
+
 test("setting an existing bubble as the central idea preserves the graph and is reversible", () => {
   const h = harness();
   createRoot(h, "Conversation is the main focus");
@@ -677,4 +698,96 @@ test("proposal acceptance drops an over-limit utterance operation as stale", () 
   });
   assert.equal(accepted.proposal_status, "stale");
   assert.equal(h.session.nodes.length, 3);
+});
+
+test("pinning and keeping a thought aside are independently reversible", () => {
+  const h = harness();
+  createRoot(h);
+  const nodeId = h.session.nodes[0].id;
+  h.apply({ type: "set_node_pinned", node_id: nodeId, pinned: true });
+  assert.equal(h.session.nodes[0].pinned, true);
+  assert.equal(h.session.operations.at(-1).label, "Pinned a bubble");
+  h.apply({ type: "set_node_parked", node_id: nodeId, parked: true });
+  assert.equal(h.session.nodes[0].parked, true);
+  h.apply({ type: "undo_map_change" });
+  assert.equal(h.session.nodes[0].parked, undefined);
+  assert.equal(h.session.nodes[0].pinned, true);
+  h.apply({ type: "undo_map_change" });
+  assert.equal(h.session.nodes[0].pinned, undefined);
+  h.apply({ type: "redo_map_change" });
+  assert.equal(h.session.nodes[0].pinned, true);
+  for (const [type, field] of [["set_node_pinned", "pinned"], ["set_node_parked", "parked"]]) {
+    assert.throws(() => h.apply({ type, node_id: nodeId, [field]: "true" }), { code: `invalid_${field}` });
+  }
+});
+
+test("a sourced map interpretation is one undo step and its call id is idempotent", () => {
+  const h = harness();
+  appendUserTurn(h, "A voice map should preserve exact source spans.");
+  const utteranceId = h.session.transcript[0].id;
+  const batch = {
+    type: "apply_map_batch",
+    actor: "partner",
+    origin: "map_controller",
+    call_id: "one-interpretation",
+    label: "Organized a thought",
+    operations: [
+      { type: "create_bubble", node_id: "root", text: "Voice map", sources: [{ utterance_id: utteranceId, quote: "voice map" }] },
+      { type: "create_bubble", node_id: "detail", parent: "root", text: "Exact source spans", sources: [{ utterance_id: utteranceId, quote: "exact source spans" }] },
+    ],
+  };
+  h.apply(batch);
+  assert.equal(h.session.revision, 1);
+  assert.equal(h.session.history_cursor, 1);
+  assert.equal(h.session.nodes.length, 2);
+  assert.equal(h.session.edges.length, 1);
+  const record = h.session.operations.at(-1);
+  assert.equal(record.label, "Organized a thought");
+  assert.equal(record.steps.length, 2);
+  assert.deepEqual(record.source_utterance_ids, [utteranceId]);
+  const after = structuredClone(h.session.nodes);
+  assert.equal(h.apply(batch).replayed, true);
+  h.apply({ type: "undo_map_change" });
+  assert.equal(h.session.nodes.length, 0);
+  assert.equal(h.session.edges.length, 0);
+  assert.equal(h.session.transcript.length, 1);
+  h.apply({ type: "redo_map_change" });
+  assert.deepEqual(h.session.nodes, after);
+  assert.equal(h.session.edges.length, 1);
+});
+
+test("an invalid nested operation discards the entire batch", () => {
+  const h = harness();
+  assert.throws(() => h.apply({
+    type: "apply_map_batch",
+    operations: [
+      { type: "create_bubble", node_id: "root", text: "Will not persist" },
+      { type: "connect_bubbles", from: "root", to: "missing" },
+    ],
+  }), { code: "node_not_found" });
+  assert.equal(h.session.nodes.length, 0);
+  assert.equal(h.session.history_cursor, 0);
+  assert.throws(() => h.apply({ type: "apply_map_batch", operations: [{ type: "append_utterance", text: "Hidden write" }] }), { code: "invalid_map_batch" });
+});
+
+test("nested batch speech references cannot bypass finalized transcript gating", () => {
+  const h = harness();
+  assert.throws(() => h.apply({
+    type: "apply_map_batch", origin: "realtime", operations: [
+      { type: "create_bubble", text: "Early", realtime_item_id: "not-finalized" },
+    ],
+  }), { code: "transcript_pending" });
+  assert.equal(h.session.nodes.length, 0);
+});
+
+test("reassigning the central idea preserves pinned positions", () => {
+  const h = harness();
+  createRoot(h);
+  h.apply({ type: "create_bubble", text: "Other idea", node_id: "other", x: 1000, y: 600 });
+  const root = h.session.nodes[0];
+  h.apply({ type: "set_node_pinned", node_id: root.id, pinned: true });
+  h.apply({ type: "set_central_idea", node_id: "other" });
+  assert.deepEqual(h.session.nodes.map(({ id, x, y }) => ({ id, x, y })), [
+    { id: root.id, x: root.x, y: root.y }, { id: "other", x: 1000, y: 600 },
+  ]);
 });
