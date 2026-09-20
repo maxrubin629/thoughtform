@@ -1,26 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
-import { createSessionStore, SESSION_SCHEMA_VERSION } from "../server/sessionStore.mjs";
-import { createThoughtformServer } from "../server/index.mjs";
+import { SESSION_SCHEMA_VERSION } from "../server/sessionStore.mjs";
+import { startTestServer } from "./helpers/server.mjs";
 import { applyOperation } from "../server/sessionOperations.mjs";
 import { sessionMarkdown } from "../server/sessionExport.mjs";
 
 async function fixture(t, extra = {}) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-workspace-"));
-  const store = createSessionStore({ directory });
-  const app = await createThoughtformServer({ store, env: { THOUGHTFORM_MAP_CONTROLLER_ENABLED: "false" }, ...extra });
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
-  const base = `http://127.0.0.1:${server.address().port}/api`;
-  const request = async (route, body, method = body === undefined ? "GET" : "POST") => {
-    const response = await fetch(base + route, { method, headers: { "Content-Type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-    return { status: response.status, data: await response.json() };
-  };
-  t.after(async () => { app.locals.dispose(); await new Promise((resolve) => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });
-  return { store, directory, app, request, base };
+  const server = await startTestServer(t, { env: { THOUGHTFORM_MAP_CONTROLLER_ENABLED: "false" }, ...extra });
+  return { ...server, request: (route, body, method = body === undefined ? "GET" : "POST") => server.request(route, { body, method }) };
 }
 
 test("v2 migration preserves processing checkpoint and keeps an original backup", async (t) => {

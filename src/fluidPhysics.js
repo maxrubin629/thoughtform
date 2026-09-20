@@ -2,7 +2,8 @@
 // The lab remains the behavioral source of truth for spring bands, clearance,
 // release inertia, damping, and edge collisions.
 
-import { DEFAULT_MATERIAL_SETTINGS, clamp } from "./fluidMaterial.js";
+import { DEFAULT_MATERIAL_SETTINGS } from "./canvas/materialSettings.js";
+import { clamp, distanceToSegment } from "./canvas/geometry.js";
 
 export const FLUID_PHYSICS_SETTINGS = {
   ...DEFAULT_MATERIAL_SETTINGS,
@@ -10,24 +11,6 @@ export const FLUID_PHYSICS_SETTINGS = {
 
 function linkKey(a, b) {
   return String(a) < String(b) ? `${a}:${b}` : `${b}:${a}`;
-}
-
-function distanceToSegment(point, a, b) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const lengthSquared = dx * dx + dy * dy;
-  if (!lengthSquared) {
-    return {
-      distance: Math.hypot(point.x - a.x, point.y - a.y),
-      t: 0,
-      x: a.x,
-      y: a.y,
-    };
-  }
-  const t = clamp(((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared, 0, 1);
-  const x = a.x + dx * t;
-  const y = a.y + dy * t;
-  return { distance: Math.hypot(point.x - x, point.y - y), t, x, y };
 }
 
 export function captureFluidRestLengths(

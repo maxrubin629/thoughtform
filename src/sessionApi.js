@@ -1,85 +1,12 @@
-const API_BASE = "/api";
-
-export class SessionApiError extends Error {
-  constructor(message, { status = 0, code = "request_failed", details = null, cause } = {}) {
-    super(message, cause ? { cause } : undefined);
-    this.name = "SessionApiError";
-    this.status = status;
-    this.code = code;
-    this.details = details;
-    this.revision = details?.revision ?? details?.current_revision ?? null;
-    this.snapshot = details?.snapshot ?? details?.current_snapshot ?? null;
-    this.retryable = details?.retryable
-      ?? details?.error?.retryable
-      ?? (status === 409 || status >= 500 || status === 0);
-  }
-}
-
-function sessionPath(sessionId, suffix = "") {
-  if (!sessionId) throw new TypeError("A session ID is required");
-  return `${API_BASE}/sessions/${encodeURIComponent(sessionId)}${suffix}`;
-}
-
-async function parseResponseBody(response) {
-  if (response.status === 204) return null;
-
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    return response.json().catch(() => null);
-  }
-
-  const text = await response.text();
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
-}
-
-async function request(path, { method = "GET", body, headers, signal } = {}) {
-  let response;
-  try {
-    response = await fetch(path, {
-      method,
-      headers: body === undefined
-        ? headers
-        : { "Content-Type": "application/json", ...headers },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal,
-    });
-  } catch (cause) {
-    if (cause?.name === "AbortError") throw cause;
-    throw new SessionApiError("The session server is unavailable", {
-      code: "network_error",
-      cause,
-    });
-  }
-
-  const data = await parseResponseBody(response);
-  if (!response.ok) {
-    const message = typeof data === "string"
-      ? data
-      : data?.error?.message ?? data?.error ?? data?.message ?? `Session request failed (${response.status})`;
-    const code = typeof data?.error === "object"
-      ? data.error.code
-      : data?.code ?? (response.status === 409 ? "revision_conflict" : "request_failed");
-    throw new SessionApiError(message, {
-      status: response.status,
-      code,
-      details: data,
-    });
-  }
-
-  return data;
-}
+import { request, requestSession, sessionPath, SessionApiError } from "./apiRequest.js";
+export { SessionApiError } from "./apiRequest.js";
 
 export function listSessions({ signal } = {}) {
-  return request(`${API_BASE}/sessions`, { signal });
+  return request("/api/sessions", { signal });
 }
 
 export function createSession({ title } = {}, { signal } = {}) {
-  return request(`${API_BASE}/sessions`, {
+  return request("/api/sessions", {
     method: "POST",
     body: title ? { title } : {},
     signal,
@@ -87,11 +14,11 @@ export function createSession({ title } = {}, { signal } = {}) {
 }
 
 export function getSession(sessionId, { signal } = {}) {
-  return request(sessionPath(sessionId), { signal });
+  return requestSession(sessionId, "", { signal });
 }
 
 export function renameSession(sessionId, title, { signal } = {}) {
-  return request(sessionPath(sessionId), {
+  return requestSession(sessionId, "", {
     method: "PATCH",
     body: { title },
     signal,
@@ -99,14 +26,14 @@ export function renameSession(sessionId, title, { signal } = {}) {
 }
 
 export function deleteSession(sessionId, { signal } = {}) {
-  return request(sessionPath(sessionId), {
+  return requestSession(sessionId, "", {
     method: "DELETE",
     signal,
   });
 }
 
 export function updateSessionUiContext(sessionId, context, { signal } = {}) {
-  return request(sessionPath(sessionId, "/ui-context"), {
+  return requestSession(sessionId, "/ui-context", {
     method: "PATCH",
     body: context,
     signal,
@@ -118,52 +45,27 @@ export async function applySessionOperation(
   operation,
   { expectedRevision, callId, actor, signal } = {},
 ) {
-  let revision = expectedRevision;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await request(sessionPath(sessionId, "/operations"), {
-        method: "POST",
-        body: {
-          operation,
-          ...(revision === undefined ? {} : { expected_revision: revision }),
-          ...(callId ? { call_id: callId } : {}),
-          ...(actor ? { actor } : {}),
-        },
-        signal,
-      });
-    } catch (error) {
-      if (attempt === 0
-        && error instanceof SessionApiError
-        && error.code === "revision_conflict"
-        && Number.isInteger(error.revision)) {
-        revision = error.revision;
-        continue;
-      }
-      throw error;
-    }
-  }
-  throw new Error("Session operation retry exhausted");
-}
-
-export function executeSessionToolCall(
-  sessionId,
-  { name, arguments: toolArguments = {}, callId, expectedRevision },
-  { signal } = {},
-) {
-  return request(sessionPath(sessionId, "/tool-calls"), {
+  const commit = (revision) => requestSession(sessionId, "/operations", {
     method: "POST",
     body: {
-      name,
-      arguments: toolArguments,
-      call_id: callId,
-      ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision }),
+      operation,
+      ...(revision === undefined ? {} : { expected_revision: revision }),
+      ...(callId ? { call_id: callId } : {}),
+      ...(actor ? { actor } : {}),
     },
     signal,
   });
+  try {
+    return await commit(expectedRevision);
+  } catch (error) {
+    if (!(error instanceof SessionApiError) || error.code !== "revision_conflict" || !Number.isInteger(error.revision)) throw error;
+    // Rebase an explicit action once; further conflicts return to the caller.
+    return commit(error.revision);
+  }
 }
 
 export function synthesizeSession(sessionId, { expectedRevision, signal } = {}) {
-  return request(sessionPath(sessionId, "/synthesize"), {
+  return requestSession(sessionId, "/synthesize", {
     method: "POST",
     body: expectedRevision === undefined ? {} : { expected_revision: expectedRevision },
     signal,
@@ -171,7 +73,7 @@ export function synthesizeSession(sessionId, { expectedRevision, signal } = {}) 
 }
 
 export function retrySessionMapController(sessionId, { signal } = {}) {
-  return request(sessionPath(sessionId, "/map-controller/retry"), {
+  return requestSession(sessionId, "/map-controller/retry", {
     method: "POST",
     body: {},
     signal,
@@ -181,76 +83,13 @@ export function retrySessionMapController(sessionId, { signal } = {}) {
 export function shouldApplySessionSnapshot(current, incoming) {
   if (!incoming?.id) return false;
   if (!current || current.id !== incoming.id) return true;
-  const currentRevision = Number.isFinite(current.revision) ? current.revision : -1;
-  const incomingRevision = Number.isFinite(incoming.revision) ? incoming.revision : -1;
-  if (incomingRevision !== currentRevision) return incomingRevision > currentRevision;
-  const currentControllerEpoch = Number.isFinite(current.controller_event_epoch)
-    ? current.controller_event_epoch
-    : 0;
-  const incomingControllerEpoch = Number.isFinite(incoming.controller_event_epoch)
-    ? incoming.controller_event_epoch
-    : 0;
-  if (incomingControllerEpoch !== currentControllerEpoch) {
-    return incomingControllerEpoch > currentControllerEpoch;
+  // Revision wins, followed by the controller's restart epoch and event sequence.
+  for (const [key, fallback] of [["revision", -1], ["controller_event_epoch", 0], ["controller_event_sequence", 0]]) {
+    const before = Number.isFinite(current[key]) ? current[key] : fallback;
+    const after = Number.isFinite(incoming[key]) ? incoming[key] : fallback;
+    if (before !== after) return after > before;
   }
-  const currentControllerSequence = Number.isFinite(current.controller_event_sequence)
-    ? current.controller_event_sequence
-    : 0;
-  const incomingControllerSequence = Number.isFinite(incoming.controller_event_sequence)
-    ? incoming.controller_event_sequence
-    : 0;
-  return incomingControllerSequence >= currentControllerSequence;
-}
-
-export async function negotiateRealtimeSession(
-  sessionId,
-  sdp,
-  { voiceMode = "vad", signal } = {},
-) {
-  if (typeof sdp !== "string" || !sdp.trim()) {
-    throw new TypeError("A WebRTC offer SDP is required");
-  }
-
-  const query = new URLSearchParams({ voice_mode: voiceMode });
-  let response;
-  try {
-    response = await fetch(`${sessionPath(sessionId, "/realtime")}?${query}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/sdp",
-        Accept: "application/sdp, application/json",
-      },
-      body: sdp,
-      signal,
-    });
-  } catch (cause) {
-    if (cause?.name === "AbortError") throw cause;
-    throw new SessionApiError("Realtime voice could not reach the session server", {
-      code: "realtime_network_error",
-      cause,
-    });
-  }
-
-  const answer = await parseResponseBody(response);
-  if (!response.ok) {
-    const message = typeof answer === "string"
-      ? answer
-      : answer?.error?.message ?? answer?.error ?? answer?.message ?? `Realtime setup failed (${response.status})`;
-    throw new SessionApiError(message, {
-      status: response.status,
-      code: answer?.code ?? answer?.error?.code ?? "realtime_setup_failed",
-      details: answer,
-    });
-  }
-
-  const answerSdp = typeof answer === "string" ? answer : answer?.sdp;
-  if (!answerSdp) {
-    throw new SessionApiError("Realtime setup returned no answer SDP", {
-      code: "invalid_realtime_answer",
-      details: answer,
-    });
-  }
-  return answerSdp;
+  return true;
 }
 
 function decodeEvent(event) {
@@ -347,10 +186,3 @@ export function subscribeSessionEvents(
     source = null;
   };
 }
-
-// Concise aliases for callers that already operate in a session namespace.
-export const patchSessionUiContext = updateSessionUiContext;
-export const performSessionOperation = applySessionOperation;
-export const postSessionToolCall = executeSessionToolCall;
-export const requestSessionSynthesis = synthesizeSession;
-export const retryMapController = retrySessionMapController;

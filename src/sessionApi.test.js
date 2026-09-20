@@ -3,7 +3,6 @@ import { afterEach, test } from "node:test";
 
 import {
   applySessionOperation,
-  negotiateRealtimeSession,
   retrySessionMapController,
   shouldApplySessionSnapshot,
   subscribeSessionEvents,
@@ -74,6 +73,17 @@ test("session operations retry once at the revision returned by a conflict", asy
   assert.equal(result.revision, 16);
 });
 
+test("a second revision conflict is returned without an unbounded retry", async () => {
+  const revisions = [];
+  globalThis.fetch = async (_url, options) => {
+    const revision = JSON.parse(options.body).expected_revision;
+    revisions.push(revision);
+    return Response.json({ error: { code: "revision_conflict", message: "Map changed" }, revision: revision + 1 }, { status: 409 });
+  };
+  await assert.rejects(applySessionOperation("map", { type: "undo" }, { expectedRevision: 4 }), { code: "revision_conflict", revision: 6 });
+  assert.deepEqual(revisions, [4, 5]);
+});
+
 test("map controller retry posts to the session retry endpoint and returns its snapshot", async () => {
   let request;
   globalThis.fetch = async (url, options) => {
@@ -93,26 +103,6 @@ test("map controller retry posts to the session retry endpoint and returns its s
   assert.equal(request.options.method, "POST");
   assert.equal(request.options.body, "{}");
   assert.equal(result.snapshot.map_controller.status, "waiting");
-});
-
-test("Realtime negotiation sends raw SDP without exposing a credential", async () => {
-  let request;
-  globalThis.fetch = async (url, options) => {
-    request = { url, options };
-    return new Response("answer-sdp", {
-      headers: { "Content-Type": "application/sdp" },
-    });
-  };
-
-  const answer = await negotiateRealtimeSession("session-1", "offer-sdp", {
-    voiceMode: "push-to-talk",
-  });
-
-  assert.equal(answer, "answer-sdp");
-  assert.equal(request.url, "/api/sessions/session-1/realtime?voice_mode=push-to-talk");
-  assert.equal(request.options.body, "offer-sdp");
-  assert.equal(request.options.headers["Content-Type"], "application/sdp");
-  assert.equal("Authorization" in request.options.headers, false);
 });
 
 test("SSE subscriptions dispatch snapshots and close idempotently", () => {

@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
-import { PROPOSAL_OPERATION_SCHEMA } from "./realtime.mjs";
+import { PROPOSAL_OPERATION_SCHEMA } from "./mapTools.mjs";
+import { jsonSchemaFormat, strictObjectSchema } from "./aiProtocol.mjs";
+import { completedUserTurns, preferencesAllowCurator } from "./curatorScheduler.mjs";
+
+export { createCuratorScheduler } from "./curatorScheduler.mjs";
 
 export const CURATOR_SYSTEM = `You are Thoughtform's silent creative curator. You inspect the current canonical mind map and a bounded window of recent conversation, then decide whether one genuinely useful new direction is worth the user's attention.
 
@@ -18,62 +22,45 @@ Rules:
 - Every evidence entry must pair a completed utterance id with one exact quote from that utterance. The server resolves its character span.
 - Rationale should be one concise user-facing sentence and should not mention internal orchestration, schemas, revisions, or model names.`;
 
-export const CURATOR_EVIDENCE_SCHEMA = {
-  type: "object",
-  properties: {
-    utterance_id: {
-      type: "string",
-      minLength: 1,
-      description: "The id of the completed transcript utterance containing the quote.",
-    },
-    quote: {
-      type: "string",
-      minLength: 1,
-      description: "An exact, uniquely occurring quote copied from that utterance.",
-    },
+export const CURATOR_EVIDENCE_SCHEMA = strictObjectSchema({
+  utterance_id: {
+    type: "string",
+    minLength: 1,
+    description: "The id of the completed transcript utterance containing the quote.",
   },
-  required: ["utterance_id", "quote"],
-  additionalProperties: false,
-};
+  quote: {
+    type: "string",
+    minLength: 1,
+    description: "An exact, uniquely occurring quote copied from that utterance.",
+  },
+});
 
-export const CURATOR_PROPOSAL_SCHEMA = {
-  type: "object",
-  properties: {
-    rationale: {
-      type: "string",
-      description: "One concise user-facing sentence explaining the proposed batch.",
-    },
-    evidence: {
-      type: "array",
-      items: CURATOR_EVIDENCE_SCHEMA,
-      description: "Completed utterance ids paired with exact transcript quotes supporting the batch.",
-    },
-    operations: {
-      type: "array",
-      maxItems: 3,
-      items: PROPOSAL_OPERATION_SCHEMA,
-      description: "A reviewable atomic batch. Return an empty array when no worthwhile proposal exists.",
-    },
+export const CURATOR_PROPOSAL_SCHEMA = strictObjectSchema({
+  rationale: {
+    type: "string",
+    description: "One concise user-facing sentence explaining the proposed batch.",
   },
-  required: ["rationale", "evidence", "operations"],
-  additionalProperties: false,
-};
+  evidence: {
+    type: "array",
+    items: CURATOR_EVIDENCE_SCHEMA,
+    description: "Completed utterance ids paired with exact transcript quotes supporting the batch.",
+  },
+  operations: {
+    type: "array",
+    maxItems: 3,
+    items: PROPOSAL_OPERATION_SCHEMA,
+    description: "A reviewable atomic batch. Return an empty array when no worthwhile proposal exists.",
+  },
+});
 
 export function isCuratorEnabled(env = process.env) {
   return String(env.THOUGHTFORM_CURATOR_ENABLED ?? "true").toLowerCase() === "true";
 }
 
-function preferencesAllowCurator(snapshot) {
-  return snapshot?.preferences?.partner_mode !== "quiet" && !snapshot?.preferences?.mapping_paused;
-}
-
 export function shouldRunCurator(snapshot, { minimumUserTurns = 2, maximumSurfacedProposals = 3 } = {}) {
   if (!snapshot || !Number.isInteger(snapshot.revision)) return false;
   if (!preferencesAllowCurator(snapshot)) return false;
-  const completedUserTurns = (snapshot.transcript ?? [])
-    .filter((utterance) => utterance?.speaker === "you" && utterance?.text?.trim())
-    .length;
-  if (completedUserTurns < minimumUserTurns) return false;
+  if (completedUserTurns(snapshot).length < minimumUserTurns) return false;
   const proposals = snapshot.proposals ?? [];
   if (proposals.some((proposal) => proposal?.status === "pending")) return false;
   const surfaced = proposals.filter((proposal) => proposal?.actor === "curator").length;
@@ -105,16 +92,7 @@ function parseOutput(response) {
 }
 
 function normalizeOperation(operation, idFactory) {
-  const fields = [
-    "node_id",
-    "from",
-    "to",
-    "edge_id",
-    "text",
-    "parent",
-    "quote",
-    "utterance_id",
-  ];
+  const fields = ["node_id", "from", "to", "edge_id", "text", "parent", "quote", "utterance_id"];
   const normalized = {
     id: operation?.id?.trim() || idFactory("proposal_operation"),
     type: operation?.type,
@@ -197,130 +175,10 @@ export function createCurator({
         reasoning: { effort: "medium" },
         instructions: CURATOR_SYSTEM,
         input: JSON.stringify(compactSnapshot(snapshot)),
-        text: {
-          format: {
-            type: "json_schema",
-            name: "thoughtform_curator_proposal",
-            strict: true,
-            schema: CURATOR_PROPOSAL_SCHEMA,
-          },
-        },
+        text: jsonSchemaFormat("thoughtform_curator_proposal", CURATOR_PROPOSAL_SCHEMA),
       });
 
       return normalizeProposal(parseOutput(response), snapshot, { now, idFactory });
     },
   };
-}
-
-// The server can call notify(sessionId) after a completed user turn. Debouncing
-// happens per session; the latest canonical snapshot is loaded only when idle.
-export function createCuratorScheduler({
-  curator,
-  loadSnapshot,
-  onProposal,
-  isBlocked = () => false,
-  onError = (error) => console.error(error),
-  idleMs = 10_000,
-  minimumUserTurnsBetweenRuns = 3,
-  setTimer = setTimeout,
-  clearTimer = clearTimeout,
-} = {}) {
-  if (!curator || typeof loadSnapshot !== "function" || typeof onProposal !== "function") {
-    throw new TypeError("Curator scheduler requires curator, loadSnapshot, and onProposal");
-  }
-  const timers = new Map();
-  const lastRunFingerprint = new Map();
-  const lastRunUserTurnCount = new Map();
-  const active = new Set();
-  const queued = new Set();
-  const generations = new Map();
-  let disposed = false;
-
-  const userTurnCount = (snapshot) => (snapshot.transcript ?? [])
-    .filter((utterance) => utterance?.speaker === "you" && utterance?.text?.trim())
-    .length;
-
-  const snapshotFingerprint = (snapshot) => {
-    const latestUserTurn = [...(snapshot.transcript ?? [])]
-      .reverse()
-      .find((utterance) => utterance?.speaker === "you");
-    return `${snapshot.revision}:${snapshot.transcript?.length ?? 0}:${latestUserTurn?.id ?? "none"}`;
-  };
-
-  const cancel = (sessionId) => {
-    generations.set(sessionId, (generations.get(sessionId) ?? 0) + 1);
-    const timer = timers.get(sessionId);
-    if (timer !== undefined) clearTimer(timer);
-    timers.delete(sessionId);
-    queued.delete(sessionId);
-  };
-
-  const schedule = (sessionId) => {
-    if (disposed) return false;
-    cancel(sessionId);
-    const generation = generations.get(sessionId);
-    const timer = setTimer(async () => {
-      if (disposed || generation !== generations.get(sessionId)) return;
-      timers.delete(sessionId);
-      if (await isBlocked(sessionId)) {
-        schedule(sessionId);
-        return;
-      }
-      if (active.has(sessionId)) {
-        queued.add(sessionId);
-        return;
-      }
-      active.add(sessionId);
-      try {
-        const snapshot = await loadSnapshot(sessionId);
-        if (disposed || generation !== generations.get(sessionId)) return;
-        const fingerprint = snapshotFingerprint(snapshot);
-        if (!preferencesAllowCurator(snapshot) || !curator.shouldRun(snapshot) || lastRunFingerprint.get(sessionId) === fingerprint) return;
-        const turns = userTurnCount(snapshot);
-        const previousTurns = lastRunUserTurnCount.get(sessionId);
-        if (previousTurns !== undefined && turns - previousTurns < minimumUserTurnsBetweenRuns) return;
-        const proposal = await curator.propose(snapshot);
-        if (disposed || generation !== generations.get(sessionId)) return;
-        lastRunFingerprint.set(sessionId, fingerprint);
-        lastRunUserTurnCount.set(sessionId, turns);
-        if (proposal) {
-          const latest = await loadSnapshot(sessionId);
-          if (disposed || generation !== generations.get(sessionId)
-            || !preferencesAllowCurator(latest) || !curator.shouldRun(latest)) return;
-          if (await isBlocked(sessionId) || snapshotFingerprint(latest) !== fingerprint) {
-            queued.add(sessionId);
-            // Discard stale work and wait for the controller again. This
-            // evaluation still counts toward the three-user-turn budget.
-            return;
-          }
-          await onProposal(sessionId, proposal);
-        }
-      } catch (error) {
-        onError(error, sessionId);
-      } finally {
-        active.delete(sessionId);
-        if (queued.delete(sessionId)) schedule(sessionId);
-      }
-    }, idleMs);
-    timers.set(sessionId, timer);
-    return true;
-  };
-
-  const notify = (sessionId) => {
-    if (disposed || !curator.enabled) return false;
-    if (active.has(sessionId)) {
-      queued.add(sessionId);
-      return true;
-    }
-    return schedule(sessionId);
-  };
-
-  const dispose = () => {
-    disposed = true;
-    [...timers.keys()].forEach(cancel);
-    [...active.keys()].forEach(cancel);
-    queued.clear();
-  };
-
-  return { notify, cancel, dispose };
 }

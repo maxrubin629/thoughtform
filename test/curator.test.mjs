@@ -369,3 +369,53 @@ test("curator leaves parked thoughts alone", async () => {
   value.nodes[0].parked = true;
   assert.equal(await curator.propose(value), null);
 });
+
+test("cancellation during the final controller check cannot publish a curator proposal", async () => {
+  for (const action of ["cancel", "dispose"]) {
+    let release;
+    let checking;
+    const checkStarted = new Promise((resolve) => { checking = resolve; });
+    const pendingCheck = new Promise((resolve) => { release = resolve; });
+    const queued = [];
+    const proposals = [];
+    let checks = 0;
+    const scheduler = createCuratorScheduler({
+      curator: { enabled: true, shouldRun: () => true, propose: async () => ({ id: "stale" }) },
+      loadSnapshot: async () => snapshot(),
+      onProposal: async (_id, proposal) => proposals.push(proposal),
+      isBlocked: async () => {
+        if (++checks === 1) return false;
+        checking();
+        return pendingCheck;
+      },
+      setTimer: (callback) => { queued.push(callback); return queued.length; },
+      clearTimer: () => {},
+    });
+    scheduler.notify("session-1");
+    const running = queued[0]();
+    await checkStarted;
+    scheduler[action]("session-1");
+    release(false);
+    await running;
+    assert.deepEqual(proposals, [], `${action} invalidates a result awaiting its final controller check`);
+    scheduler.dispose();
+  }
+});
+
+test("a failed controller readiness check follows the curator error path", async () => {
+  const queued = [];
+  const errors = [];
+  const scheduler = createCuratorScheduler({
+    curator: { enabled: true },
+    loadSnapshot: async () => assert.fail("must not load a snapshot after the check fails"),
+    onProposal: async () => assert.fail("must not publish after the check fails"),
+    isBlocked: async () => { throw new Error("readiness unavailable"); },
+    onError: (error, id) => errors.push([error.message, id]),
+    setTimer: (callback) => { queued.push(callback); return queued.length; },
+    clearTimer: () => {},
+  });
+  scheduler.notify("session-1");
+  await queued[0]();
+  assert.deepEqual(errors, [["readiness unavailable", "session-1"]]);
+  scheduler.dispose();
+});

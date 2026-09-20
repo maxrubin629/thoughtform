@@ -31,8 +31,7 @@ export function createMapControllerScheduler({
       sessions.set(sessionId, {
         timer: null,
         timerToken: null,
-        preparing: false,
-        active: false,
+        phase: "idle",
         queued: false,
         retryAttempt: 0,
         pendingWatermark: null,
@@ -56,10 +55,20 @@ export function createMapControllerScheduler({
       .some((item) => item?.speaker === "you" && item?.text?.trim())
   );
 
+  const busy = (entry) => entry.phase !== "idle";
+  const resetRetry = (entry) => {
+    entry.retryAttempt = 0;
+    entry.pendingWatermark = null;
+  };
+  const queue = (sessionId, entry) => {
+    entry.queued = true;
+    reportState(sessionId);
+    return true;
+  };
   let schedule;
 
   const scheduleQueuedPass = (sessionId, entry) => {
-    if (entry.queued && entry.timer === null && !entry.active && !entry.preparing && !disposed) {
+    if (entry.queued && entry.timer === null && !busy(entry) && !disposed) {
       entry.queued = false;
       schedule(sessionId, idleMs);
     }
@@ -73,8 +82,7 @@ export function createMapControllerScheduler({
       schedule(sessionId, delay);
       return;
     }
-    entry.retryAttempt = 0;
-    entry.pendingWatermark = null;
+    resetRetry(entry);
     try {
       await controller.recordFailure?.(sessionId, error);
     } catch (recordError) {
@@ -88,40 +96,37 @@ export function createMapControllerScheduler({
     if (disposed
       || generation !== entry.generation
       || entry.timerToken !== timerToken
-      || entry.preparing
-      || entry.active) return;
+      || busy(entry)) return;
     entry.timer = null;
     entry.timerToken = null;
-    entry.preparing = true;
+    entry.phase = "preparing";
     reportState(sessionId);
     let snapshot;
     try {
       snapshot = await loadSnapshot(sessionId);
     } catch (error) {
       if (generation !== entry.generation || disposed) return;
-      entry.preparing = false;
+      entry.phase = "idle";
       await handleFailure(sessionId, entry, generation, error);
       scheduleQueuedPass(sessionId, entry);
       return;
     }
-    if (disposed || generation !== entry.generation || !entry.preparing || entry.active) return;
-    entry.preparing = false;
+    if (disposed || generation !== entry.generation || entry.phase !== "preparing") return;
+    entry.phase = "idle";
     entry.paused = snapshot.preferences?.mapping_paused === true;
     if (entry.paused) {
-      entry.pendingWatermark = null;
-      entry.retryAttempt = 0;
+      resetRetry(entry);
       entry.queued = false;
       reportState(sessionId);
       return;
     }
     if (entry.pendingWatermark === null) entry.pendingWatermark = snapshot.transcript?.length ?? 0;
     if (!hasPendingUser(snapshot, entry.pendingWatermark)) {
-      entry.pendingWatermark = null;
-      entry.retryAttempt = 0;
+      resetRetry(entry);
       entry.queued = false;
       return;
     }
-    entry.active = true;
+    entry.phase = "active";
     entry.abortController = new AbortController();
     reportState(sessionId);
     let completed = null;
@@ -130,13 +135,12 @@ export function createMapControllerScheduler({
         watermark: entry.pendingWatermark,
         signal: entry.abortController.signal,
       });
-      entry.retryAttempt = 0;
-      entry.pendingWatermark = null;
+      resetRetry(entry);
     } catch (error) {
       if (entry.abortController.signal.aborted || generation !== entry.generation || disposed) return;
       await handleFailure(sessionId, entry, generation, error);
     } finally {
-      entry.active = false;
+      entry.phase = "idle";
       entry.abortController = null;
       if (completed && !completed.paused && generation === entry.generation) {
         try {
@@ -165,44 +169,24 @@ export function createMapControllerScheduler({
     if (disposed || completedUtterance?.speaker !== "you" || !completedUtterance?.text?.trim()) return false;
     const entry = entryFor(sessionId);
     if (entry.paused) return false;
-    if (entry.preparing || entry.active) {
-      entry.queued = true;
-      reportState(sessionId);
-      return true;
-    }
-    if (entry.timer !== null && entry.retryAttempt > 0) {
-      entry.queued = true;
-      reportState(sessionId);
-      return true;
-    }
-    entry.retryAttempt = 0;
-    entry.pendingWatermark = null;
+    if (busy(entry) || (entry.timer !== null && entry.retryAttempt > 0)) return queue(sessionId, entry);
+    resetRetry(entry);
     return schedule(sessionId, idleMs);
   };
 
   const retry = (sessionId) => {
     if (disposed) return false;
     const entry = entryFor(sessionId);
-    entry.retryAttempt = 0;
-    entry.pendingWatermark = null;
-    if (entry.active) {
-      entry.queued = true;
-      reportState(sessionId);
-    } else schedule(sessionId, 0);
-    return true;
+    resetRetry(entry);
+    return busy(entry) ? queue(sessionId, entry) : schedule(sessionId, 0);
   };
 
   const recover = (sessionId) => {
     if (disposed) return false;
     const entry = entryFor(sessionId);
-    if (entry.preparing || entry.active) {
-      entry.queued = true;
-      reportState(sessionId);
-      return true;
-    }
+    if (busy(entry)) return queue(sessionId, entry);
     if (entry.timer !== null) return true;
-    entry.retryAttempt = 0;
-    entry.pendingWatermark = null;
+    resetRetry(entry);
     return schedule(sessionId, 0);
   };
 
@@ -211,10 +195,10 @@ export function createMapControllerScheduler({
     if (!entry) return false;
     entry.generation += 1;
     clearScheduled(entry);
-    entry.preparing = false;
+    // An aborted request keeps its slot until its finally block settles.
+    if (entry.phase === "preparing") entry.phase = "idle";
     entry.queued = false;
-    entry.retryAttempt = 0;
-    entry.pendingWatermark = null;
+    resetRetry(entry);
     entry.abortController?.abort(new Error("Map controller run cancelled."));
     return true;
   };
@@ -222,9 +206,9 @@ export function createMapControllerScheduler({
   const state = (sessionId) => {
     const entry = sessions.get(sessionId);
     return {
-      scheduled: Boolean(entry?.timer !== null && entry?.timer !== undefined),
-      preparing: Boolean(entry?.preparing),
-      active: Boolean(entry?.active),
+      scheduled: entry?.timer != null,
+      preparing: entry?.phase === "preparing",
+      active: entry?.phase === "active",
       queued: Boolean(entry?.queued),
       retry_attempt: entry?.retryAttempt ?? 0,
       watermark: entry?.pendingWatermark ?? null,

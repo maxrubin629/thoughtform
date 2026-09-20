@@ -10,7 +10,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "server": "node --env-file-if-exists=.env server/index.mjs",
-    "test": "node --test test/*.test.mjs src/*.test.js"
+    "test": "node --test test/*.test.mjs src/*.test.js",
+    "stats": "node scripts/code-stats.mjs"
   },
   "dependencies": {
     "@fontsource/manrope": "^5.2.8",

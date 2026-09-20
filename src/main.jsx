@@ -1,6 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { CanonicalSessionApp } from "./CanonicalSessionApp.jsx";
+import { Workspace } from "./workspace/Workspace.jsx";
 import "./styles.css";
 
 // Keep old bookmarks working while presenting a single workspace.
@@ -12,6 +12,6 @@ if (url.searchParams.has("mode")) {
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <CanonicalSessionApp />
+    <Workspace />
   </React.StrictMode>,
 );
