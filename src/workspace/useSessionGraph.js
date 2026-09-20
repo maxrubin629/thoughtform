@@ -100,6 +100,7 @@ export function useSessionGraph({ viewMode, reducedMotion, showSuggestions }) {
         if (wasManual || alreadyPopping) return;
         const transition = buildConnectionPopTransition(transitionNodes, edge, {}, {
           eventId: `canonical:${snapshot.revision}:${key}`,
+          links: edgesRef.current,
         });
         transitionNodes = transition.nodes;
         if (transition.pop) connectionPopQueueRef.current.push(transition.pop);

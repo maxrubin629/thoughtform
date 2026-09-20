@@ -39,7 +39,7 @@ export function useConnectionPops({ edges, connectionPopQueueRef, reducedMotion,
     const { pop, impacts } = buildConnectionPopTransition(
       [connection.a, connection.b],
       connection.link,
-      { hitT: connection.hit.t },
+      { hitT: connection.hit.t, angleLimits: connection.angleLimits },
       { duration: reducedMotion ? 1 : CONNECTION_POP_DURATION },
     );
     poppingConnectionsRef.current.push(pop);

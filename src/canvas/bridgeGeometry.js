@@ -83,7 +83,7 @@ export function bridgeMetrics(a, b, settings, angleLimits) {
   };
 }
 
-export function traceFluidBridge(path, a, b, settings, angleLimits) {
+export function bridgeOutline(a, b, settings, angleLimits) {
   const metrics = bridgeMetrics(a, b, settings, angleLimits);
   if (!metrics) return false;
 
@@ -133,40 +133,91 @@ export function traceFluidBridge(path, a, b, settings, angleLimits) {
   const waistTop = { x: waist.x + px * waistHalfWidth, y: waist.y + py * waistHalfWidth };
   const waistBottom = { x: waist.x - px * waistHalfWidth, y: waist.y - py * waistHalfWidth };
 
-  path.moveTo(aTop.x, aTop.y);
-  path.bezierCurveTo(
-    aTop.x + aTopTangent.x * sourceTangentLength,
-    aTop.y + aTopTangent.y * sourceTangentLength,
-    waistTop.x - ux * leftLength * waistHandleFactor,
-    waistTop.y - uy * leftLength * waistHandleFactor,
-    waistTop.x,
-    waistTop.y,
-  );
-  path.bezierCurveTo(
-    waistTop.x + ux * rightLength * waistHandleFactor,
-    waistTop.y + uy * rightLength * waistHandleFactor,
-    bTop.x - bTopTangent.x * targetTangentLength,
-    bTop.y - bTopTangent.y * targetTangentLength,
-    bTop.x,
-    bTop.y,
-  );
-  path.lineTo(bBottom.x, bBottom.y);
-  path.bezierCurveTo(
-    bBottom.x - bBottomTangent.x * targetTangentLength,
-    bBottom.y - bBottomTangent.y * targetTangentLength,
-    waistBottom.x + ux * rightLength * waistHandleFactor,
-    waistBottom.y + uy * rightLength * waistHandleFactor,
-    waistBottom.x,
-    waistBottom.y,
-  );
-  path.bezierCurveTo(
-    waistBottom.x - ux * leftLength * waistHandleFactor,
-    waistBottom.y - uy * leftLength * waistHandleFactor,
-    aBottom.x + aBottomTangent.x * sourceTangentLength,
-    aBottom.y + aBottomTangent.y * sourceTangentLength,
-    aBottom.x,
-    aBottom.y,
-  );
+  const control = (point, direction, distance) => ({
+    x: point.x + direction.x * distance,
+    y: point.y + direction.y * distance,
+  });
+  const along = { x: ux, y: uy };
+  return {
+    metrics,
+    top: [
+      [aTop, control(aTop, aTopTangent, sourceTangentLength), control(waistTop, along, -leftLength * waistHandleFactor), waistTop],
+      [waistTop, control(waistTop, along, rightLength * waistHandleFactor), control(bTop, bTopTangent, -targetTangentLength), bTop],
+    ],
+    bottom: [
+      [aBottom, control(aBottom, aBottomTangent, sourceTangentLength), control(waistBottom, along, -leftLength * waistHandleFactor), waistBottom],
+      [waistBottom, control(waistBottom, along, rightLength * waistHandleFactor), control(bBottom, bBottomTangent, -targetTangentLength), bBottom],
+    ],
+  };
+}
+
+const mixPoint = (a, b, t) => ({ x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t) });
+
+function splitCurve([a, b, c, d], t) {
+  const ab = mixPoint(a, b, t);
+  const bc = mixPoint(b, c, t);
+  const cd = mixPoint(c, d, t);
+  const abc = mixPoint(ab, bc, t);
+  const bcd = mixPoint(bc, cd, t);
+  const middle = mixPoint(abc, bcd, t);
+  return [[a, ab, abc, middle], [middle, bcd, cd, d]];
+}
+
+function curveTime(curve, distance, metrics) {
+  const positions = curve.map((point) => (
+    (point.x - metrics.start.x) * metrics.ux + (point.y - metrics.start.y) * metrics.uy
+  ));
+  if (distance <= positions[0]) return 0;
+  if (distance >= positions[3]) return 1;
+  let low = 0;
+  let high = 1;
+  for (let i = 0; i < 18; i += 1) {
+    const t = (low + high) / 2;
+    const u = 1 - t;
+    const x = u ** 3 * positions[0] + 3 * u * u * t * positions[1]
+      + 3 * u * t * t * positions[2] + t ** 3 * positions[3];
+    if (x < distance) low = t;
+    else high = t;
+  }
+  return (low + high) / 2;
+}
+
+function sliceCurves(curves, start, end, metrics) {
+  if (start === 0 && end === 1) return curves;
+  const length = Math.hypot(metrics.end.x - metrics.start.x, metrics.end.y - metrics.start.y);
+  return curves.flatMap((curve) => {
+    const a = curveTime(curve, start * length, metrics);
+    const b = curveTime(curve, end * length, metrics);
+    if (b <= a) return [];
+    const left = b === 1 ? curve : splitCurve(curve, b)[0];
+    return [a === 0 ? left : splitCurve(left, a / b)[1]];
+  });
+}
+
+// Keep the original stem outline at rupture. Its two exact Bézier sections
+// retreat from the click, with rounded ends rolling into the endpoint lobes.
+export function traceBridgeSection(path, outline, start = 0, end = 1, roundStart = 0, roundEnd = 0) {
+  if (!outline || end - start < 0.0001) return false;
+  const { metrics } = outline;
+  const top = sliceCurves(outline.top, start, end, metrics);
+  const bottom = sliceCurves(outline.bottom, start, end, metrics);
+  if (!top.length || !bottom.length) return false;
+  const drawCurve = ([, b, c, d]) => path.bezierCurveTo(b.x, b.y, c.x, c.y, d.x, d.y);
+  const cap = (a, b, round, direction) => {
+    const reach = Math.hypot(a.x - b.x, a.y - b.y) * 0.55 * round * direction;
+    if (!round) path.lineTo(b.x, b.y);
+    else path.bezierCurveTo(a.x + metrics.ux * reach, a.y + metrics.uy * reach,
+      b.x + metrics.ux * reach, b.y + metrics.uy * reach, b.x, b.y);
+  };
+  path.moveTo(top[0][0].x, top[0][0].y);
+  top.forEach(drawCurve);
+  cap(top.at(-1)[3], bottom.at(-1)[3], roundEnd, 1);
+  [...bottom].reverse().forEach((curve) => drawCurve([...curve].reverse()));
+  cap(bottom[0][0], top[0][0], roundStart, -1);
   path.closePath();
   return true;
+}
+
+export function traceFluidBridge(path, a, b, settings, angleLimits) {
+  return traceBridgeSection(path, bridgeOutline(a, b, settings, angleLimits));
 }
