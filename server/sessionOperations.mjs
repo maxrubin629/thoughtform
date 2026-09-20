@@ -38,6 +38,10 @@ const PROPOSABLE_TYPES = new Set([
   "delete_bubble",
   "delete_connection",
 ]);
+const BATCH_TYPES = new Set([
+  ...PROPOSABLE_TYPES, "set_central_idea", "move_bubble", "bulk_delete_bubbles",
+  "set_node_pinned", "set_node_parked",
+]);
 
 export class SessionOperationError extends Error {
   constructor(message, { code = "invalid_operation", status = 400, retryable = false, details } = {}) {
@@ -514,9 +518,56 @@ function mutateGraph(session, operation, context) {
   const affected = [];
   const warnings = [];
 
+  if (type === "apply_map_batch") {
+    if (!Array.isArray(operation.operations) || !operation.operations.length || operation.operations.length > 32) {
+      throw new SessionOperationError("A map batch requires one to 32 graph operations.", { code: "invalid_map_batch" });
+    }
+    let changed = false;
+    const steps = [];
+    for (const child of operation.operations) {
+      if (!child || typeof child !== "object" || !BATCH_TYPES.has(canonicalType(child.type))) {
+        throw new SessionOperationError("Map batches may contain only graph changes.", { code: "invalid_map_batch" });
+      }
+      const nested = { ...child, actor, origin: originOf(operation) };
+      const realtimeItemId = nested.realtime_item_id ?? nested.source?.realtime_item_id;
+      if (realtimeItemId && !session.transcript.some((utterance) => utterance.realtime_item_id === realtimeItemId)) {
+        throw new TranscriptPendingError(realtimeItemId);
+      }
+      const result = mutateGraph(session, nested, context);
+      changed ||= result.changed;
+      affected.push(...result.affected);
+      warnings.push(...result.warnings);
+      steps.push({
+        type: result.effective_type ?? canonicalType(child.type),
+        affected_ids: [...new Set(result.affected)],
+        ...operationProvenance(session, nested),
+      });
+    }
+    return { changed, affected, warnings, steps, effective_type: type };
+  }
+
+  if (type === "set_node_pinned" || type === "set_node_parked") {
+    const id = resolveNodeReference(session, nodeRef(operation), selection);
+    const node = session.nodes.find((candidate) => candidate.id === id);
+    const field = type === "set_node_pinned" ? "pinned" : "parked";
+    if (typeof operation[field] !== "boolean") {
+      throw new SessionOperationError(`${field} must be a boolean.`, { code: `invalid_${field}` });
+    }
+    const changed = Boolean(node[field]) !== operation[field];
+    if (changed) {
+      node[field] = operation[field];
+      node.updated_at = timestamp;
+    }
+    affected.push(id);
+    return { changed, affected, warnings, effective_type: type };
+  }
+
   if (type === "create_bubble") {
     const text = textField(operation.text ?? operation.idea_text ?? operation.label, "text");
-    const existing = session.nodes.find((node) => node.text.trim().toLocaleLowerCase() === text.toLocaleLowerCase());
+    // An explicit manual creation is a new object, even while its label is a placeholder.
+    // Transcript mapping and proposals still reuse matching semantic ideas.
+    const createDistinct = actor === "you" && !context.fromProposal && operation.create_distinct === true;
+    const existing = !createDistinct && session.nodes.find((node) => node.text.trim().toLocaleLowerCase() === text.toLocaleLowerCase());
     if (existing) {
       if (context.fromProposal) {
         throw new SessionOperationError("A bubble with the same idea already exists.", {
@@ -619,7 +670,7 @@ function mutateGraph(session, operation, context) {
       const id = resolveNodeReference(session, reference, selection);
       central = session.nodes.find((node) => node.id === id);
       sourceAdded = appendSources(central, exactSources(session, operation));
-      if (previousRoot && previousRoot.id !== central.id) {
+      if (previousRoot && previousRoot.id !== central.id && !previousRoot.pinned && !central.pinned) {
         const priorPosition = { x: previousRoot.x, y: previousRoot.y };
         previousRoot.x = central.x;
         previousRoot.y = central.y;
@@ -633,7 +684,7 @@ function mutateGraph(session, operation, context) {
       if (existing) {
         central = existing;
         sourceAdded = appendSources(central, sources);
-        if (previousRoot && previousRoot.id !== central.id) {
+        if (previousRoot && previousRoot.id !== central.id && !previousRoot.pinned && !central.pinned) {
           const priorPosition = { x: previousRoot.x, y: previousRoot.y };
           previousRoot.x = central.x;
           previousRoot.y = central.y;
@@ -643,7 +694,7 @@ function mutateGraph(session, operation, context) {
         warnings.push("The matching existing bubble became the central idea instead of creating a duplicate.");
       } else {
         enforceUtteranceBubbleLimit(session, sources);
-        const nodeId = operation.node_id ?? operation.nodeId
+        const nodeId = operation.new_node_id
           ?? allocateId(session, "node", context, context.reservedIds);
         if (!SAFE_ID.test(String(nodeId)) || session.nodes.some(({ id }) => id === nodeId)) {
           throw new SessionOperationError("The central bubble ID is invalid or already exists.", {
@@ -653,7 +704,7 @@ function mutateGraph(session, operation, context) {
           });
         }
         const rootPosition = previousRoot
-          ? { x: previousRoot.x, y: previousRoot.y }
+          ? (previousRoot.pinned ? defaultNodePosition(session, previousRoot) : { x: previousRoot.x, y: previousRoot.y })
           : defaultNodePosition(session, null);
         central = {
           id: nodeId,
@@ -668,7 +719,7 @@ function mutateGraph(session, operation, context) {
         };
         session.nodes.push(central);
         context.reservedIds.add(nodeId);
-        if (previousRoot) {
+        if (previousRoot && !previousRoot.pinned) {
           const supportPosition = defaultNodePosition(session, central);
           previousRoot.x = supportPosition.x;
           previousRoot.y = supportPosition.y;
@@ -1293,6 +1344,11 @@ function acceptProposal(session, operation, context) {
 }
 
 function operationResultRecord({ operationId, type, actor, operation, timestamp, baseRevision, session, affected, warnings, undoable, change, history }) {
+  const label = typeof operation.label === "string" && operation.label.trim()
+    ? operation.label.trim()
+    : (type === "set_node_pinned"
+      ? (operation.pinned ? "Pinned a bubble" : "Unpinned a bubble")
+      : (type === "set_node_parked" ? (operation.parked ? "Kept a thought aside" : "Returned a thought to focus") : null));
   const record = {
     id: operationId,
     type,
@@ -1305,6 +1361,7 @@ function operationResultRecord({ operationId, type, actor, operation, timestamp,
     affected_ids: [...new Set(affected)],
     warnings: [...warnings],
     undoable,
+    ...(label ? { label } : {}),
     ...(change ? { change } : {}),
     ...operationProvenance(session, operation),
   };
@@ -1475,6 +1532,15 @@ export function applyOperation(sessionInput, operationInput, options = {}) {
     change,
     history,
   });
+  if (outcome.steps) {
+    const record = session.operations.at(-1);
+    record.steps = outcome.steps;
+    const sources = new Set([
+      ...(record.source_utterance_ids ?? []),
+      ...outcome.steps.flatMap((step) => step.source_utterance_ids ?? []),
+    ]);
+    if (sources.size) record.source_utterance_ids = [...sources];
+  }
   return finalizeResult(session, operationId, outcome.affected, outcome.warnings, extra);
 }
 

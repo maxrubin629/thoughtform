@@ -67,6 +67,7 @@ function operationWithResolvedEvidence(operation, temporary, assignedNodeId) {
     ...(operation.to ? { to: operationReference(operation.to, temporary) } : {}),
     ...(operation.parent ? { parent: operationReference(operation.parent, temporary) } : {}),
     ...(assignedNodeId && operation.type !== "set_central_idea" ? { node_id: assignedNodeId } : {}),
+    ...(assignedNodeId && operation.type === "set_central_idea" ? { new_node_id: assignedNodeId } : {}),
   };
   if (operation.evidence?.length) resolved.sources = operation.evidence;
   return resolved;
@@ -102,9 +103,17 @@ function applyControllerDecision(current, decision, {
   now,
   allowedUtteranceIds,
 }) {
+  if (current.preferences?.mapping_paused) return current;
   if (current.revision !== baseRevision) throw new MapControllerRevisionConflict(baseRevision, current.revision);
   if (current.map_controller.processed_transcript_count !== start) {
     throw new MapControllerRevisionConflict(baseRevision, current.revision);
+  }
+  const parked = new Set(current.nodes.filter((node) => node.parked).map((node) => node.id));
+  const operations = [...decision.operations, ...(decision.proposal?.operations ?? [])];
+  if (operations.some((operation) => (
+    [operation.node_id, operation.from, operation.to, operation.parent].some((id) => parked.has(id))
+  ))) {
+    throw new MapControllerError("Parked thoughts are kept aside and cannot be changed by automatic mapping.", { code: "invalid_output" });
   }
   assertEvidenceWithinWatermark(decision, allowedUtteranceIds);
   let next = structuredClone(current);
@@ -113,29 +122,25 @@ function applyControllerDecision(current, decision, {
   const reducerId = (kind) => `${safePart(runId)}-${safePart(kind)}-${++serial}`;
   const allocateNodeId = () => reducerId("node");
   const direct = assignTemporaryNodes(decision.operations, temporary, allocateNodeId);
-  const preparedDirect = direct.map(({ operation, assignedNodeId }) => ({
-    operation: operationWithResolvedEvidence(operation, temporary, assignedNodeId),
-    assignedNodeId,
-  }));
+  const preparedDirect = direct.map(({ operation, assignedNodeId }) => (
+    operationWithResolvedEvidence(operation, temporary, assignedNodeId)
+  ));
 
-  for (const [index, prepared] of preparedDirect.entries()) {
-    const { operation, assignedNodeId } = prepared;
-    let assignedNodeReturned = false;
-    const operationIdFactory = (kind) => {
-      if (kind === "node" && assignedNodeId && !assignedNodeReturned) {
-        assignedNodeReturned = true;
-        return assignedNodeId;
-      }
-      return reducerId(kind);
-    };
+  if (preparedDirect.length) {
     const result = applyOperation(next, {
-      ...operation,
+      type: "apply_map_batch",
+      label: "Organized a thought",
+      operations: preparedDirect,
       actor: "partner",
       origin: "map_controller",
-      call_id: `map-controller-${safePart(runId)}-direct-${index + 1}`,
+      call_id: `map-controller-${safePart(runId)}-direct`,
       expected_revision: next.revision,
-    }, { now, idFactory: operationIdFactory });
+    }, { now, idFactory: reducerId });
     next = result.session;
+  }
+  if (current.nodes.some((node) => node.parked
+    && JSON.stringify(node) !== JSON.stringify(next.nodes.find(({ id }) => id === node.id)))) {
+    throw new MapControllerError("Automatic mapping must preserve thoughts that the user kept aside, including the previous central idea.", { code: "invalid_output" });
   }
 
   if (decision.proposal) {
@@ -201,7 +206,7 @@ export function createMapController({
     const openaiClient = await api();
     let response = await openaiClient.responses.create({
       model,
-      reasoning: { effort: "low" },
+      reasoning: { effort: "medium" },
       instructions: MAP_CONTROLLER_SYSTEM,
       input: developerEvidenceInput(envelope, repairMessage),
       ...(searchBudget.remaining > 0 ? { tools: [SEARCH_TRANSCRIPT_TOOL] } : {}),
@@ -230,7 +235,7 @@ export function createMapController({
       const output = JSON.stringify({ matches: searchTranscript(searchableTranscript, query) });
       response = await openaiClient.responses.create({
         model,
-        reasoning: { effort: "low" },
+        reasoning: { effort: "medium" },
         instructions: MAP_CONTROLLER_SYSTEM,
         previous_response_id: response.id,
         input: [{ type: "function_call_output", call_id: call.call_id, output }],
@@ -246,6 +251,9 @@ export function createMapController({
     async run(sessionId, { watermark: requestedWatermark, signal } = {}) {
       if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
       const opening = await loadSnapshot(sessionId);
+      if (opening.preferences?.mapping_paused) {
+        return { decision: "no_change", skipped: true, paused: true, revision: opening.revision };
+      }
       const start = opening.map_controller.processed_transcript_count;
       const watermark = Math.min(
         requestedWatermark ?? opening.transcript.length,
@@ -263,6 +271,9 @@ export function createMapController({
       while (true) {
         if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
         const snapshot = await loadSnapshot(sessionId);
+        if (snapshot.preferences?.mapping_paused) {
+          return { decision: "no_change", skipped: true, paused: true, revision: snapshot.revision };
+        }
         if (snapshot.map_controller.processed_transcript_count >= watermark) {
           return { decision: "no_change", skipped: true, watermark, revision: snapshot.revision };
         }
@@ -288,6 +299,9 @@ export function createMapController({
             };
           });
           const persisted = outcome?.session ?? outcome;
+          if (persisted.preferences?.mapping_paused) {
+            return { decision: "no_change", skipped: true, paused: true, revision: persisted.revision, session: persisted };
+          }
           return {
             decision: decision.decision,
             run_id: runId,

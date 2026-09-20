@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { open, mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
+import { defaultLiveCapture, validateLiveStorage } from "./liveState.mjs";
 
-export const SESSION_SCHEMA_VERSION = 2;
+export const SESSION_SCHEMA_VERSION = 3;
 export const UNTITLED_SESSION_TITLE = "Untitled map";
 
 const SESSION_KEYS = new Set([
@@ -21,6 +22,8 @@ const SESSION_KEYS = new Set([
   "map_controller",
 ]);
 const V1_SESSION_KEYS = new Set([...SESSION_KEYS].filter((key) => key !== "map_controller"));
+const V2_SESSION_KEYS = new Set(SESSION_KEYS);
+const SESSION_EXTENSION_KEYS = new Set(["preferences", "synthesis", "transcript_fragments", "live_capture"]);
 const INDEX_KEYS = new Set(["schema_version", "active_session_id"]);
 const MAP_CONTROLLER_KEYS = new Set([
   "processed_transcript_count",
@@ -191,13 +194,13 @@ function migrateOperationRecord(operation) {
 export function migrateSession(session) {
   assertObject(session, "session");
   if (session.schema_version === SESSION_SCHEMA_VERSION) return { session, migrated: false };
-  if (session.schema_version !== 1) {
+  if (session.schema_version !== 1 && session.schema_version !== 2) {
     throw new SessionSchemaError(
       `Unsupported session schema version ${String(session.schema_version)}; expected ${SESSION_SCHEMA_VERSION}.`,
       { found: session.schema_version, supported: SESSION_SCHEMA_VERSION },
     );
   }
-  validateLegacyKeys(session, V1_SESSION_KEYS, "session", 1);
+  validateLegacyKeys(session, session.schema_version === 1 ? V1_SESSION_KEYS : V2_SESSION_KEYS, "session", session.schema_version);
   if (!Array.isArray(session.transcript)) schemaError("session.transcript", "must be an array");
   if (!Array.isArray(session.operations)) schemaError("session.operations", "must be an array");
   return {
@@ -206,7 +209,11 @@ export function migrateSession(session) {
       ...session,
       schema_version: SESSION_SCHEMA_VERSION,
       operations: session.operations.map(migrateOperationRecord),
-      map_controller: defaultMapController(session.transcript.length),
+      map_controller: session.map_controller ?? defaultMapController(session.transcript.length),
+      preferences: { mapping_paused: false, partner_mode: "proactive" },
+      synthesis: null,
+      transcript_fragments: [],
+      live_capture: defaultLiveCapture(),
     },
   };
 }
@@ -214,7 +221,7 @@ export function migrateSession(session) {
 function migrateIndex(index) {
   assertObject(index, "session index");
   if (index.schema_version === SESSION_SCHEMA_VERSION) return { index, migrated: false };
-  if (index.schema_version !== 1) {
+  if (index.schema_version !== 1 && index.schema_version !== 2) {
     throw new SessionSchemaError("Unsupported session index schema version.", {
       found: index.schema_version,
       supported: SESSION_SCHEMA_VERSION,
@@ -282,7 +289,7 @@ export function validateSession(session) {
     );
   }
   for (const key of Object.keys(session)) {
-    if (!SESSION_KEYS.has(key)) schemaError(`session.${key}`, `is not part of schema version ${SESSION_SCHEMA_VERSION}`);
+    if (!SESSION_KEYS.has(key) && !SESSION_EXTENSION_KEYS.has(key)) schemaError(`session.${key}`, `is not part of schema version ${SESSION_SCHEMA_VERSION}`);
   }
   for (const key of SESSION_KEYS) {
     if (!(key in session)) schemaError(`session.${key}`, "is required");
@@ -294,6 +301,20 @@ export function validateSession(session) {
   assertTimestamp(session.created_at, "session.created_at");
   assertTimestamp(session.updated_at, "session.updated_at");
   assertInteger(session.history_cursor, "session.history_cursor");
+  if (session.preferences !== undefined) {
+    assertObject(session.preferences, "session.preferences");
+    if (typeof session.preferences.mapping_paused !== "boolean") schemaError("session.preferences.mapping_paused", "must be a boolean");
+    if (!["quiet", "proactive"].includes(session.preferences.partner_mode)) schemaError("session.preferences.partner_mode", "must be quiet or proactive");
+    if (Object.keys(session.preferences).some((key) => !["mapping_paused", "partner_mode"].includes(key))) schemaError("session.preferences", "contains an unknown preference");
+  }
+  if (session.synthesis !== undefined && session.synthesis !== null) {
+    assertObject(session.synthesis, "session.synthesis");
+    assertString(session.synthesis.text, "session.synthesis.text", { nonempty: true });
+    assertInteger(session.synthesis.revision, "session.synthesis.revision");
+    if (session.synthesis.revision > session.revision) schemaError("session.synthesis.revision", "must reference an existing map revision");
+    assertTimestamp(session.synthesis.created_at, "session.synthesis.created_at");
+  }
+  try { validateLiveStorage(session); } catch (error) { schemaError("session.live_capture", error.message); }
 
   if (!Array.isArray(session.transcript)) schemaError("session.transcript", "must be an array");
   const utterances = new Map();
@@ -330,6 +351,9 @@ export function validateSession(session) {
     assertNumber(node.x, `${pathname}.x`);
     assertNumber(node.y, `${pathname}.y`);
     if (node.heat_at !== undefined) assertTimestamp(node.heat_at, `${pathname}.heat_at`);
+    for (const flag of ["pinned", "parked"]) {
+      if (node[flag] !== undefined && typeof node[flag] !== "boolean") schemaError(`${pathname}.${flag}`, "must be a boolean");
+    }
     if (!Array.isArray(node.sources)) schemaError(`${pathname}.sources`, "must be an array");
     node.sources.forEach((source, sourceIndex) => (
       validateSource(source, `${pathname}.sources[${sourceIndex}]`, utterances)
@@ -520,7 +544,12 @@ export class SessionStore {
     if (!raw) return null;
     const migrated = migrateSession(raw);
     validateSession(migrated.session);
-    if (migrated.migrated) await atomicWriteJson(filename, migrated.session);
+    if (migrated.migrated) {
+      // A migrated map can always be recovered with the earlier app version.
+      const backup = `${filename}.v${raw.schema_version}.backup`;
+      if (await readJson(backup) === null) await atomicWriteJson(backup, raw);
+      await atomicWriteJson(filename, migrated.session);
+    }
     return migrated.session;
   }
 
@@ -635,6 +664,10 @@ export class SessionStore {
       operations: [],
       history_cursor: 0,
       map_controller: defaultMapController(),
+      preferences: { mapping_paused: false, partner_mode: "proactive" },
+      synthesis: null,
+      transcript_fragments: [],
+      live_capture: defaultLiveCapture(),
     };
     validateSession(session);
     await atomicWriteJson(this.#sessionPath(sessionId), session);

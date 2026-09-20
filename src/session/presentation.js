@@ -68,6 +68,8 @@ export function visualizeSession(
       createdAt: previous?.createdAt ?? (animateNew ? now : now - 2_000),
       updatedAt: node.updated_at,
       ghost: false,
+      pinned: Boolean(node.pinned),
+      parked: Boolean(node.parked),
     };
     return visualNode;
   });
@@ -239,6 +241,9 @@ export function actorLabel(actor) {
 }
 
 const MODEL_ACTION_LABELS = {
+  apply_map_batch: "Organized a thought",
+  set_node_pinned: "Updated a bubble’s position lock",
+  set_node_parked: "Updated a thought’s focus",
   create_bubble: "Created a bubble",
   set_central_idea: "Changed the central idea",
   edit_bubble: "Edited a bubble",
@@ -262,6 +267,9 @@ export function modelActionLabel(operation) {
 
 export function mapControllerPresentation(controller, { activeVisible = false } = {}) {
   if (!controller) return null;
+  if (controller.status === "paused" || controller.paused) {
+    return { kind: "paused", label: "Mapping paused" };
+  }
   if (controller.status === "error") {
     return { kind: "error", label: "Map organization paused" };
   }
@@ -399,7 +407,8 @@ export function buildConversationTimeline(transcript = [], operations = []) {
 
 export function activityLabel(record) {
   if (record.label) return record.label;
-  const type = operationType(record).replaceAll?.("_", " ") ?? "Updated the map";
+  if (MODEL_ACTION_LABELS[operationType(record)]) return MODEL_ACTION_LABELS[operationType(record)];
+  const type = operationType(record)?.replaceAll?.("_", " ") ?? "Updated the map";
   return type.charAt(0).toUpperCase() + type.slice(1);
 }
 

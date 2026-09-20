@@ -8,6 +8,9 @@ import {
   searchTranscript,
 } from "../server/mapController.mjs";
 
+import { SESSION_SCHEMA_VERSION } from "../server/sessionStore.mjs";
+import { applyOperation } from "../server/sessionOperations.mjs";
+
 const stamp = "2026-07-21T12:00:00.000Z";
 
 function utterance(index, speaker = "you", text = `thought ${index}`) {
@@ -22,7 +25,7 @@ function utterance(index, speaker = "you", text = `thought ${index}`) {
 
 function session(overrides = {}) {
   return {
-    schema_version: 2,
+    schema_version: SESSION_SCHEMA_VERSION,
     id: "session-1",
     title: "Untitled map",
     revision: 0,
@@ -78,7 +81,7 @@ function requestEnvelope(request) {
 
 const noChange = { decision: "no_change", operations: [], proposal: null };
 
-test("builds a bounded untrusted-evidence envelope with the Sol defaults", async () => {
+test("builds a bounded untrusted-evidence envelope with the Terra defaults", async () => {
   const transcript = Array.from({ length: 13 }, (_, index) => utterance(index));
   const initial = session({
     revision: 7,
@@ -111,9 +114,9 @@ test("builds a bounded untrusted-evidence envelope with the Sol defaults", async
 
   await controller.run("session-1", { watermark: 13 });
 
-  assert.equal(controller.model, "gpt-5.6-sol");
-  assert.equal(request.model, "gpt-5.6-sol");
-  assert.deepEqual(request.reasoning, { effort: "low" });
+  assert.equal(controller.model, "gpt-5.6-terra");
+  assert.equal(request.model, "gpt-5.6-terra");
+  assert.deepEqual(request.reasoning, { effort: "medium" });
   assert.equal(request.instructions, MAP_CONTROLLER_SYSTEM);
   assert.equal(request.text.format.strict, true);
   assert.equal(request.text.format.schema, MAP_CONTROLLER_OUTPUT_SCHEMA);
@@ -880,6 +883,7 @@ test("notification during transient backoff preserves retry range and queues a l
     queued: true,
     retry_attempt: 1,
     watermark: 1,
+    paused: false,
   });
 
   await timers.fire(retryTimer.id);
@@ -934,4 +938,170 @@ test("scheduler backoff persists failure without advancing the real controller c
   scheduler.cancel("session-1");
   assert.equal(scheduler.state("session-1").scheduled, false);
   scheduler.dispose();
+});
+
+test("one controller interpretation undoes as a whole while preserving transcript", async () => {
+  const store = storeHarness(session({ transcript: [utterance(0, "you", "Voice maps need source spans.")] }));
+  const controller = createMapController({
+    client: { responses: { create: async () => jsonResponse({
+      decision: "apply",
+      operations: [
+        { type: "create_bubble", temp_id: "root", text: "Voice maps", evidence: [{ utterance_id: "u-0", quote: "Voice maps" }] },
+        { type: "create_bubble", temp_id: "detail", parent: "root", text: "Source spans", evidence: [{ utterance_id: "u-0", quote: "source spans" }] },
+      ],
+      proposal: null,
+    }) } },
+    loadSnapshot: store.loadSnapshot,
+    transact: store.transact,
+  });
+  await controller.run("session-1");
+  assert.equal(store.current.history_cursor, 1);
+  assert.equal(store.current.operations.length, 1);
+  assert.equal(store.current.operations[0].type, "apply_map_batch");
+  assert.deepEqual(store.current.operations[0].source_utterance_ids, ["u-0"]);
+  const undone = applyOperation(store.current, { type: "undo_map_change" }).session;
+  assert.equal(undone.nodes.length, 0);
+  assert.equal(undone.edges.length, 0);
+  assert.deepEqual(undone.transcript, store.current.transcript);
+  assert.equal(undone.map_controller.processed_transcript_count, 1);
+});
+
+test("mapping paused before a request spends no API call and retains its cursor", async () => {
+  const store = storeHarness(session({
+    transcript: [utterance(0)],
+    preferences: { mapping_paused: true, partner_mode: "proactive" },
+  }));
+  let called = false;
+  const controller = createMapController({
+    client: { responses: { create: async () => { called = true; return jsonResponse(noChange); } } },
+    loadSnapshot: store.loadSnapshot,
+    transact: store.transact,
+  });
+  const result = await controller.run("session-1");
+  assert.equal(result.paused, true);
+  assert.equal(called, false);
+  assert.equal(store.current.map_controller.processed_transcript_count, 0);
+});
+
+test("pausing during model work blocks late writes and resuming maps the backlog", async () => {
+  const store = storeHarness(session({ transcript: [utterance(0)] }));
+  const started = deferred();
+  const response = deferred();
+  let calls = 0;
+  const controller = createMapController({
+    client: { responses: { create: async () => {
+      calls += 1;
+      if (calls === 1) { started.resolve(); return response.promise; }
+      return jsonResponse(noChange);
+    } } },
+    loadSnapshot: store.loadSnapshot,
+    transact: store.transact,
+  });
+  const running = controller.run("session-1");
+  await started.promise;
+  store.replace({ ...store.current, preferences: { mapping_paused: true, partner_mode: "proactive" } });
+  response.resolve(jsonResponse({
+    decision: "apply", operations: [{ type: "create_bubble", text: "Late thought", evidence: [] }], proposal: null,
+  }));
+  assert.equal((await running).paused, true);
+  assert.equal(store.current.nodes.length, 0);
+  assert.equal(store.current.map_controller.processed_transcript_count, 0);
+  store.replace({ ...store.current, preferences: { mapping_paused: false, partner_mode: "proactive" } });
+  await controller.run("session-1");
+  assert.equal(store.current.map_controller.processed_transcript_count, 1);
+});
+
+test("scheduler cancels active mapping on pause and processes new backlog on resume", async () => {
+  let snapshot = session({ transcript: [utterance(0)] });
+  const timers = fakeTimers();
+  const started = deferred();
+  const watermarks = [];
+  let signal;
+  const scheduler = createMapControllerScheduler({
+    controller: { run: async (_id, options) => {
+      watermarks.push(options.watermark);
+      if (watermarks.length > 1) return { decision: "no_change" };
+      signal = options.signal;
+      started.resolve();
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    } },
+    loadSnapshot: async () => structuredClone(snapshot),
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+  });
+  scheduler.notify("session-1", utterance(0));
+  const firstRun = timers.fire(timers.calls.at(-1).id);
+  await started.promise;
+  snapshot.preferences = { mapping_paused: true, partner_mode: "proactive" };
+  await scheduler.preferencesChanged("session-1");
+  await firstRun;
+  assert.equal(signal.aborted, true);
+  assert.equal(scheduler.state("session-1").paused, true);
+  snapshot.transcript.push(utterance(1));
+  assert.equal(scheduler.notify("session-1", utterance(1)), false);
+  snapshot.preferences.mapping_paused = false;
+  await scheduler.preferencesChanged("session-1");
+  await timers.fire(timers.calls.at(-1).id);
+  assert.deepEqual(watermarks, [1, 2]);
+  scheduler.dispose();
+});
+
+test("parked thoughts reject automatic edits and receive one repair", async () => {
+  const seeded = applyOperation(session({ transcript: [utterance(0)] }), { type: "create_bubble", node_id: "parked", text: "Keep aside" }).session;
+  seeded.nodes[0].parked = true;
+  const store = storeHarness(seeded);
+  let calls = 0;
+  const controller = createMapController({
+    client: { responses: { create: async () => {
+      calls += 1;
+      return jsonResponse(calls === 1 ? {
+        decision: "apply", operations: [{ type: "edit_bubble", node_id: "parked", text: "Changed", evidence: [] }], proposal: null,
+      } : noChange);
+    } } },
+    loadSnapshot: store.loadSnapshot,
+    transact: store.transact,
+  });
+  await controller.run("session-1");
+  assert.equal(calls, 2);
+  assert.equal(store.current.nodes[0].text, "Keep aside");
+});
+
+test("foreground command ownership is attached to exact utterances without hiding mixed substantive content", async () => {
+  const transcript = [
+    utterance(0, "you", "An earlier idea."),
+    utterance(1, "you", "Rename this bubble to Voice capture. Long pauses help me think."),
+    utterance(2, "you", "The app needs a rename feature."),
+    utterance(3, "you", "Connect these two bubbles."),
+  ];
+  const store = storeHarness(session({
+    transcript,
+    map_controller: { processed_transcript_count: 1, last_run_id: null, last_success_at: null, last_error: null },
+    operations: [
+      { id: "old-foreground", type: "edit_bubble", actor: "partner", origin: "realtime", created_at: stamp, source_utterance_ids: ["u-0"] },
+      { id: "rename-foreground", type: "edit_bubble", actor: "partner", origin: "realtime", created_at: stamp, source_utterance_ids: ["u-1"] },
+      { id: "connect-foreground", type: "connect_bubbles", actor: "partner", origin: "realtime", created_at: stamp, source_realtime_item_id: "rt-3" },
+      { id: "mapping-record", type: "apply_map_batch", actor: "partner", origin: "map_controller", created_at: stamp, source_utterance_ids: ["u-2"] },
+    ],
+  }));
+  let request;
+  const controller = createMapController({
+    client: { responses: { create: async (payload) => { request = payload; return jsonResponse(noChange); } } },
+    loadSnapshot: store.loadSnapshot,
+    transact: store.transact,
+  });
+  await controller.run("session-1");
+  const envelope = requestEnvelope(request);
+  assert.deepEqual(envelope.transcript_delta.map(({ id, foreground_operation_ids }) => ({ id, foreground_operation_ids })), [
+    { id: "u-1", foreground_operation_ids: ["rename-foreground"] },
+    { id: "u-2", foreground_operation_ids: [] },
+    { id: "u-3", foreground_operation_ids: ["connect-foreground"] },
+  ]);
+  assert.equal(envelope.transcript_delta[0].text, transcript[1].text, "mixed content remains available for exact source spans");
+  assert.equal(envelope.transcript_delta[1].text, "The app needs a rename feature.", "substantive mention of a control is not classified as a command");
+  assert.deepEqual(envelope.relevant_realtime_operations.map(({ id }) => id), ["rename-foreground", "connect-foreground"]);
+  assert.match(request.instructions, /Application-control requests belong exclusively to the foreground Partner/);
+  assert.match(request.instructions, /even when the foreground operation has not appeared yet/);
+  assert.match(request.instructions, /A delta containing only application controls requires no_change/);
+  assert.match(request.instructions, /citing its exact substantive source span/);
+  assert.equal(store.current.map_controller.processed_transcript_count, 4);
 });

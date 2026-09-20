@@ -1,14 +1,17 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { App } from "./App.jsx";
 import { CanonicalSessionApp } from "./CanonicalSessionApp.jsx";
 import "./styles.css";
 
-const mode = new URLSearchParams(window.location.search).get("mode");
-const classicMode = mode === "classic";
+// Keep old bookmarks working while presenting a single workspace.
+const url = new URL(window.location.href);
+if (url.searchParams.has("mode")) {
+  url.searchParams.delete("mode");
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    {classicMode ? <App /> : <CanonicalSessionApp />}
+    <CanonicalSessionApp />
   </React.StrictMode>,
 );
