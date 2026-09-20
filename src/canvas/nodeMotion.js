@@ -1,5 +1,5 @@
 import { clamp } from "./geometry.js";
-import { easeOutBack } from "./easing.js";
+import { easeOutBack, smootherstep } from "./easing.js";
 import { CREATE_DURATION, WOBBLE_DURATION, DEFAULT_MATERIAL_SETTINGS } from "./materialSettings.js";
 
 function nodeVisualState(node, now, reducedMotion) {
@@ -7,7 +7,9 @@ function nodeVisualState(node, now, reducedMotion) {
   let scale = 1;
   let scaleX = 1;
   let scaleY = 1;
-  let rotation = 0;
+  let strainX = 0;
+  let strainY = 0;
+  let shear = 0;
   let offsetX = 0;
   let offsetY = 0;
 
@@ -26,31 +28,29 @@ function nodeVisualState(node, now, reducedMotion) {
   }
 
   const wobblePulses = node.wobblePulses ?? [];
-  let strongestWobble = 0;
   wobblePulses.forEach((pulse) => {
     const wobbleProgress = (now - pulse.startAt) / WOBBLE_DURATION;
     if (wobbleProgress >= 0 && wobbleProgress < 1) {
       const t = clamp(wobbleProgress, 0, 1);
-      const envelope = (1 - t) ** 2.45;
+      const attack = smootherstep(t / 0.075);
+      const envelope = attack * (1 - t) ** 3;
       const amplitude = pulse.amplitude ?? 0.1;
-      const impactCompression = -Math.exp(-10 * t) * amplitude * 0.48;
-      const wave = impactCompression + Math.sin(t * Math.PI * 4.4) * amplitude * envelope;
-      scaleX += wave;
-      scaleY -= wave * 0.52;
-      if (Math.abs(wave) >= strongestWobble) {
-        strongestWobble = Math.abs(wave);
-        rotation = Math.atan2(pulse.forceY ?? 0, pulse.forceX ?? 1);
-      }
-      const shove = (
-        Math.exp(-8 * t) * 0.62
-        + Math.sin(t * Math.PI * 3.6) * envelope * 0.38
-      ) * node.r * amplitude * (pulse.travel ?? 0.18);
-      offsetX += (pulse.forceX ?? 1) * shove;
-      offsetY += (pulse.forceY ?? 0) * shove;
+      const wave = -Math.cos(t * Math.PI * 2.5) * amplitude * envelope * 0.85;
+      const fx = pulse.forceX ?? 1;
+      const fy = pulse.forceY ?? 0;
+      // Add directional strain, not competing ellipse angles. Overlapping
+      // launch/return/contact pulses then blend without flipping the lobe.
+      strainX += wave * (fx * fx - 0.52 * fy * fy);
+      strainY += wave * (fy * fy - 0.52 * fx * fx);
+      shear += wave * 1.52 * fx * fy;
+      const shove = attack * Math.exp(-6 * t) * (1 - t) ** 2
+        * node.r * amplitude * (pulse.travel ?? 0.18);
+      offsetX += fx * shove;
+      offsetY += fy * shove;
     }
   });
 
-  return { scale: Math.max(0, scale), scaleX, scaleY, rotation, offsetX, offsetY };
+  return { scale: Math.max(0, scale), scaleX, scaleY, strainX, strainY, shear, offsetX, offsetY };
 }
 
 export function buildFluidVisualNodes(nodes, now, reducedMotion = false) {
@@ -58,25 +58,29 @@ export function buildFluidVisualNodes(nodes, now, reducedMotion = false) {
   nodes.forEach((node) => {
     const visual = nodeVisualState(node, now, reducedMotion);
     const speed = Math.hypot(node.vx ?? 0, node.vy ?? 0);
-    const stretch = node.dragging
+    const stretch = reducedMotion || node.dragging
       ? 0
       : clamp(speed * 0.008 * DEFAULT_MATERIAL_SETTINGS.viscosity, 0, 0.14);
     const movementAngle = speed > 0.08 ? Math.atan2(node.vy ?? 0, node.vx ?? 0) : 0;
-    const radiusX = Math.max(
-      0.01,
-      node.r * visual.scale * (1 + stretch) * visual.scaleX,
-    );
-    const radiusY = Math.max(
-      0.01,
-      node.r * visual.scale * (1 - stretch * 0.52) * visual.scaleY,
-    );
+    const cosine = Math.cos(movementAngle);
+    const sine = Math.sin(movementAngle);
+    const xx = visual.scaleX - 1 + (visual.strainX ?? 0)
+      + stretch * (cosine ** 2 - 0.52 * sine ** 2);
+    const yy = visual.scaleY - 1 + (visual.strainY ?? 0)
+      + stretch * (sine ** 2 - 0.52 * cosine ** 2);
+    const xy = (visual.shear ?? 0) + stretch * 1.52 * sine * cosine;
+    const mean = (xx + yy) / 2;
+    const difference = Math.hypot(xx - yy, 2 * xy) / 2;
+    const rotation = difference > 1e-8 ? Math.atan2(2 * xy, xx - yy) / 2 : 0;
+    const radiusX = Math.max(0.01, node.r * visual.scale * (1 + mean + difference));
+    const radiusY = Math.max(0.01, node.r * visual.scale * (1 + mean - difference));
     const shadeVx = node.dragging ? (node.shadeVx ?? 0) : (node.vx ?? 0);
     const shadeVy = node.dragging ? (node.shadeVy ?? 0) : (node.vy ?? 0);
     const shadeSpeed = Math.hypot(shadeVx, shadeVy);
     const anisotropy = Math.abs(radiusX - radiusY) / Math.max(node.r, 1);
     const rawMotionStrength = clamp(shadeSpeed * 0.035 + anisotropy * 3.2, 0, 1);
     const motionStrength = reducedMotion || rawMotionStrength < 0.018 ? 0 : rawMotionStrength;
-    const motionAngle = visual.rotation || (shadeSpeed > 0.01
+    const motionAngle = difference > 1e-8 ? rotation : (shadeSpeed > 0.01
       ? Math.atan2(shadeVy, shadeVx)
       : movementAngle);
     const stretchPolarity = radiusX >= radiusY ? 1 : -1;
@@ -87,7 +91,7 @@ export function buildFluidVisualNodes(nodes, now, reducedMotion = false) {
       radius: Math.max(0.01, Math.min(radiusX, radiusY) * 0.98),
       radiusX,
       radiusY,
-      rotation: visual.rotation || movementAngle,
+      rotation,
       motionShadeX: Math.cos(motionAngle) * stretchPolarity,
       motionShadeY: Math.sin(motionAngle) * stretchPolarity,
       motionShadeStrength: motionStrength,
@@ -107,7 +111,7 @@ export function withWobble(node, forceX = 1, forceY = 0, amplitude = 0.1, option
     travel: options.travel ?? 0.18,
   };
   const existingPulses = options.append && Array.isArray(node.wobblePulses)
-    ? node.wobblePulses
+    ? node.wobblePulses.filter((item) => item.startAt + WOBBLE_DURATION > (options.retainAfter ?? startAt))
     : [];
   const wobblePulses = [...existingPulses, pulse]
     .sort((a, b) => a.startAt - b.startAt);

@@ -5,6 +5,25 @@ export function smoothstep(value) {
   return t * t * (3 - 2 * t);
 }
 
+// Zero velocity and acceleration at both ends of a material transition.
+export function smootherstep(value) {
+  const t = clamp(value, 0, 1);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+export function inverseSmootherstep(value) {
+  const target = clamp(value, 0, 1);
+  if (target === 0 || target === 1) return target;
+  let low = 0;
+  let high = 1;
+  for (let index = 0; index < 24; index += 1) {
+    const middle = (low + high) / 2;
+    if (smootherstep(middle) < target) low = middle;
+    else high = middle;
+  }
+  return (low + high) / 2;
+}
+
 export function lerp(start, end, amount) {
   return start + (end - start) * clamp(amount, 0, 1);
 }

@@ -1,9 +1,9 @@
 // Public material API. Boundary geometry, lobe motion, and rupture each have one owner.
 import { clamp, distanceToSegment, segmentClearance, angleSeparation } from "./canvas/geometry.js";
-import { smoothstep, lerp } from "./canvas/easing.js";
+import { smootherstep, lerp } from "./canvas/easing.js";
 import { linkEnds } from "./canvas/graphLayout.js";
 import { DEFAULT_MATERIAL_SETTINGS, CONNECTION_CREATE_DURATION, CONNECTION_CREATE_CONTACT_PROGRESS } from "./canvas/materialSettings.js";
-import { attachmentAngleLimits, traceFluidBridge } from "./canvas/bridgeGeometry.js";
+import { attachmentAngleLimits, bridgeOutline, traceBridgeSection } from "./canvas/bridgeGeometry.js";
 
 export { clamp } from "./canvas/geometry.js";
 export { DEFAULT_MATERIAL_SETTINGS, PAPER_MATERIAL_SETTINGS, CONNECTION_CREATE_DURATION, CONNECTION_CREATE_CONTACT_PROGRESS, CONNECTION_CREATE_RETURN_DELAY, CONNECTION_POP_DURATION } from "./canvas/materialSettings.js";
@@ -26,7 +26,7 @@ export function findFluidConnectionHit(point, visualNodes, links) {
     const bRadius = b.radius ?? b.r;
     const hitWidth = Math.max(12, Math.min(aRadius, bRadius) * 0.26);
     if (hit.t > 0.14 && hit.t < 0.86 && hit.distance <= hitWidth) {
-      return { link, a, b, hit };
+      return { link, a, b, hit, angleLimits: attachmentAngleLimits(a, b, links, [...nodes.values()]) };
     }
   }
   return null;
@@ -49,6 +49,7 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
     if (!a || !b || a.ghost || b.ghost) return;
     let bridgeTarget = b;
     let bridgeSettings = settings;
+    let headRounding = 0;
     const connectionStart = link.createdAt;
     if (!reducedMotion && connectionStart != null) {
       const elapsedProgress = clamp(
@@ -68,8 +69,9 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
           0,
           1,
         );
-        const travelEase = smoothstep(travelProgress);
-        const fusionEase = smoothstep(fusionProgress);
+        const travelEase = smootherstep(travelProgress);
+        const fusionEase = smootherstep(fusionProgress);
+        headRounding = 1 - fusionEase;
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const distance = Math.max(Math.hypot(dx, dy), 1);
@@ -77,10 +79,10 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
         const uy = dy / distance;
         const smallestRadius = Math.min(a.radius, b.radius);
         const startDistance = a.radius * 0.72;
-        const flightPulse = Math.sin(travelProgress * Math.PI) * 0.045;
-        const contactPulse = Math.sin(fusionProgress * Math.PI) * 0.09;
+        const flightPulse = Math.sin(travelProgress * Math.PI) ** 2 * 0.035;
+        const contactPulse = Math.sin(fusionProgress * Math.PI) ** 2 * 0.055;
         const headRadius = clamp(
-          smallestRadius * (0.04 + travelProgress * 0.015) * (1 + flightPulse),
+          smallestRadius * (0.04 + travelEase * 0.015) * (1 + flightPulse),
           2.8,
           4.8,
         );
@@ -107,7 +109,7 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
           bridgeWidth: clamp(settings.bridgeWidth + flightPulse + contactPulse, 0, 1),
           flare: settings.flare * (
             0.52
-            + travelProgress * 0.22
+            + travelEase * 0.22
             + fusionEase * 0.26
           ),
         };
@@ -115,7 +117,7 @@ export function drawFluidMaterial(ctx, visualNodes, links, options = {}) {
     }
     const path = new Path2D();
     const angleLimits = attachmentAngleLimits(a, b, links, nodes);
-    if (traceFluidBridge(path, a, bridgeTarget, bridgeSettings, angleLimits)) {
+    if (traceBridgeSection(path, bridgeOutline(a, bridgeTarget, bridgeSettings, angleLimits), 0, 1, 0, headRounding)) {
       const gradient = ctx.createLinearGradient(a.x, a.y, bridgeTarget.x, bridgeTarget.y);
       gradient.addColorStop(0, colorForNode(a));
       gradient.addColorStop(1, colorForNode(b));

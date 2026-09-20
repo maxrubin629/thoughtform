@@ -8,6 +8,7 @@ import {
   getConnectionPopImpactTimes,
   withWobble,
 } from "./fluidMaterial.js";
+import { attachmentAngleLimits } from "./canvas/bridgeGeometry.js";
 
 function monotonicNow() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -34,14 +35,14 @@ export function applyConnectionGrowthMotion(nodes, edge, { reducedMotion = false
         dx,
         dy,
         0.064,
-        { startAt: createdAt, travel: 0.14 },
+        { startAt: createdAt, travel: 0.14, append: true, retainAfter: createdAt },
       );
       return withWobble(
         launched,
         -dx,
         -dy,
         0.038,
-        { startAt: sourceReturnAt, travel: 0.11, append: true },
+        { startAt: sourceReturnAt, travel: 0.11, append: true, retainAfter: createdAt },
       );
     }
     if (node.id === target.id) return withWobble(
@@ -49,7 +50,7 @@ export function applyConnectionGrowthMotion(nodes, edge, { reducedMotion = false
       dx,
       dy,
       0.105,
-      { startAt: targetImpactAt, travel: 0.32 },
+      { startAt: targetImpactAt, travel: 0.32, append: true, retainAfter: createdAt },
     );
     return node;
   });
@@ -63,6 +64,7 @@ export function buildConnectionPopTransition(
     reducedMotion = false,
     includePop = true,
     eventId,
+    links = [],
     start = monotonicNow(),
     duration = CONNECTION_POP_DURATION,
   } = {},
@@ -71,6 +73,7 @@ export function buildConnectionPopTransition(
   const target = nodes.find((node) => node.id === edge?.to);
   if (!source || !target) return { nodes, pop: null, impacts: null };
 
+  const angleLimits = motion.angleLimits ?? attachmentAngleLimits(source, target, links, nodes);
   const hitT = clamp(motion.hitT ?? 0.5, 0, 1);
   const impacts = motion.sourceImpactAt != null && motion.targetImpactAt != null
     ? { source: motion.sourceImpactAt, target: motion.targetImpactAt }
@@ -81,6 +84,7 @@ export function buildConnectionPopTransition(
         { ...source, radius: source.radius ?? source.r },
         { ...target, radius: target.radius ?? target.r },
         PAPER_MATERIAL_SETTINGS,
+        angleLimits,
       );
 
   if (reducedMotion) return { nodes, pop: null, impacts };
@@ -95,14 +99,14 @@ export function buildConnectionPopTransition(
       source.x - hitX,
       source.y - hitY,
       sourceAmplitude,
-      { startAt: impacts.source, travel: 0.13 },
+      { startAt: impacts.source, travel: 0.13, append: true, retainAfter: start },
     );
     if (node.id === target.id) return withWobble(
       node,
       target.x - hitX,
       target.y - hitY,
       targetAmplitude,
-      { startAt: impacts.target, travel: 0.13 },
+      { startAt: impacts.target, travel: 0.13, append: true, retainAfter: start },
     );
     return node;
   });
@@ -123,6 +127,7 @@ export function buildConnectionPopTransition(
       a: { ...source, radius: source.radius ?? source.r },
       b: { ...target, radius: target.radius ?? target.r },
       hitT,
+      angleLimits,
       seed,
       start,
       duration,
