@@ -1,0 +1,143 @@
+.toast {
+  position: absolute;
+  z-index: 30;
+  top: 87px;
+  left: 50%;
+  max-width: min(420px, calc(100vw - 190px));
+  padding: 10px 15px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(80, 66, 54, 0.1);
+  border-radius: 999px;
+  color: #4d413a;
+  background: rgba(255, 250, 242, 0.96);
+  box-shadow: 0 9px 24px rgba(71, 57, 44, 0.1);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-align: center;
+  animation: toast-enter 180ms ease-out both;
+}
+
+@keyframes toast-enter {
+  from { opacity: 0; transform: translate(-50%, -6px); }
+}
+
+.nocturne .node-actions .icon-button,
+.nocturne .ghost-badge,
+.nocturne .zoom-controls .icon-button,
+.nocturne .voice-control .icon-button,
+.nocturne .toast {
+  color: #fff1df;
+  background: #16121b;
+  border-color: rgba(255, 241, 223, 0.17);
+}
+
+.nocturne .panel-header {
+  border-color: rgba(255, 241, 223, 0.1);
+}
+
+.nocturne .panel-title-mark {
+  color: #ff9278;
+  background: rgba(225, 100, 77, 0.18);
+}
+
+.nocturne .panel-header span,
+.nocturne .panel-list button svg {
+  color: #ef8068;
+}
+
+.nocturne .panel-description,
+.nocturne .panel-list small,
+.nocturne .profile-card small,
+.nocturne .empty-state,
+.nocturne .map-stats small {
+  color: rgba(255, 241, 223, 0.58);
+}
+
+.nocturne .history-actions .icon-button,
+.nocturne .profile-card,
+.nocturne .search-field,
+.nocturne .map-stats > span {
+  color: #fff1df;
+  border-color: rgba(255, 241, 223, 0.12);
+  background: rgba(30, 24, 36, 0.92);
+}
+
+.nocturne .search-field input {
+  color: #fff1df;
+}
+
+.nocturne .search-field input::placeholder {
+  color: rgba(255, 241, 223, 0.4);
+}
+
+.nocturne .panel-list button:hover,
+.nocturne .panel-list button.is-current {
+  color: #fff1df;
+  border-color: rgba(239, 128, 104, 0.32);
+  background: rgba(225, 100, 77, 0.12);
+}
+
+.nocturne .panel-note,
+.nocturne .segmented-control {
+  color: rgba(255, 241, 223, 0.78);
+  border-color: rgba(255, 241, 223, 0.1);
+  background: rgba(8, 9, 20, 0.58);
+}
+
+.nocturne .segmented-control button {
+  color: rgba(255, 241, 223, 0.58);
+}
+
+.nocturne .segmented-control button.is-active {
+  color: #fff1df;
+  background: rgba(225, 100, 77, 0.2);
+  box-shadow: none;
+}
+
+.nocturne .wide-action {
+  color: #ff9a82;
+  border-color: rgba(239, 128, 104, 0.24);
+  background: rgba(225, 100, 77, 0.1);
+}
+
+@media (max-width: 900px) {
+  .side-rail {
+    padding-inline: 9px;
+  }
+
+  .top-dock {
+    width: 306px;
+  }
+
+  .zoom-controls {
+    right: 13px;
+  }
+}
+
+@media (max-height: 720px) {
+  .side-rail {
+    padding-top: 18px;
+    gap: 10px;
+  }
+
+  .top-dock {
+    top: 10px;
+  }
+
+  .voice-control {
+    bottom: 25px;
+    gap: 10px;
+    transform: translateX(-50%) scale(0.86);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+*::before,
+*::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

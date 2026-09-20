@@ -203,6 +203,10 @@ export function createFluidShaderRenderer(canvas, options = {}) {
     height: 1,
   });
 
+  const uniformLocations = (program, names) => Object.fromEntries(names.map((name) => [
+    name, gl.getUniformLocation(program, `u${name[0].toUpperCase()}${name.slice(1)}`),
+  ]));
+
   const initializeResources = () => {
     deleteResources();
     const blurProgram = createProgram(gl, BLUR_FRAGMENT_SHADER);
@@ -218,47 +222,30 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       softB: createTarget(),
       broadA: createTarget(),
       broadB: createTarget(),
-      blurUniforms: {
-        texture: gl.getUniformLocation(blurProgram, "uTexture"),
-        texel: gl.getUniformLocation(blurProgram, "uTexel"),
-        radius: gl.getUniformLocation(blurProgram, "uRadius"),
-      },
-      materialUniforms: {
-        source: gl.getUniformLocation(materialProgram, "uSource"),
-        soft: gl.getUniformLocation(materialProgram, "uSoft"),
-        broad: gl.getUniformLocation(materialProgram, "uBroad"),
-        motion: gl.getUniformLocation(materialProgram, "uMotion"),
-        resolution: gl.getUniformLocation(materialProgram, "uResolution"),
-        softTexel: gl.getUniformLocation(materialProgram, "uSoftTexel"),
-      },
+      blurUniforms: uniformLocations(blurProgram, ["texture", "texel", "radius"]),
+      materialUniforms: uniformLocations(materialProgram, ["source", "soft", "broad", "motion", "resolution", "softTexel"]),
     };
     gl.bindVertexArray(vertexArray);
     gl.disable(gl.BLEND);
   };
 
-  const allocateTarget = (target, width, height) => {
-    target.width = Math.max(1, width);
-    target.height = Math.max(1, height);
-    gl.bindTexture(gl.TEXTURE_2D, target.texture);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA8,
-      target.width,
-      target.height,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      null,
-    );
+  const allocateTexture = (texture, width, height) => {
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  };
+
+  const uploadTexture = (texture, source) => {
+    if (!source) return allocateTexture(texture, pixelWidth, pixelHeight);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  };
+
+  const allocateTarget = (target, divisor) => {
+    target.width = Math.max(1, Math.ceil(pixelWidth / divisor));
+    target.height = Math.max(1, Math.ceil(pixelHeight / divisor));
+    allocateTexture(target.texture, target.width, target.height);
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
-    gl.framebufferTexture2D(
-      gl.FRAMEBUFFER,
-      gl.COLOR_ATTACHMENT0,
-      gl.TEXTURE_2D,
-      target.texture,
-      0,
-    );
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target.texture, 0);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
       throw new Error("Fluid shader framebuffer is incomplete");
     }
@@ -266,34 +253,9 @@ export function createFluidShaderRenderer(canvas, options = {}) {
 
   const allocateTextures = () => {
     if (!resources) return;
-    gl.bindTexture(gl.TEXTURE_2D, resources.source);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA8,
-      pixelWidth,
-      pixelHeight,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      null,
-    );
-    gl.bindTexture(gl.TEXTURE_2D, resources.motion);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA8,
-      pixelWidth,
-      pixelHeight,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      null,
-    );
-    allocateTarget(resources.softA, Math.ceil(pixelWidth / 2), Math.ceil(pixelHeight / 2));
-    allocateTarget(resources.softB, Math.ceil(pixelWidth / 2), Math.ceil(pixelHeight / 2));
-    allocateTarget(resources.broadA, Math.ceil(pixelWidth / 4), Math.ceil(pixelHeight / 4));
-    allocateTarget(resources.broadB, Math.ceil(pixelWidth / 4), Math.ceil(pixelHeight / 4));
+    for (const texture of [resources.source, resources.motion]) allocateTexture(texture, pixelWidth, pixelHeight);
+    for (const target of [resources.softA, resources.softB]) allocateTarget(target, 2);
+    for (const target of [resources.broadA, resources.broadB]) allocateTarget(target, 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   };
 
@@ -363,38 +325,8 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       sourceCanvas = nextSourceCanvas;
       motionCanvas = nextMotionCanvas;
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.bindTexture(gl.TEXTURE_2D, resources.source);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA8,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        nextSourceCanvas,
-      );
-      gl.bindTexture(gl.TEXTURE_2D, resources.motion);
-      if (nextMotionCanvas) {
-        gl.texImage2D(
-          gl.TEXTURE_2D,
-          0,
-          gl.RGBA8,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          nextMotionCanvas,
-        );
-      } else {
-        gl.texImage2D(
-          gl.TEXTURE_2D,
-          0,
-          gl.RGBA8,
-          pixelWidth,
-          pixelHeight,
-          0,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          null,
-        );
-      }
+      uploadTexture(resources.source, nextSourceCanvas);
+      uploadTexture(resources.motion, nextMotionCanvas);
       updateBlurTextures();
       return true;
     },
@@ -416,14 +348,6 @@ export function createFluidShaderRenderer(canvas, options = {}) {
       gl.uniform2f(materialUniforms.softTexel, 1 / softB.width, 1 / softB.height);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       return true;
-    },
-
-    clear() {
-      if (!renderer.available) return;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.viewport(0, 0, pixelWidth, pixelHeight);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
     },
 
     dispose() {

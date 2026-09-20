@@ -1,34 +1,8 @@
-import { SessionApiError } from "./sessionApi.js";
+import { requestSession, SessionApiError } from "./apiRequest.js";
 
-function path(sessionId, suffix) {
-  if (!sessionId) throw new TypeError("A session ID is required");
-  return `/api/sessions/${encodeURIComponent(sessionId)}${suffix}`;
-}
-
-async function post(sessionId, suffix, body, { signal, keepalive = false } = {}) {
-  let response;
-  try {
-    response = await fetch(path(sessionId, suffix), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
-      keepalive,
-    });
-  } catch (cause) {
-    if (cause?.name === "AbortError") throw cause;
-    throw new SessionApiError("The session server is unavailable", { code: "network_error", cause });
-  }
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new SessionApiError(data?.error?.message ?? data?.error ?? "Live request failed", {
-      status: response.status,
-      code: data?.error?.code ?? data?.code ?? "live_request_failed",
-      details: data,
-    });
-  }
-  return data;
-}
+const post = (sessionId, suffix, body, options) => requestSession(sessionId, suffix, {
+  ...options, method: "POST", body,
+});
 
 export async function negotiateLiveSession(sessionId, sdp, options = {}) {
   if (typeof sdp !== "string" || !sdp.trim()) throw new TypeError("An SDP offer is required");

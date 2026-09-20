@@ -177,22 +177,24 @@ test("a map-controller snapshot reconciles into the same generic Partner action 
 });
 
 test("workspace preserves shared sizing, canvas rendering, and causal motion", () => {
-  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const canvasSource = readFileSync(new URL("./canvas/MindMap.jsx", import.meta.url), "utf8");
   const motionSource = readFileSync(new URL("./connectionVisualMotion.js", import.meta.url), "utf8");
   const sessionMotionSource = readFileSync(new URL("./session/connectionMotion.js", import.meta.url), "utf8");
   const presentationSource = readFileSync(new URL("./session/presentation.js", import.meta.url), "utf8");
-  const sessionSource = readFileSync(new URL("./CanonicalSessionApp.jsx", import.meta.url), "utf8");
+  const sessionSource = readFileSync(new URL("./workspace/Workspace.jsx", import.meta.url), "utf8");
+  const graphSource = readFileSync(new URL("./workspace/useSessionGraph.js", import.meta.url), "utf8");
 
   assert.match(presentationSource, /import \{ radiusForThought, wrapThought \} from "\.\.\/thoughtSizing\.js"/);
-  assert.doesNotMatch(appSource, /function (?:wrapThought|radiusForThought)\(/);
+  assert.doesNotMatch(canvasSource, /function (?:wrapThought|radiusForThought)\(/);
   assert.doesNotMatch(presentationSource, /function (?:wrapThought|radiusForThought)\(/);
-  assert.match(sessionSource, /import \{ IconButton, MindMap, layoutHierarchy \} from "\.\/App\.jsx"/);
+  assert.match(sessionSource, /import \{ MindMap \} from "\.\.\/canvas\/MindMap\.jsx"/);
+  assert.match(graphSource, /import \{ layoutHierarchy \} from "\.\.\/canvas\/graphLayout\.js"/);
   assert.match(sessionMotionSource, /from "\.\.\/connectionVisualMotion\.js"/);
   assert.match(motionSource, /export function applyConnectionGrowthMotion/);
   assert.match(motionSource, /export function buildConnectionPopTransition/);
   assert.doesNotMatch(sessionSource, /updateBubbleRadii/);
-  assert.match(sessionSource, /includeGhosts: true/);
-  assert.match(sessionSource, /withWobble\(released, 1, 0, 0\.082\)/);
+  assert.match(graphSource, /includeGhosts: true/);
+  assert.match(graphSource, /withWobble\(released, 1, 0, 0\.082\)/);
 });
 
 test("create-bubble proposals preserve their parent ghost tether", () => {

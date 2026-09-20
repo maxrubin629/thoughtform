@@ -1,23 +1,11 @@
-import { SessionApiError } from "./sessionApi.js";
+import { requestSession } from "./apiRequest.js";
 
-async function responseOrError(response) {
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new SessionApiError(payload?.error?.message ?? payload?.error ?? "The session could not be saved", { status: response.status, code: payload?.error?.code ?? "request_failed", details: payload });
-  return payload;
-}
-
-export async function updateWorkspacePreferences(sessionId, preferences) {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/preferences`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(preferences),
-  });
-  return responseOrError(response);
+export function updateWorkspacePreferences(sessionId, preferences) {
+  return requestSession(sessionId, "/preferences", { method: "PATCH", body: preferences });
 }
 
 export async function downloadSessionExport(sessionId, format = "markdown") {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/export?format=${encodeURIComponent(format)}`);
-  if (!response.ok) return responseOrError(response);
+  const response = await requestSession(sessionId, `/export?format=${encodeURIComponent(format)}`, { raw: true });
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");

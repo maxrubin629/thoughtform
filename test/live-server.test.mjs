@@ -6,9 +6,10 @@ import path from "node:path";
 import { SessionStore } from "../server/sessionStore.mjs";
 import { applyOperation } from "../server/sessionOperations.mjs";
 import { ensureLiveState } from "../server/liveState.mjs";
-import { buildLiveSessionConfig, forwardLiveSdp, registerLiveRoutes } from "../server/live.mjs";
+import { registerLiveRoutes } from "../server/live.mjs";
+import { buildLiveSessionConfig, forwardLiveSdp } from "../server/liveConnection.mjs";
 
-async function setup(t, responses) {
+async function setup(t, responses, options = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-live-server-"));
   const store = new SessionStore({ directory });
   await store.init();
@@ -30,6 +31,7 @@ async function setup(t, responses) {
   const runtime = registerLiveRoutes({ post: (route, handler) => routes.set(route, handler) }, {
     store, openaiClient: client, jsonRoute: (handler) => handler, performOperation, snapshotFor,
     captureOptions: { debounceMs: 60_000, classify: async ({ fragments }) => fragments.length ? [{ fragment_ids: fragments.filter(({ speaker }) => speaker === "you").map(({ id }) => id) }] : [] },
+    ...options,
   });
   const request = (route, body) => routes.get(`/api/sessions/:id${route}`)({ params: { id: session.id }, body });
   t.after(async () => { runtime.dispose(); await rm(directory, { recursive: true, force: true }); });
@@ -126,4 +128,54 @@ test("A provider failure before map execution retries the same typed request wit
   assert.equal(retry.reply, "Let's examine the uncertain part.");
   assert.equal(calls.length, 2);
   assert.deepEqual((await store.get(id)).transcript.map(({ speaker }) => speaker), ["you", "partner"]);
+});
+
+test("explicit commands rebase once after a concurrent map change", async (t) => {
+  const { request, store, id } = await setup(t, async (_input, count) => {
+    if (count === 1) return { output_text: JSON.stringify({ explicit_map_request: true, request_quote: "Add testing.", reply: "" }) };
+    if (count === 2) {
+      await store.transact(id, (session) => applyOperation(session, { type: "create_bubble", text: "Concurrent idea", expected_revision: 0 }));
+      return { output: [{ type: "function_call", call_id: "create", name: "create_bubble", arguments: JSON.stringify({ text: "Testing", quote: "testing", expected_revision: 0 }) }] };
+    }
+    return { output: [], output_text: "" };
+  });
+  const result = await request("/chat", { text: "Add testing.", request_id: "concurrent" });
+  assert.equal(result.reply, "");
+  assert.equal(result.snapshot.revision, 2);
+  assert.deepEqual(result.snapshot.nodes.map(({ text }) => text), ["Concurrent idea", "Testing"]);
+  assert.equal(result.snapshot.nodes[1].sources[0].quote, "testing");
+});
+
+test("read-only tool dispatch cannot mutate the map and unknown tools return an error", async (t) => {
+  let outputs;
+  const { request } = await setup(t, async (input, count) => {
+    if (count === 1) return { output_text: JSON.stringify({ explicit_map_request: true, request_quote: "Find my earlier idea.", reply: "" }) };
+    if (count === 2) return { output: [
+      { type: "function_call", call_id: "read", name: "get_map", arguments: "{}" },
+      { type: "function_call", call_id: "search", name: "search_transcript", arguments: JSON.stringify({ query: "earlier", utterance_id: null }) },
+      { type: "function_call", call_id: "invalid", name: "constructor", arguments: "{}" },
+    ] };
+    outputs = input.input.filter(({ type }) => type === "function_call_output").map(({ output }) => JSON.parse(output));
+    return { output: [], output_text: "Your earlier idea is in the conversation." };
+  });
+  const result = await request("/chat", { text: "Find my earlier idea.", request_id: "read_only" });
+  assert.equal(outputs[0].ok, true);
+  assert.equal(outputs[1].utterances[0].text, "Find my earlier idea.");
+  assert.equal(outputs[2].error.code, "unknown_live_tool");
+  assert.equal(result.snapshot.revision, 0);
+  assert.deepEqual(result.snapshot.nodes, []);
+});
+
+test("a selection change during reasoning prevents the pending command from executing", async (t) => {
+  let selection = [];
+  const { request, store, id } = await setup(t, async (_input, count) => {
+    if (count === 1) return { output_text: JSON.stringify({ explicit_map_request: true, request_quote: "Rename this idea.", reply: "" }) };
+    selection = [];
+    return { output: [{ type: "function_call", call_id: "edit", name: "edit_bubble", arguments: JSON.stringify({ node_reference: "$selected", text: "Must not replace", expected_revision: 1 }) }] };
+  }, { getUiContext: () => ({ selected_node_ids: selection }) });
+  const created = await store.transact(id, (session) => applyOperation(session, { type: "create_bubble", text: "Original", expected_revision: 0 }));
+  selection = [created.session.nodes[0].id];
+  await request("/chat", { text: "Rename this idea.", request_id: "changed_selection" });
+  assert.equal((await store.get(id)).nodes[0].text, "Original");
+  assert.equal((await store.get(id)).revision, 1);
 });

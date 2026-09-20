@@ -4,7 +4,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createSseEventWriter, createThoughtformServer } from "../server/index.mjs";
+import { startTestServer } from "./helpers/server.mjs";
+import { createThoughtformServer } from "../server/index.mjs";
+import { createSseEventWriter } from "../server/sessionEvents.mjs";
 import { applyOperation } from "../server/sessionOperations.mjs";
 import { createSessionStore } from "../server/sessionStore.mjs";
 
@@ -44,65 +46,23 @@ test("SSE backpressure queues complete controller events and flushes them in ord
 });
 
 test("session HTTP routes share the canonical reducer and revision contract", async (t) => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-http-"));
-  const app = await createThoughtformServer({ store: createSessionStore({ directory }) });
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
-  const address = server.address();
-  const base = `http://127.0.0.1:${address.port}`;
+  const { request } = await startTestServer(t);
 
-  t.after(async () => {
-    app.locals.dispose?.();
-    await new Promise((resolve) => server.close(resolve));
-    await rm(directory, { recursive: true, force: true });
-  });
-
-  const request = async (pathname, { method = "GET", body, headers } = {}) => {
-    const response = await fetch(`${base}${pathname}`, {
-      method,
-      headers: {
-        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-        ...headers,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    return { response, data: await response.json() };
-  };
-
-  const created = await request("/api/sessions", { method: "POST", body: {} });
+  const created = await request("/sessions", { method: "POST", body: {} });
   assert.equal(created.response.status, 200);
   assert.equal(created.data.revision, 0);
   const id = created.data.id;
 
-  const getMap = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: {
-      name: "get_map",
-      call_id: "call-http-get-map",
-      arguments: {},
-    },
-  });
-  assert.equal(getMap.data.ok, true);
+  const getMap = await request(`/sessions/${id}`);
   assert.equal(getMap.data.revision, 0);
-  assert.equal(getMap.data.snapshot.nodes.length, 0);
-  assert.equal(getMap.data.snapshot.history_length, 0);
-  assert.equal(
-    JSON.parse(getMap.data.function_call_output.output).snapshot.revision,
-    0,
-  );
-
-  const removedTool = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: {
-      name: "no_map_change",
-      call_id: "call-http-removed-tool",
-      arguments: { expected_revision: 0 },
-    },
-  });
+  assert.equal(getMap.data.nodes.length, 0);
+  assert.equal(getMap.data.history_length, 0);
+  const operation = (body) => request(`/sessions/${id}/operations`, { method: "POST", body });
+  const removedTool = await operation({ type: "no_map_change", expected_revision: 0 });
   assert.equal(removedTool.response.status, 400);
   assert.equal(removedTool.data.error.code, "unsupported_operation");
 
-  const transcript = await request(`/api/sessions/${id}/operations`, {
+  const transcript = await request(`/sessions/${id}/operations`, {
     method: "POST",
     body: {
       expected_revision: 0,
@@ -118,18 +78,12 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(transcript.data.ok, true);
   assert.equal(transcript.data.revision, 0, "transcript append is not a semantic map revision");
 
-  const toolBody = {
-    name: "create_bubble",
-    call_id: "call-http-1",
-    expected_revision: 0,
-    arguments: {
-      text: "Server owned maps",
-      quote: "Server owned maps",
-      parent_reference: null,
-      expected_revision: 0,
-    },
+  const createBody = {
+    type: "create_bubble", call_id: "call-http-1", expected_revision: 0,
+    actor: "partner", origin: "realtime", text: "Server owned maps",
+    quote: "Server owned maps", parent_reference: null,
   };
-  const createdBubble = await request(`/api/sessions/${id}/tool-calls`, { method: "POST", body: toolBody });
+  const createdBubble = await operation(createBody);
   assert.equal(createdBubble.data.revision, 1);
   assert.equal(createdBubble.data.snapshot.nodes.length, 1);
   assert.equal(createdBubble.data.snapshot.nodes[0].sources[0].quote, "Server owned maps");
@@ -142,65 +96,26 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(sourceUtterance.realtime_item_id, "input-http-1");
   assert.equal(createdBubble.data.snapshot.operations.some((operation) => "change" in operation), false);
   assert.equal(createdBubble.data.snapshot.history_length, 1);
-  assert.equal(createdBubble.data.function_call_output.type, "function_call_output");
-  const modelOutput = JSON.parse(createdBubble.data.function_call_output.output);
-  assert.equal(modelOutput.snapshot.operations, undefined);
-  assert.equal(modelOutput.snapshot.transcript, undefined);
-  assert.equal(modelOutput.snapshot.nodes.length, 1);
-  assert.equal(modelOutput.snapshot.central_node_id, modelOutput.snapshot.nodes[0].id);
-
-  const replay = await request(`/api/sessions/${id}/tool-calls`, { method: "POST", body: toolBody });
+  const replay = await operation(createBody);
   assert.equal(replay.data.replayed, true);
   assert.equal(replay.data.snapshot.nodes.length, 1);
 
   const nodeId = replay.data.snapshot.nodes[0].id;
-  const selected = await request(`/api/sessions/${id}/ui-context`, {
+  const selected = await request(`/sessions/${id}/ui-context`, {
     method: "PATCH",
     body: { selected_node_ids: [nodeId], view_mode: "clusters", voice_mode: "vad" },
   });
   assert.deepEqual(selected.data.ui_context.selected_node_ids, [nodeId]);
   assert.equal(selected.data.snapshot.revision, 1);
 
-  const edited = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: {
-      name: "edit_bubble",
-      call_id: "call-http-2",
-      expected_revision: 1,
-      arguments: {
-        node_reference: "$selected",
-        text: "Canonical server owned maps",
-        transcript_quote: null,
-        realtime_item_id: null,
-        expected_revision: 1,
-      },
-    },
+  const edited = await operation({
+    type: "edit_bubble", call_id: "call-http-2", expected_revision: 1,
+    node_reference: "$selected", text: "Canonical server owned maps",
   });
   assert.equal(edited.data.revision, 2);
   assert.equal(edited.data.snapshot.nodes[0].text, "Canonical server owned maps");
 
-  const staleToolIntent = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: {
-      name: "edit_bubble",
-      call_id: "call-http-stale",
-      expected_revision: 2,
-      arguments: {
-        node_reference: nodeId,
-        text: "Must not overwrite newer state",
-        transcript_quote: null,
-        realtime_item_id: null,
-        expected_revision: 1,
-      },
-    },
-  });
-  assert.equal(staleToolIntent.response.status, 409);
-  assert.equal(staleToolIntent.data.error.code, "revision_conflict");
-  assert.equal(staleToolIntent.data.snapshot.nodes[0].text, "Canonical server owned maps");
-  assert.equal(staleToolIntent.data.function_call_output.type, "function_call_output");
-  assert.equal(JSON.parse(staleToolIntent.data.function_call_output.output).snapshot.revision, 2);
-
-  const stale = await request(`/api/sessions/${id}/operations`, {
+  const stale = await request(`/sessions/${id}/operations`, {
     method: "POST",
     body: {
       expected_revision: 0,
@@ -211,18 +126,11 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(stale.data.error.code, "revision_conflict");
   assert.equal(stale.data.snapshot.revision, 2);
 
-  const listed = await request("/api/sessions");
+  const listed = await request("/sessions");
   assert.equal(listed.data.active_session_id, id);
   assert.equal(listed.data.sessions[0].thought_count, 1);
 
-  const missingCallId = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: { name: "get_map", arguments: {} },
-  });
-  assert.equal(missingCallId.response.status, 400);
-  assert.equal(missingCallId.data.error.code, "missing_call_id");
-
-  const directCuratorMutation = await request(`/api/sessions/${id}/operations`, {
+  const directCuratorMutation = await request(`/sessions/${id}/operations`, {
     method: "POST",
     body: {
       expected_revision: 2,
@@ -233,7 +141,7 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(directCuratorMutation.response.status, 403);
   assert.equal(directCuratorMutation.data.error.code, "curator_proposal_only");
 
-  const child = await request(`/api/sessions/${id}/operations`, {
+  const child = await request(`/sessions/${id}/operations`, {
     method: "POST",
     body: {
       expected_revision: 2,
@@ -242,11 +150,11 @@ test("session HTTP routes share the canonical reducer and revision contract", as
     },
   });
   const childId = child.data.snapshot.nodes.find((node) => node.text === "Temporary child").id;
-  await request(`/api/sessions/${id}/ui-context`, {
+  await request(`/sessions/${id}/ui-context`, {
     method: "PATCH",
     body: { selected_node_ids: [childId], view_mode: "clusters", voice_mode: "vad" },
   });
-  const deletedChild = await request(`/api/sessions/${id}/operations`, {
+  const deletedChild = await request(`/sessions/${id}/operations`, {
     method: "POST",
     body: {
       expected_revision: 3,
@@ -256,24 +164,14 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   });
   assert.deepEqual(deletedChild.data.snapshot.ui_context.selected_node_ids, []);
 
-  const staleSelection = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: {
-      name: "edit_bubble",
-      call_id: "call-after-delete",
-      arguments: {
-        node_reference: "$selected",
-        text: "No stale selection",
-        transcript_quote: null,
-        realtime_item_id: null,
-        expected_revision: 4,
-      },
-    },
+  const staleSelection = await operation({
+    type: "edit_bubble", call_id: "call-after-delete", expected_revision: 4,
+    node_reference: "$selected", text: "No stale selection",
   });
   assert.equal(staleSelection.response.status, 409);
   assert.equal(staleSelection.data.error.code, "selection_clarification_required");
 
-  const blockedOrigin = await request("/api/sessions", {
+  const blockedOrigin = await request("/sessions", {
     headers: { Origin: "https://attacker.example" },
   });
   assert.equal(blockedOrigin.response.status, 403);
@@ -281,7 +179,6 @@ test("session HTTP routes share the canonical reducer and revision contract", as
 });
 
 test("a completed user append notifies the map controller but a Partner append does not", async (t) => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-map-controller-http-"));
   const notifications = [];
   let waiting = false;
   let cancellations = 0;
@@ -294,32 +191,12 @@ test("a completed user append notifies the map controller but a Partner append d
     state: () => ({ scheduled: waiting, active: false, queued: false }),
     dispose: () => { disposals += 1; },
   };
-  const app = await createThoughtformServer({
-    store: createSessionStore({ directory }),
+  const { app, base, post: request } = await startTestServer(t, {
     mapController: { model: "controller-test-model" },
     mapControllerScheduler: scheduler,
   });
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
-
-  t.after(async () => {
-    app.locals.dispose?.();
-    await new Promise((resolve) => server.close(resolve));
-    await rm(directory, { recursive: true, force: true });
-  });
-
-  const request = async (pathname, body) => {
-    const response = await fetch(`${base}${pathname}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    return { response, data: await response.json() };
-  };
-
-  const created = await request("/api/sessions", {});
-  const userAppend = await request(`/api/sessions/${created.data.id}/operations`, {
+  const created = await request("/sessions", {});
+  const userAppend = await request(`/sessions/${created.data.id}/operations`, {
     expected_revision: 0,
     operation: {
       type: "append_utterance",
@@ -330,7 +207,7 @@ test("a completed user append notifies the map controller but a Partner append d
   });
   assert.equal(userAppend.response.status, 200);
   assert.equal(userAppend.data.snapshot.map_controller.status, "waiting");
-  const partnerAppend = await request(`/api/sessions/${created.data.id}/operations`, {
+  const partnerAppend = await request(`/sessions/${created.data.id}/operations`, {
     expected_revision: 0,
     operation: { type: "append_utterance", speaker: "partner", text: "Tell me more." },
   });
@@ -338,7 +215,7 @@ test("a completed user append notifies the map controller but a Partner append d
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0][0], created.data.id);
   assert.deepEqual(notifications[0][1], userAppend.data.snapshot.transcript[0]);
-  const replay = await request(`/api/sessions/${created.data.id}/operations`, {
+  const replay = await request(`/sessions/${created.data.id}/operations`, {
     expected_revision: 0,
     operation: {
       type: "append_utterance",
@@ -349,7 +226,7 @@ test("a completed user append notifies the map controller but a Partner append d
   });
   assert.equal(replay.data.replayed, true);
   assert.equal(notifications.length, 1);
-  const deleted = await fetch(`${base}/api/sessions/${created.data.id}`, { method: "DELETE" });
+  const deleted = await fetch(`${base}/sessions/${created.data.id}`, { method: "DELETE" });
   assert.equal(deleted.status, 200);
   assert.equal(cancellations, 1);
   app.locals.dispose?.();
@@ -357,7 +234,6 @@ test("a completed user append notifies the map controller but a Partner append d
 });
 
 test("the controller publishes its runtime status and applied snapshots over SSE", async (t) => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-map-controller-sse-"));
   let hooks;
   let retries = 0;
   let schedulerState = { scheduled: false, preparing: false, active: false, queued: false };
@@ -369,8 +245,7 @@ test("the controller publishes its runtime status and applied snapshots over SSE
     state: () => schedulerState,
     dispose: () => {},
   };
-  const app = await createThoughtformServer({
-    store: createSessionStore({ directory }),
+  const { app, base, post: request } = await startTestServer(t, {
     env: { OPENAI_API_KEY: "test-key", THOUGHTFORM_CURATOR_ENABLED: "false" },
     mapController: { model: "controller-test-model" },
     controllerEventEpoch: 41,
@@ -379,19 +254,9 @@ test("the controller publishes its runtime status and applied snapshots over SSE
       return scheduler;
     },
   });
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
-
-  t.after(async () => {
-    app.locals.dispose?.();
-    await new Promise((resolve) => server.close(resolve));
-    await rm(directory, { recursive: true, force: true });
-  });
-
   assert.equal(typeof hooks.onStateChange, "function");
   assert.equal(typeof hooks.onComplete, "function");
-  const health = await (await fetch(`${base}/api/health`)).json();
+  const health = await (await fetch(`${base}/health`)).json();
   assert.deepEqual(health.map_controller, {
     configured: true,
     enabled: true,
@@ -399,7 +264,7 @@ test("the controller publishes its runtime status and applied snapshots over SSE
   });
   assert.equal("curator" in health, false);
   assert.equal("curatorScheduler" in app.locals, false);
-  const created = await (await fetch(`${base}/api/sessions`, {
+  const created = await (await fetch(`${base}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}",
@@ -407,14 +272,14 @@ test("the controller publishes its runtime status and applied snapshots over SSE
   assert.equal(created.map_controller.status, "idle");
   assert.equal(created.controller_event_epoch, 41);
   assert.equal(created.controller_event_sequence, 0);
-  const retry = await (await fetch(`${base}/api/sessions/${created.id}/map-controller/retry`, {
+  const retry = await (await fetch(`${base}/sessions/${created.id}/map-controller/retry`, {
     method: "POST",
   })).json();
   assert.equal(retry.ok, true);
   assert.equal(retry.scheduled, true);
   assert.equal(retries, 1);
   assert.equal(retry.snapshot.controller_event_sequence, 1);
-  const stream = await fetch(`${base}/api/sessions/${created.id}/events`);
+  const stream = await fetch(`${base}/sessions/${created.id}/events`);
   const reader = stream.body.getReader();
   await reader.read();
   await app.locals.sessionStore.transact(created.id, (session) => ({
@@ -481,7 +346,6 @@ test("the controller publishes its runtime status and applied snapshots over SSE
 });
 
 test("the creative curator starts only after the map controller has completed", async (t) => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-curator-ordering-"));
   let controllerHooks;
   let curatorHooks;
   const curatorNotifications = [];
@@ -490,8 +354,7 @@ test("the creative curator starts only after the map controller has completed", 
     cancel: () => false,
     dispose: () => {},
   };
-  const app = await createThoughtformServer({
-    store: createSessionStore({ directory }),
+  const { app, base, post: request } = await startTestServer(t, {
     env: {
       OPENAI_API_KEY: "test-key",
       THOUGHTFORM_CURATOR_ENABLED: "true",
@@ -514,22 +377,12 @@ test("the creative curator starts only after the map controller has completed", 
       return curatorScheduler;
     },
   });
-  const server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
-
-  t.after(async () => {
-    app.locals.dispose?.();
-    await new Promise((resolve) => server.close(resolve));
-    await rm(directory, { recursive: true, force: true });
-  });
-
-  const created = await (await fetch(`${base}/api/sessions`, {
+  const created = await (await fetch(`${base}/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}",
   })).json();
-  const appended = await (await fetch(`${base}/api/sessions/${created.id}/operations`, {
+  const appended = await (await fetch(`${base}/sessions/${created.id}/operations`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

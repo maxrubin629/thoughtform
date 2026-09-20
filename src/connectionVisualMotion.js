@@ -13,9 +13,7 @@ function monotonicNow() {
   return globalThis.performance?.now?.() ?? Date.now();
 }
 
-// This is the classic canvas connection response. Both routes use this exact
-// helper so session reconciliation cannot drift into a similar-but-different
-// wobble controller.
+// Direct gestures and canonical reconciliation share one causal motion clock.
 export function applyConnectionGrowthMotion(nodes, edge, { reducedMotion = false } = {}) {
   if (reducedMotion || !edge) return nodes;
   const source = nodes.find((node) => node.id === edge.from);

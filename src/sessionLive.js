@@ -5,69 +5,18 @@ import {
   persistLiveEvents,
   sendSessionChat,
 } from "./liveApi.js";
+import { aborted, conciseContext, errorFrom, eventId as id, waitFor } from "./live/protocol.js";
+import { LiveTranscript } from "./live/transcript.js";
 
 const AUDIO_CONSTRAINTS = { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true };
 const APPEND_TYPES = new Set(["session.instructions.append", "session.thinking.append", "session.commentary.append"]);
 const CALLBACKS = ["onStateChange", "onStatus", "onEvent", "onError", "onUserTranscriptPartial", "onPartnerTranscriptPartial", "onSnapshot", "onToolResult", "onBackendStatus", "onMutedChange", "onUsage", "onActivity"];
-const id = () => `live_${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
-const aborted = () => new DOMException("Voice connection was cancelled", "AbortError");
-const errorFrom = (value) => value instanceof Error ? value : Object.assign(new Error(value?.error?.message ?? value?.message ?? "Voice connection failed"), { code: value?.error?.code ?? value?.code });
-
-function conciseContext(text) {
-  // UTF-8 bytes also bound the tokenizer's byte-level fallback, including for
-  // non-Latin text. Full selected and typed text stays in the canonical session.
-  let result = "";
-  let bytes = 0;
-  for (const character of text) {
-    const length = new TextEncoder().encode(character).length;
-    if (bytes + length > 480) break;
-    result += character;
-    bytes += length;
-  }
-  return result;
-}
-
-function waitFor(target, type, ready, { timeoutMs, signal, message }) {
-  if (ready()) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const finish = (error) => {
-      clearTimeout(timer);
-      target.removeEventListener?.(type, check);
-      signal?.removeEventListener("abort", cancel);
-      if (error) reject(error); else resolve();
-    };
-    const check = () => { if (ready()) finish(); };
-    const cancel = () => finish(aborted());
-    const timer = setTimeout(() => finish(new Error(message)), timeoutMs);
-    target.addEventListener?.(type, check);
-    signal?.addEventListener("abort", cancel, { once: true });
-    if (signal?.aborted) cancel();
-    else check();
-  });
-}
-
-/** Display grouping only. The original events remain immutable and never imply semantic completion. */
-export function groupLiveTranscriptFragments(events, gapMs = 4000) {
-  const rows = [];
-  const seen = new Set();
-  for (const event of events) {
-    if (seen.has(event.event_id)) continue;
-    seen.add(event.event_id);
-    const speaker = event.type === "session.input_transcript.delta" ? "you" : "partner";
-    let row = rows.findLast((candidate) => candidate.speaker === speaker
-      && event.start_ms <= candidate.end_ms + gapMs && event.end_ms >= candidate.start_ms - gapMs);
-    if (!row) {
-      row = { id: event.event_id, speaker, start_ms: event.start_ms, end_ms: event.end_ms, fragments: [], text: "" };
-      rows.push(row);
-    }
-    row.fragments.push(event);
-    row.start_ms = Math.min(row.start_ms, event.start_ms);
-    row.end_ms = Math.max(row.end_ms, event.end_ms);
-    // Preserve delivery order and exact whitespace, including repeated words.
-    row.text += event.delta;
-  }
-  return rows;
-}
+const EVENT_HANDLERS = new Map([
+  ["session.input_transcript.delta", "_receiveTranscript"],
+  ["session.output_transcript.delta", "_receiveTranscript"],
+  ["session.delegation.created", "_receiveDelegation"],
+  ["session.closed", "_receiveClosed"],
+]);
 
 /**
  * One canonical session's browser voice transport. Server endpoints own transcript
@@ -93,12 +42,8 @@ export class SessionLiveClient {
     this.getSelectedContext = options.getSelectedContext;
     this.api = { negotiateLiveSession, persistLiveEvents, flushLiveTranscript, delegateLiveTask, sendSessionChat, ...options.api };
     this.timeouts = { setup: 20_000, command: 10_000, close: 5000, reconnect: 3500, ...options.timeouts };
-    this.batchMs = options.batchMs ?? 500;
     this.callbacks = { ...options.callbacks };
     CALLBACKS.forEach((name) => { if (options[name]) this.callbacks[name] = options[name]; });
-    try { this.storage = options.storage === undefined ? globalThis.localStorage : options.storage; } catch { this.storage = null; }
-    this.storageKey = `thoughtform:live-outbox:${this.sessionId}`;
-    this._outbox = this._loadOutbox();
     this._state = "idle";
     this._generation = 0;
     this._muted = false;
@@ -108,14 +53,22 @@ export class SessionLiveClient {
     this._waiters = new Map();
     this._delegations = new Map();
     this._seenEvents = new Set();
-    this._captionFragments = [];
-    this._captionLiveIds = new WeakMap();
-    this._pendingIds = null;
     this._context = null;
     this._lastContext = null;
     this._usage = null;
     this._ending = null;
     this._retryCount = 0;
+    this.transcript = new LiveTranscript({
+      sessionId: this.sessionId,
+      storage: options.storage,
+      batchMs: options.batchMs ?? 500,
+      callbacks: this.callbacks,
+      persist: (liveId, events) => this.api.persistLiveEvents(this.sessionId, liveId, events),
+      onResult: (result) => this._applyResult(result),
+      onSaved: () => this._retryDelegations(),
+      onError: (error, phase) => this._report(error, phase),
+      shouldRetry: () => this._state !== "closed",
+    });
   }
 
   get connectionState() { return this._state; }
@@ -135,35 +88,10 @@ export class SessionLiveClient {
     return normalized;
   }
 
-  _loadOutbox() {
-    try {
-      const records = JSON.parse(this.storage?.getItem(this.storageKey) ?? "[]");
-      return Array.isArray(records) ? records.filter((record) => record.liveSessionId && record.event?.event_id) : [];
-    } catch { return []; }
-  }
-
-  _saveOutbox() {
-    try {
-      if (this._outbox.length) this.storage?.setItem(this.storageKey, JSON.stringify(this._outbox));
-      else this.storage?.removeItem(this.storageKey);
-    } catch (error) {
-      this._report(new Error("Unsaved voice fragments could not be cached in this browser. Keep this page open until saving recovers.", { cause: error }), "transcript_storage");
-    }
-  }
-
   _applyResult(result) {
     if (result?.snapshot) this.callbacks.onSnapshot?.(result.snapshot);
     this.callbacks.onToolResult?.({ result });
-    if (Array.isArray(result?.pending_fragment_ids)) {
-      this._pendingIds = new Set(result.pending_fragment_ids);
-      // Unacknowledged newer events must stay visible when an older batch returns.
-      const outstanding = new Set(this._outbox.map((record) => `${record.liveSessionId}:${record.event.event_id}`));
-      this._captionFragments = this._captionFragments.filter((event) => {
-        const fragmentId = `${this._captionLiveIds.get(event)}:${event.event_id}`;
-        return this._pendingIds.has(fragmentId) || outstanding.has(fragmentId);
-      });
-      this._emitCaptions();
-    }
+    this.transcript.reconcile(result);
   }
 
   async connect(options = {}) {
@@ -278,8 +206,7 @@ export class SessionLiveClient {
     this._abort = null;
     clearTimeout(this._recoveryTimer);
     clearTimeout(this._contextTimer);
-    clearTimeout(this._persistRetryTimer);
-    this._persistRetryTimer = null;
+    this.transcript.stopRetries();
     clearInterval(this._activityTimer);
     this._recoveryTimer = null;
     this._waiters.forEach(({ reject, timer }) => { clearTimeout(timer); reject(aborted()); });
@@ -303,13 +230,9 @@ export class SessionLiveClient {
       try { this._send({ type: "session.close" }); } catch { /* Best effort on unmount; no finalized claim. */ }
     }
     this._cleanupTransport();
-    clearTimeout(this._batchTimer);
-    this._batchTimer = null;
     void this.flushEvents().catch((error) => this._report(error, "transcript_save"));
     this._setState(state);
   }
-
-  close() { return this.end(); }
 
   async end() {
     if (this._ending) return this._ending;
@@ -379,60 +302,9 @@ export class SessionLiveClient {
     }
   }
 
-  _queueEvent(event) {
-    if (!this._liveSessionId || this._outbox.some((record) => record.liveSessionId === this._liveSessionId && record.event.event_id === event.event_id)) return;
-    this._outbox.push({ liveSessionId: this._liveSessionId, event });
-    this._saveOutbox();
-    if (!this._batchTimer) this._batchTimer = setTimeout(() => {
-      this._batchTimer = null;
-      void this.flushEvents().then(() => this._retryDelegations()).catch((error) => this._report(error, "transcript_save"));
-    }, this.batchMs);
-  }
+  flushEvents() { return this.transcript.flush(); }
 
-  async flushEvents() {
-    if (this._persisting) return this._persisting;
-    clearTimeout(this._batchTimer);
-    this._batchTimer = null;
-    this._persisting = (async () => {
-      while (this._outbox.length) {
-        const liveId = this._outbox[0].liveSessionId;
-        const records = this._outbox.filter((record) => record.liveSessionId === liveId).slice(0, 100);
-        const result = await this.api.persistLiveEvents(this.sessionId, liveId, records.map((record) => record.event));
-        const acceptedIds = new Set(result?.acknowledged_event_ids ?? records.map((record) => record.event.event_id));
-        const acknowledged = new Set(records.filter((record) => acceptedIds.has(record.event.event_id)));
-        if (!acknowledged.size) throw new Error("The session server did not acknowledge the saved voice fragments");
-        this._outbox = this._outbox.filter((record) => !acknowledged.has(record));
-        this._saveOutbox();
-        this._applyResult(result);
-      }
-    })();
-    try {
-      const result = await this._persisting;
-      this._persistFailures = 0;
-      clearTimeout(this._persistRetryTimer);
-      this._persistRetryTimer = null;
-      return result;
-    } catch (error) {
-      this._persistFailures = (this._persistFailures ?? 0) + 1;
-      if (!this._persistRetryTimer && this._state !== "closed" && this._persistFailures <= 5) {
-        this._persistRetryTimer = setTimeout(() => {
-          this._persistRetryTimer = null;
-          void this.flushEvents().then(() => this._retryDelegations()).catch((failure) => this._report(failure, "transcript_save"));
-        }, Math.min(1000 * 2 ** (this._persistFailures - 1), 10_000));
-      }
-      throw error;
-    } finally { this._persisting = null; }
-  }
-
-  _emitCaptions() {
-    const rows = groupLiveTranscriptFragments(this._captionFragments);
-    for (const [speaker, callback] of [["you", "onUserTranscriptPartial"], ["partner", "onPartnerTranscriptPartial"]]) {
-      const row = rows.findLast((candidate) => candidate.speaker === speaker);
-      this.callbacks[callback]?.({ text: row?.text ?? "", rowId: row?.id ?? null, fragments: row?.fragments ?? [], rows: rows.filter((candidate) => candidate.speaker === speaker) });
-    }
-  }
-
-  async _receiveEvent(message, generation = this._generation) {
+  _receiveEvent(message, generation = this._generation) {
     if (generation !== this._generation) return;
     let event;
     try { event = typeof message.data === "string" ? JSON.parse(message.data) : message.data; }
@@ -440,46 +312,52 @@ export class SessionLiveClient {
     if (!event?.type) return;
     this.callbacks.onEvent?.(event);
     if (event.type === "session.started") {
-      if (event.session?.id && this._liveSessionId && event.session.id !== this._liveSessionId) return;
-      this._started = true;
+      if (!event.session?.id || !this._liveSessionId || event.session.id === this._liveSessionId) this._started = true;
       return;
     }
-    const clientId = event.client_event_id ?? event.error?.client_event_id;
-    const waiter = this._waiters.get(clientId)
-      ?? (event.type === "session.closed" ? [...this._waiters.values()].find((candidate) => candidate.acknowledgment === "session.closed") : null);
-    if (waiter && (event.type === waiter.acknowledgment || event.type === "error")) {
-      clearTimeout(waiter.timer);
-      for (const [key, value] of this._waiters) { if (value === waiter) this._waiters.delete(key); }
-      if (event.type === "error") waiter.reject(errorFrom(event)); else waiter.resolve(event);
-    }
+    this._acknowledge(event);
     if (event.type === "error") { this._report(event, "live_command"); return; }
-    if (event.type === "session.usage.updated" || event.type === "session.closed") {
-      if (event.usage) { this._usage = event.usage; this.callbacks.onUsage?.(event.usage); }
+    if (["session.usage.updated", "session.closed"].includes(event.type) && event.usage) {
+      this._usage = event.usage;
+      this.callbacks.onUsage?.(event.usage);
     }
     if (event.event_id && this._seenEvents.has(event.event_id)) return;
     if (event.event_id) this._seenEvents.add(event.event_id);
-    if (event.type === "session.input_transcript.delta" || event.type === "session.output_transcript.delta") {
-      if (!event.event_id || typeof event.delta !== "string" || !Number.isFinite(event.start_ms) || !Number.isFinite(event.end_ms)) {
-        this._report(new Error("The voice service returned a transcript fragment without its original identity or timing"), "transcript_format");
-        return;
-      }
-      this._captionFragments.push(event);
-      this._captionLiveIds.set(event, this._liveSessionId);
-      this._emitCaptions();
-      this._queueEvent(event);
-    } else if (event.type === "session.delegation.created" && event.delegation?.target === "client" && event.delegation.id) {
-      if (!this._delegations.has(event.delegation.id)) {
-        this._delegations.set(event.delegation.id, { event, generation, state: "pending" });
-        void this._runDelegation(event.delegation.id);
-      }
-    } else if (event.type === "session.closed") {
-      this._queueEvent(event);
-      if (this._state !== "ending") {
-        this._cleanupTransport();
-        this._setState("closed", { finalized: true, reason: event.reason });
-        void this.flushEvents().catch((error) => this._report(error, "transcript_save"));
-      }
+    const handler = EVENT_HANDLERS.get(event.type);
+    if (handler) this[handler](event, generation);
+  }
+
+  _acknowledge(event) {
+    const clientId = event.client_event_id ?? event.error?.client_event_id;
+    const waiter = this._waiters.get(clientId)
+      ?? (event.type === "session.closed" ? [...this._waiters.values()].find((candidate) => candidate.acknowledgment === "session.closed") : null);
+    if (!waiter || (event.type !== waiter.acknowledgment && event.type !== "error")) return;
+    clearTimeout(waiter.timer);
+    for (const [key, value] of this._waiters) if (value === waiter) this._waiters.delete(key);
+    if (event.type === "error") waiter.reject(errorFrom(event)); else waiter.resolve(event);
+  }
+
+  _receiveTranscript(event) {
+    if (!event.event_id || typeof event.delta !== "string" || !Number.isFinite(event.start_ms) || !Number.isFinite(event.end_ms)) {
+      this._report(new Error("The voice service returned a transcript fragment without its original identity or timing"), "transcript_format");
+      return;
     }
+    this.transcript.append(event, this._liveSessionId);
+  }
+
+  _receiveDelegation(event, generation) {
+    const delegation = event.delegation;
+    if (delegation?.target !== "client" || !delegation.id || this._delegations.has(delegation.id)) return;
+    this._delegations.set(delegation.id, { event, generation, state: "pending" });
+    void this._runDelegation(delegation.id);
+  }
+
+  _receiveClosed(event) {
+    this.transcript.queue(event, this._liveSessionId);
+    if (this._state === "ending") return;
+    this._cleanupTransport();
+    this._setState("closed", { finalized: true, reason: event.reason });
+    void this.flushEvents().catch((error) => this._report(error, "transcript_save"));
   }
 
   async _runDelegation(delegationId) {

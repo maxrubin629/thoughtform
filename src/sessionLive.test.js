@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { groupLiveTranscriptFragments, SessionLiveClient } from "./sessionLive.js";
+import { SessionLiveClient } from "./sessionLive.js";
+import { groupLiveTranscriptFragments } from "./live/transcript.js";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 function fragment(eventId, delta, start = 0, speaker = "you") {
@@ -121,10 +122,10 @@ test("original transcript events survive a lost save response and retry unchange
   channel.receive(partner);
   channel.receive(input);
   await assert.rejects(client.flushEvents(), /Lost response/);
-  assert.equal(JSON.parse(storage.getItem(client.storageKey)).length, 2);
+  assert.equal(JSON.parse(storage.getItem("thoughtform:live-outbox:canonical-1")).length, 2);
   await client.flushEvents();
   assert.deepEqual(payloads, [[input, partner], [input, partner]]);
-  assert.equal(storage.getItem(client.storageKey), null);
+  assert.equal(storage.getItem("thoughtform:live-outbox:canonical-1"), null);
   assert.deepEqual(finalCallbacks, []);
 });
 
@@ -140,7 +141,8 @@ test("cached originals from an earlier connection are saved before replacement h
 
 test("partial save acknowledgments retain and replay the remaining originals", async (t) => {
   const batches = [];
-  const { client, channel } = fixture({ api: {
+  const storage = memoryStorage();
+  const { client, channel } = fixture({ storage, api: {
     persistLiveEvents: async (_session, _live, events) => {
       batches.push(events.map(({ event_id: eventId }) => eventId));
       return { acknowledged_event_ids: [events[0].event_id] };
@@ -152,7 +154,7 @@ test("partial save acknowledgments retain and replay the remaining originals", a
   channel.receive(fragment("second", "two", 100));
   await client.flushEvents();
   assert.deepEqual(batches, [["first", "second"], ["second"]]);
-  assert.equal(client._outbox.length, 0);
+  assert.equal(storage.getItem("thoughtform:live-outbox:canonical-1"), null);
 });
 
 test("caption rows preserve overlap, fragment identity and exact whitespace", () => {
@@ -192,6 +194,66 @@ test("saved incomplete caption remains until its namespaced fragment is committe
   assert.equal(captions.at(-1), "The reason I think that is");
   client._applyResult({ pending_fragment_ids: [] });
   assert.equal(captions.at(-1), "");
+});
+
+test("an older save response cannot clear fragments that arrived during persistence", async (t) => {
+  const captions = [];
+  let release;
+  let calls = 0;
+  const { client, channel } = fixture({
+    onUserTranscriptPartial: ({ text }) => captions.push(text),
+    api: { persistLiveEvents: async () => {
+      if (++calls === 1) await new Promise((resolve) => { release = resolve; });
+      return { pending_fragment_ids: [] };
+    } },
+  });
+  t.after(() => client.disconnect());
+  await client.connect();
+  channel.receive(fragment("earlier", "First "));
+  const saving = client.flushEvents();
+  channel.receive(fragment("newer", "still speaking", 200));
+  release();
+  await saving;
+  assert.ok(captions.includes("still speaking"));
+  assert.equal(captions.at(-1), "");
+  assert.equal(calls, 2);
+});
+
+test("a batch timer that fires during persistence cannot prevent later automatic saves", async (t) => {
+  const batches = [];
+  let release;
+  const { client, channel } = fixture({ batchMs: 20, api: {
+    persistLiveEvents: async (_session, _live, events) => {
+      batches.push(events.map(({ event_id }) => event_id));
+      if (batches.length === 1) await new Promise((resolve) => { release = resolve; });
+      return { pending_fragment_ids: [] };
+    },
+  } });
+  t.after(() => client.disconnect());
+  await client.connect();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  channel.receive(fragment("first", "First "));
+  const saving = client.flushEvents();
+  channel.receive(fragment("during-save", "still speaking", 100));
+  t.mock.timers.tick(20);
+  release();
+  await saving;
+  channel.receive(fragment("after-save", "Another thought", 200));
+  t.mock.timers.tick(20);
+  await tick();
+  assert.deepEqual(batches, [["first"], ["during-save"], ["after-save"]]);
+});
+
+test("unknown event types and malformed transcript fragments cannot enter the outbox", async (t) => {
+  const errors = [];
+  const { client, channel, requests } = fixture({ onError: (_error, context) => errors.push(context.phase) });
+  t.after(() => client.disconnect());
+  await client.connect();
+  channel.receive({ type: "constructor", event_id: "unknown" });
+  channel.receive({ type: "session.input_transcript.delta", event_id: "invalid", delta: "No timing" });
+  await client.flushEvents();
+  assert.deepEqual(errors, ["transcript_format"]);
+  assert.equal(requests.filter(([kind]) => kind === "persist").length, 0);
 });
 
 test("delegation waits for original transcript persistence and preserves the known delegation ID", async (t) => {

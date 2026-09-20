@@ -57,6 +57,8 @@ Both streams are implemented in the primary session. The creative suggestion loo
 
 ## How it works
 
+For the module map, mutation flow, and ownership rules, see [Code map](./docs/architecture.md).
+
 ```mermaid
 flowchart LR
     U["Voice"] <--> L["GPT-Live Partner"]
@@ -165,6 +167,7 @@ npm run dev:client   # frontend only
 npm run build        # production build
 npm run preview      # preview the production build
 npm test             # automated unit and integration tests
+npm run stats        # source-line counts by responsibility
 ```
 
 Tests cover transcript preservation, Live transport and delegation, graph operations, concurrency, persistence, and canvas behavior. A synthetic-silence WebRTC smoke check has verified GPT-Live connection, mute, unmute, and close; a real Terra call has verified the completeness-check contract. Those checks do not establish spoken conversation quality or microphone performance.

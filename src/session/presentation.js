@@ -1,5 +1,5 @@
 import { clamp } from "../fluidMaterial.js";
-import { BASE_HEIGHT, BASE_WIDTH } from "../mapData.js";
+import { BASE_HEIGHT, BASE_WIDTH } from "../canvas/viewport.js";
 import { radiusForThought, wrapThought } from "../thoughtSizing.js";
 import { connectionEdgeKey } from "./connectionMotion.js";
 

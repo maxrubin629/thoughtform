@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
-import { applyOperation } from "./sessionOperations.mjs";
+import { applyControllerDecision, MapControllerRevisionConflict, safePart } from "./mapControllerDecision.mjs";
 import {
   DEFAULT_MAP_CONTROLLER_MODEL,
   MAP_CONTROLLER_EVIDENCE_SCHEMA,
@@ -25,157 +25,13 @@ export {
   MAP_CONTROLLER_SYSTEM,
   SEARCH_TRANSCRIPT_TOOL,
   MapControllerError,
+  MapControllerRevisionConflict,
   createMapControllerScheduler,
   searchTranscript,
 };
 
-export class MapControllerRevisionConflict extends MapControllerError {
-  constructor(expected, actual) {
-    super(`Map revision changed from ${expected} to ${actual} while the controller was running.`, {
-      code: "revision_conflict",
-      retryable: true,
-    });
-    this.expected_revision = expected;
-    this.current_revision = actual;
-  }
-}
-
-function safePart(value) {
-  return String(value ?? "id").replace(/[^A-Za-z0-9_-]/g, "-").replace(/^-+/, "") || "id";
-}
-
-function nowDate(now) {
-  const value = now();
-  return value instanceof Date ? value : new Date(value);
-}
-
-function operationReference(value, temporary) {
-  if (typeof value !== "string") return value;
-  const candidates = [value, value.replace(/^temp:/, ""), value.replace(/^\$/, "")];
-  for (const candidate of candidates) {
-    if (temporary.has(candidate)) return temporary.get(candidate);
-  }
-  return value;
-}
-
-function operationWithResolvedEvidence(operation, temporary, assignedNodeId) {
-  const resolved = {
-    type: operation.type,
-    ...(operation.text !== null && operation.text !== undefined ? { text: operation.text } : {}),
-    ...(operation.node_id ? { node_id: operationReference(operation.node_id, temporary) } : {}),
-    ...(operation.from ? { from: operationReference(operation.from, temporary) } : {}),
-    ...(operation.to ? { to: operationReference(operation.to, temporary) } : {}),
-    ...(operation.parent ? { parent: operationReference(operation.parent, temporary) } : {}),
-    ...(assignedNodeId && operation.type !== "set_central_idea" ? { node_id: assignedNodeId } : {}),
-    ...(assignedNodeId && operation.type === "set_central_idea" ? { new_node_id: assignedNodeId } : {}),
-  };
-  if (operation.evidence?.length) resolved.sources = operation.evidence;
-  return resolved;
-}
-
-function assignTemporaryNodes(operations, temporary, allocateNodeId) {
-  return operations.map((operation) => {
-    const createsNode = operation.type === "create_bubble"
-      || (operation.type === "set_central_idea" && operation.text && !operation.node_id);
-    let assignedNodeId = null;
-    if (createsNode) {
-      assignedNodeId = operation.node_id || allocateNodeId();
-      if (operation.temp_id) {
-        if (temporary.has(operation.temp_id)) {
-          throw new MapControllerError(`Duplicate temporary reference ${operation.temp_id}.`, { code: "invalid_output" });
-        }
-        temporary.set(operation.temp_id, assignedNodeId);
-      }
-    } else if (operation.temp_id) {
-      throw new MapControllerError("temp_id is valid only for an operation that creates a bubble.", {
-        code: "invalid_output",
-      });
-    }
-    return { operation, assignedNodeId };
-  });
-}
-
-function applyControllerDecision(current, decision, {
-  baseRevision,
-  start,
-  watermark,
-  runId,
-  now,
-  allowedUtteranceIds,
-}) {
-  if (current.preferences?.mapping_paused) return current;
-  if (current.revision !== baseRevision) throw new MapControllerRevisionConflict(baseRevision, current.revision);
-  if (current.map_controller.processed_transcript_count !== start) {
-    throw new MapControllerRevisionConflict(baseRevision, current.revision);
-  }
-  const parked = new Set(current.nodes.filter((node) => node.parked).map((node) => node.id));
-  const operations = [...decision.operations, ...(decision.proposal?.operations ?? [])];
-  if (operations.some((operation) => (
-    [operation.node_id, operation.from, operation.to, operation.parent].some((id) => parked.has(id))
-  ))) {
-    throw new MapControllerError("Parked thoughts are kept aside and cannot be changed by automatic mapping.", { code: "invalid_output" });
-  }
-  assertEvidenceWithinWatermark(decision, allowedUtteranceIds);
-  let next = structuredClone(current);
-  let serial = 0;
-  const temporary = new Map();
-  const reducerId = (kind) => `${safePart(runId)}-${safePart(kind)}-${++serial}`;
-  const allocateNodeId = () => reducerId("node");
-  const direct = assignTemporaryNodes(decision.operations, temporary, allocateNodeId);
-  const preparedDirect = direct.map(({ operation, assignedNodeId }) => (
-    operationWithResolvedEvidence(operation, temporary, assignedNodeId)
-  ));
-
-  if (preparedDirect.length) {
-    const result = applyOperation(next, {
-      type: "apply_map_batch",
-      label: "Organized a thought",
-      operations: preparedDirect,
-      actor: "partner",
-      origin: "map_controller",
-      call_id: `map-controller-${safePart(runId)}-direct`,
-      expected_revision: next.revision,
-    }, { now, idFactory: reducerId });
-    next = result.session;
-  }
-  if (current.nodes.some((node) => node.parked
-    && JSON.stringify(node) !== JSON.stringify(next.nodes.find(({ id }) => id === node.id)))) {
-    throw new MapControllerError("Automatic mapping must preserve thoughts that the user kept aside, including the previous central idea.", { code: "invalid_output" });
-  }
-
-  if (decision.proposal) {
-    const proposalTemporary = new Map(temporary);
-    const proposed = assignTemporaryNodes(decision.proposal.operations, proposalTemporary, allocateNodeId)
-      .map(({ operation, assignedNodeId }) => (
-        operationWithResolvedEvidence(operation, proposalTemporary, assignedNodeId)
-      ));
-    const result = applyOperation(next, {
-      type: "propose_changes",
-      actor: "partner",
-      origin: "map_controller",
-      call_id: `map-controller-${safePart(runId)}-proposal`,
-      expected_revision: next.revision,
-      base_revision: baseRevision,
-      rationale: decision.proposal.rationale,
-      evidence: decision.proposal.evidence,
-      operations: proposed,
-    }, { now, idFactory: reducerId });
-    next = result.session;
-  }
-
-  const successAt = nowDate(now).toISOString();
-  next.map_controller = {
-    processed_transcript_count: watermark,
-    last_run_id: runId,
-    last_success_at: successAt,
-    last_error: null,
-  };
-  next.updated_at = successAt;
-  return next;
-}
-
-function transientCode(error) {
-  return error?.code ?? error?.status ?? error?.name ?? "map_controller_error";
+function assertNotAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
 }
 
 export function createMapController({
@@ -204,14 +60,16 @@ export function createMapController({
 
   const requestDecision = async (snapshot, envelope, searchBudget, signal, repairMessage = null) => {
     const openaiClient = await api();
-    let response = await openaiClient.responses.create({
+    const request = (input, previousResponseId) => openaiClient.responses.create({
       model,
       reasoning: { effort: "medium" },
       instructions: MAP_CONTROLLER_SYSTEM,
-      input: developerEvidenceInput(envelope, repairMessage),
+      input,
+      ...(previousResponseId ? { previous_response_id: previousResponseId } : {}),
       ...(searchBudget.remaining > 0 ? { tools: [SEARCH_TRANSCRIPT_TOOL] } : {}),
       text: mapControllerOutputFormat(),
     }, { signal });
+    let response = await request(developerEvidenceInput(envelope, repairMessage));
     while (searchBudget.remaining > 0) {
       const calls = mapControllerResponseFunctionCalls(response);
       if (!calls.length) break;
@@ -233,15 +91,7 @@ export function createMapController({
       }
       const searchableTranscript = (snapshot.transcript ?? []).slice(0, envelope.transcript_watermark);
       const output = JSON.stringify({ matches: searchTranscript(searchableTranscript, query) });
-      response = await openaiClient.responses.create({
-        model,
-        reasoning: { effort: "medium" },
-        instructions: MAP_CONTROLLER_SYSTEM,
-        previous_response_id: response.id,
-        input: [{ type: "function_call_output", call_id: call.call_id, output }],
-        ...(searchBudget.remaining > 0 ? { tools: [SEARCH_TRANSCRIPT_TOOL] } : {}),
-        text: mapControllerOutputFormat(),
-      }, { signal });
+      response = await request([{ type: "function_call_output", call_id: call.call_id, output }], response.id);
     }
     return parseAndValidateMapControllerResponse(response);
   };
@@ -249,7 +99,7 @@ export function createMapController({
   return {
     model,
     async run(sessionId, { watermark: requestedWatermark, signal } = {}) {
-      if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
+      assertNotAborted(signal);
       const opening = await loadSnapshot(sessionId);
       if (opening.preferences?.mapping_paused) {
         return { decision: "no_change", skipped: true, paused: true, revision: opening.revision };
@@ -269,7 +119,7 @@ export function createMapController({
       const searchBudget = { remaining: 2 };
 
       while (true) {
-        if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
+        assertNotAborted(signal);
         const snapshot = await loadSnapshot(sessionId);
         if (snapshot.preferences?.mapping_paused) {
           return { decision: "no_change", skipped: true, paused: true, revision: snapshot.revision };
@@ -284,9 +134,9 @@ export function createMapController({
         try {
           const decision = await requestDecision(snapshot, envelope, searchBudget, signal, repairMessage);
           assertEvidenceWithinWatermark(decision, allowedUtteranceIds);
-          if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
+          assertNotAborted(signal);
           const outcome = await transact(sessionId, (current) => {
-            if (signal?.aborted) throw signal.reason ?? new Error("Map controller run cancelled.");
+            assertNotAborted(signal);
             return {
               session: applyControllerDecision(current, decision, {
                 baseRevision: snapshot.revision,
@@ -337,7 +187,7 @@ export function createMapController({
       }
     },
     async recordFailure(sessionId, error) {
-      const at = nowDate(now).toISOString();
+      const at = new Date(now()).toISOString();
       return transact(sessionId, (current) => ({
         session: {
           ...current,
@@ -345,7 +195,7 @@ export function createMapController({
           map_controller: {
             ...current.map_controller,
             last_error: {
-              code: String(transientCode(error)),
+              code: String(error?.code ?? error?.status ?? error?.name ?? "map_controller_error"),
               message: String(error?.message ?? "Map controller failed"),
               at,
             },

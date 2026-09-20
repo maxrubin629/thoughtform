@@ -9,6 +9,7 @@ import {
   SessionSchemaError,
   SessionStore,
   UNTITLED_SESSION_TITLE,
+  validateSession,
 } from "../server/sessionStore.mjs";
 import { applyOperation } from "../server/sessionOperations.mjs";
 
@@ -141,6 +142,20 @@ test("strictly rejects unsupported or malformed persisted schemas", async () => 
   await assert.rejects(store.get(session.id), SessionSchemaError);
 });
 
+test("schema validation shares strict collection and checkpoint boundaries", async () => {
+  const { store } = await temporaryStore();
+  const session = await store.create();
+  for (const field of ["transcript", "nodes", "edges", "proposals", "operations"]) {
+    for (const invalid of [{}, [null], [{ id: "invalid/id" }]]) {
+      assert.throws(() => validateSession({ ...session, [field]: invalid }), SessionSchemaError, field);
+    }
+  }
+  const checkpoint = session.map_controller;
+  for (const invalid of [{ ...checkpoint, extra: true }, { ...checkpoint, last_error: {} }]) {
+    assert.throws(() => validateSession({ ...session, map_controller: invalid }), SessionSchemaError);
+  }
+});
+
 test("migrates v1 session and index files without backfilling historical transcript", async () => {
   const { store, directory } = await temporaryStore();
   const current = await store.create({ title: "Migration source" });
@@ -169,6 +184,11 @@ test("migrates v1 session and index files without backfilling historical transcr
   assert.equal(migrated.map_controller.last_run_id, null);
   assert.equal(JSON.parse(await readFile(path.join(directory, "_index.json"), "utf8")).schema_version, SESSION_SCHEMA_VERSION);
   assert.equal(JSON.parse(await readFile(path.join(directory, `${current.id}.json`), "utf8")).schema_version, SESSION_SCHEMA_VERSION);
+  const backup = path.join(directory, `${current.id}.json.v1.backup`);
+  assert.deepEqual(JSON.parse(await readFile(backup, "utf8")), legacy);
+  await migratedStore.rename(current.id, "Changed after migration");
+  await migratedStore.get(current.id);
+  assert.deepEqual(JSON.parse(await readFile(backup, "utf8")), legacy, "later reads and writes preserve the original backup");
 });
 
 test("migrates legacy curator records to the conservative ui origin", async () => {
@@ -284,4 +304,21 @@ test("serializes concurrent transactions for one session", async () => {
   const saved = await store.get(session.id);
   assert.equal(saved.revision, 2);
   assert.equal(saved.title, "First + second");
+});
+
+test("a failed transaction cannot leak mutations or block a queued rename", async () => {
+  const { store } = await temporaryStore();
+  const original = await store.create();
+  const failed = store.transact(original.id, (session) => {
+    session.title = "Uncommitted";
+    session.revision += 1;
+    throw new Error("Abort before persistence");
+  });
+  const renamed = store.rename(original.id, "Renamed after failure");
+  await assert.rejects(failed, /Abort before persistence/);
+  const saved = await renamed;
+  assert.equal(saved.revision, original.revision);
+  assert.equal(saved.title, "Renamed after failure");
+  saved.title = "Mutated return value";
+  assert.equal((await store.get(original.id)).title, "Renamed after failure");
 });

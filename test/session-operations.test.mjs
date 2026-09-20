@@ -791,3 +791,45 @@ test("reassigning the central idea preserves pinned positions", () => {
     { id: root.id, x: root.x, y: root.y }, { id: "other", x: 1000, y: 600 },
   ]);
 });
+
+
+test("central-idea traversal preserves cycles and disconnected thoughts through undo and redo", () => {
+  const h = harness();
+  for (const id of ["a", "b", "c", "aside"]) h.apply({ type: "create_bubble", node_id: id, text: id });
+  for (const [from, to] of [["a", "b"], ["b", "c"], ["c", "a"]]) h.apply({ type: "connect_bubbles", from, to });
+  const original = structuredClone({ nodes: h.session.nodes, edges: h.session.edges });
+  h.apply({ type: "set_central_idea", node_id: "c" });
+  assert.deepEqual(h.session.nodes.map(({ id, depth }) => [id, depth]), [["a", 1], ["b", 1], ["c", 0], ["aside", 1]]);
+  assert.equal(h.session.edges.length, 3);
+  const promoted = structuredClone({ nodes: h.session.nodes, edges: h.session.edges });
+  h.apply({ type: "undo_map_change" });
+  assert.deepEqual({ nodes: h.session.nodes, edges: h.session.edges }, original);
+  h.apply({ type: "redo_map_change" });
+  assert.deepEqual({ nodes: h.session.nodes, edges: h.session.edges }, promoted);
+});
+
+test("batch children resolve selection independently from their enclosing operation", () => {
+  const h = harness();
+  for (const id of ["a", "b", "c"]) h.apply({ type: "create_bubble", node_id: id, text: id });
+  h.apply({
+    type: "apply_map_batch", selected_node_ids: ["a"], operations: [
+      { type: "set_node_pinned", node_id: "$selected", pinned: true },
+      { type: "set_node_parked", node_id: "$selected", parked: true, selected_node_ids: ["c"] },
+    ],
+  }, { selection: { selected_node_ids: ["b"] } });
+  assert.deepEqual(h.session.nodes.map(({ id, pinned, parked }) => [id, Boolean(pinned), Boolean(parked)]), [
+    ["a", false, false], ["b", true, false], ["c", false, true],
+  ]);
+});
+
+
+test("proposal acceptance drops a stale creation before interpreting its placement", () => {
+  const h = harness();
+  const proposal = h.apply({ type: "propose_changes", operations: [
+    { type: "create_bubble", node_id: "future", text: "Proposed thought", x: "right" },
+  ] });
+  h.apply({ type: "create_bubble", node_id: "future", text: "An intervening thought" });
+  const result = h.apply({ type: "accept_proposal", proposal_id: proposal.affected_ids[0] });
+  assert.equal(result.proposal_status, "stale");
+  assert.equal(h.session.nodes[0].text, "An intervening thought");
+});

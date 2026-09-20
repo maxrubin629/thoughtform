@@ -1,3 +1,5 @@
+import { jsonSchemaFormat, strictObjectSchema } from "./aiProtocol.mjs";
+
 export const DEFAULT_MAP_CONTROLLER_MODEL = "gpt-5.6-terra";
 
 export const MAP_CONTROLLER_SYSTEM = `You are Thoughtform's silent incremental map controller. You maintain a thinking map from completed conversation evidence and never address the user.
@@ -26,98 +28,46 @@ Map policy:
 - Prefer no_change over a weak, redundant, or unsupported map mutation.
 - search_transcript is read-only. Use it only when older transcript evidence is materially needed; at most two search rounds are available.`;
 
-export const MAP_CONTROLLER_EVIDENCE_SCHEMA = {
-  type: "object",
-  properties: {
-    utterance_id: { type: "string", minLength: 1 },
-    quote: { type: "string", minLength: 1 },
-  },
-  required: ["utterance_id", "quote"],
-  additionalProperties: false,
-};
-
-const nullableString = { type: ["string", "null"] };
-
-const operationSchema = (types) => ({
-  type: "object",
-  properties: {
-    type: { type: "string", enum: types },
-    temp_id: nullableString,
-    node_id: nullableString,
-    from: nullableString,
-    to: nullableString,
-    parent: nullableString,
-    text: nullableString,
-    evidence: { type: "array", items: MAP_CONTROLLER_EVIDENCE_SCHEMA },
-  },
-  required: ["type", "temp_id", "node_id", "from", "to", "parent", "text", "evidence"],
-  additionalProperties: false,
+export const MAP_CONTROLLER_EVIDENCE_SCHEMA = strictObjectSchema({
+  utterance_id: { type: "string", minLength: 1 },
+  quote: { type: "string", minLength: 1 },
 });
 
-const DIRECT_TYPES = [
-  "create_bubble",
-  "revisit_bubble",
-  "edit_bubble",
-  "set_central_idea",
-  "connect_bubbles",
-];
-const PROPOSAL_TYPES = [
-  "create_bubble",
-  "revisit_bubble",
-  "edit_bubble",
-  "connect_bubbles",
-  "delete_bubble",
-  "delete_connection",
-];
-const directTypes = new Set(DIRECT_TYPES);
-const proposalTypes = new Set(PROPOSAL_TYPES);
+const nullableString = { type: ["string", "null"] };
+const operationSchema = (types) => strictObjectSchema({
+  type: { type: "string", enum: types },
+  temp_id: nullableString,
+  node_id: nullableString,
+  from: nullableString,
+  to: nullableString,
+  parent: nullableString,
+  text: nullableString,
+  evidence: { type: "array", items: MAP_CONTROLLER_EVIDENCE_SCHEMA },
+});
 
-export const MAP_CONTROLLER_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    decision: { type: "string", enum: ["apply", "no_change"] },
-    operations: {
-      type: "array",
-      maxItems: 8,
-      items: operationSchema(DIRECT_TYPES),
-    },
-    proposal: {
-      anyOf: [
-        { type: "null" },
-        {
-          type: "object",
-          properties: {
-            rationale: { type: "string" },
-            evidence: { type: "array", items: MAP_CONTROLLER_EVIDENCE_SCHEMA },
-            operations: {
-              type: "array",
-              minItems: 1,
-              maxItems: 5,
-              items: operationSchema(PROPOSAL_TYPES),
-            },
-          },
-          required: ["rationale", "evidence", "operations"],
-          additionalProperties: false,
-        },
-      ],
-    },
-  },
-  required: ["decision", "operations", "proposal"],
-  additionalProperties: false,
-};
+const directOperationSchema = operationSchema([
+  "create_bubble", "revisit_bubble", "edit_bubble", "set_central_idea", "connect_bubbles",
+]);
+const proposalOperationSchema = operationSchema([
+  "create_bubble", "revisit_bubble", "edit_bubble", "connect_bubbles", "delete_bubble", "delete_connection",
+]);
+const proposalSchema = strictObjectSchema({
+  rationale: { type: "string" },
+  evidence: { type: "array", items: MAP_CONTROLLER_EVIDENCE_SCHEMA },
+  operations: { type: "array", minItems: 1, maxItems: 5, items: proposalOperationSchema },
+});
+
+export const MAP_CONTROLLER_OUTPUT_SCHEMA = strictObjectSchema({
+  decision: { type: "string", enum: ["apply", "no_change"] },
+  operations: { type: "array", maxItems: 8, items: directOperationSchema },
+  proposal: { anyOf: [{ type: "null" }, proposalSchema] },
+});
 
 export const SEARCH_TRANSCRIPT_TOOL = {
   type: "function",
   name: "search_transcript",
   description: "Search completed transcript evidence without loading the full transcript. Returns at most eight ranked matches with adjacent context.",
-  parameters: {
-    type: "object",
-    properties: {
-      query: { type: "string", minLength: 1 },
-    },
-    required: ["query"],
-    additionalProperties: false,
-  },
+  parameters: strictObjectSchema({ query: { type: "string", minLength: 1 } }),
   strict: true,
 };
 
@@ -129,6 +79,9 @@ export class MapControllerError extends Error {
     this.retryable = retryable;
   }
 }
+
+const invalidOutput = (message, cause) => new MapControllerError(message, { code: "invalid_output", cause });
+const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
 function normalizedText(value) {
   return String(value ?? "")
@@ -161,7 +114,7 @@ export function searchTranscript(transcript, query, { limit = 8 } = {}) {
   return (transcript ?? [])
     .map((item, index) => {
       const text = normalizedText(item?.text);
-      const tokens = new Set(transcriptTokens(item?.text));
+      const tokens = new Set(text.split(/\s+/));
       const overlap = queryTokens.filter((token) => tokens.has(token)).length;
       const phraseIndex = text.indexOf(phrase);
       const score = (phraseIndex >= 0 ? 10_000 - phraseIndex : 0)
@@ -225,16 +178,9 @@ export function buildMapControllerEnvelope(snapshot, start, watermark) {
   };
 }
 
-export function mapControllerOutputFormat() {
-  return {
-    format: {
-      type: "json_schema",
-      name: "thoughtform_map_controller_decision",
-      strict: true,
-      schema: MAP_CONTROLLER_OUTPUT_SCHEMA,
-    },
-  };
-}
+export const mapControllerOutputFormat = () => (
+  jsonSchemaFormat("thoughtform_map_controller_decision", MAP_CONTROLLER_OUTPUT_SCHEMA)
+);
 
 export function developerEvidenceInput(envelope, repair = null) {
   return [{
@@ -256,85 +202,80 @@ export function mapControllerResponseFunctionCalls(response) {
 
 function parseResponseDecision(response) {
   if (typeof response?.output_text !== "string" || !response.output_text.trim()) {
-    throw new MapControllerError("Map controller returned no structured decision.", { code: "invalid_output" });
+    throw invalidOutput("Map controller returned no structured decision.");
   }
   try {
     return JSON.parse(response.output_text);
   } catch (cause) {
-    throw new MapControllerError("Map controller returned malformed JSON.", { code: "invalid_output", cause });
+    throw invalidOutput("Map controller returned malformed JSON.", cause);
   }
 }
 
 function evidenceArray(value, pathname) {
-  if (!Array.isArray(value)) throw new MapControllerError(`${pathname} must be an array.`, { code: "invalid_output" });
+  if (!Array.isArray(value)) throw invalidOutput(`${pathname} must be an array.`);
   return value.map((item, index) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)
+    if (!isRecord(item)
       || Object.keys(item).some((key) => key !== "utterance_id" && key !== "quote")
       || typeof item.utterance_id !== "string" || !item.utterance_id
       || typeof item.quote !== "string" || !item.quote) {
-      throw new MapControllerError(`${pathname}[${index}] must contain only utterance_id and exact quote.`, {
-        code: "invalid_output",
-      });
+      throw invalidOutput(`${pathname}[${index}] must contain only utterance_id and exact quote.`);
     }
     return { utterance_id: item.utterance_id, quote: item.quote };
   });
 }
 
-function validateOperation(value, types, pathname) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || !types.has(value.type)) {
-    throw new MapControllerError(`${pathname} has an unsupported operation type.`, { code: "invalid_output" });
+function validateOperation(value, schema, pathname) {
+  if (!isRecord(value) || !schema.properties.type.enum.includes(value.type)) {
+    throw invalidOutput(`${pathname} has an unsupported operation type.`);
   }
-  const allowed = new Set(["type", "temp_id", "node_id", "from", "to", "parent", "text", "evidence"]);
-  if (Object.keys(value).some((key) => !allowed.has(key))) {
-    throw new MapControllerError(`${pathname} contains an unsupported field.`, { code: "invalid_output" });
+  if (Object.keys(value).some((key) => !Object.hasOwn(schema.properties, key))) {
+    throw invalidOutput(`${pathname} contains an unsupported field.`);
   }
   const evidence = evidenceArray(value.evidence ?? [], `${pathname}.evidence`);
   return { ...value, evidence };
 }
 
 function validateDecision(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new MapControllerError("The map controller decision must be an object.", { code: "invalid_output" });
+  if (!isRecord(value)) {
+    throw invalidOutput("The map controller decision must be an object.");
   }
   if (value.decision !== "apply" && value.decision !== "no_change") {
-    throw new MapControllerError("decision must be apply or no_change.", { code: "invalid_output" });
+    throw invalidOutput("decision must be apply or no_change.");
   }
-  if (Object.keys(value).some((key) => !["decision", "operations", "proposal"].includes(key))) {
-    throw new MapControllerError("The map controller decision contains an unsupported field.", { code: "invalid_output" });
+  if (Object.keys(value).some((key) => !Object.hasOwn(MAP_CONTROLLER_OUTPUT_SCHEMA.properties, key))) {
+    throw invalidOutput("The map controller decision contains an unsupported field.");
   }
   if (!Array.isArray(value.operations) || value.operations.length > 8) {
-    throw new MapControllerError("operations must contain at most eight direct operations.", { code: "invalid_output" });
+    throw invalidOutput("operations must contain at most eight direct operations.");
   }
   const operations = value.operations.map((operation, index) => (
-    validateOperation(operation, directTypes, `operations[${index}]`)
+    validateOperation(operation, directOperationSchema, `operations[${index}]`)
   ));
   let proposal = null;
   if (value.proposal !== null && value.proposal !== undefined) {
-    if (!value.proposal || typeof value.proposal !== "object"
+    if (!isRecord(value.proposal)
       || typeof value.proposal.rationale !== "string"
       || !Array.isArray(value.proposal.operations)
       || value.proposal.operations.length < 1
       || value.proposal.operations.length > 5) {
-      throw new MapControllerError("proposal must contain a rationale and one to five operations.", {
-        code: "invalid_output",
-      });
+      throw invalidOutput("proposal must contain a rationale and one to five operations.");
     }
-    if (Object.keys(value.proposal).some((key) => !["rationale", "evidence", "operations"].includes(key))) {
-      throw new MapControllerError("proposal contains an unsupported field.", { code: "invalid_output" });
+    if (Object.keys(value.proposal).some((key) => !Object.hasOwn(proposalSchema.properties, key))) {
+      throw invalidOutput("proposal contains an unsupported field.");
     }
     proposal = {
       ...value.proposal,
       evidence: evidenceArray(value.proposal.evidence ?? [], "proposal.evidence"),
       operations: value.proposal.operations.map((operation, index) => (
-        validateOperation(operation, proposalTypes, `proposal.operations[${index}]`)
+        validateOperation(operation, proposalOperationSchema, `proposal.operations[${index}]`)
       )),
     };
   }
   if (value.decision === "no_change" && (operations.length || proposal)) {
-    throw new MapControllerError("no_change cannot include operations or a proposal.", { code: "invalid_output" });
+    throw invalidOutput("no_change cannot include operations or a proposal.");
   }
   if (value.decision === "apply" && !operations.length && !proposal) {
-    throw new MapControllerError("apply must include a direct operation or proposal.", { code: "invalid_output" });
+    throw invalidOutput("apply must include a direct operation or proposal.");
   }
   return { decision: value.decision, operations, proposal };
 }
