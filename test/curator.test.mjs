@@ -138,7 +138,7 @@ test("curator returns no card for an empty recommendation", async () => {
   assert.equal(await curator.propose(snapshot()), null);
 });
 
-test("curator sends bounded recent conversation context and defaults to Sol", async () => {
+test("curator sends bounded recent conversation context and defaults to GPT-6 Luna high", async () => {
   let request;
   const curator = createCurator({
     env: { THOUGHTFORM_CURATOR_ENABLED: "true" },
@@ -155,7 +155,8 @@ test("curator sends bounded recent conversation context and defaults to Sol", as
 
   await curator.propose(snapshot({ transcript }));
 
-  assert.equal(curator.model, "gpt-5.6-sol");
+  assert.equal(curator.model, "gpt-6-luna");
+  assert.deepEqual(request.reasoning, { effort: "high" });
   assert.deepEqual(
     JSON.parse(request.input).transcript.map(({ id }) => id),
     transcript.slice(-8).map(({ id }) => id),
@@ -294,4 +295,77 @@ test("scheduler reschedules instead of overlapping an active map-controller pass
   await queued.shift()();
   assert.deepEqual(proposals, ["proposal-after-controller"]);
   scheduler.dispose();
+});
+
+test("quiet and mapping pause suppress unsolicited proposals independently of layer visibility", async () => {
+  let requests = 0;
+  const curator = createCurator({
+    env: {},
+    client: { responses: { create: async () => { requests += 1; return { output_text: '{"rationale":"None","evidence":[],"operations":[]}' }; } } },
+  });
+  for (const preferences of [{ partner_mode: "quiet", mapping_paused: false }, { partner_mode: "proactive", mapping_paused: true }]) {
+    assert.equal(shouldRunCurator(snapshot({ preferences })), false);
+    assert.equal(await curator.propose(snapshot({ preferences })), null);
+  }
+  assert.equal(requests, 0);
+  assert.equal(shouldRunCurator(snapshot({ preferences: { partner_mode: "proactive", mapping_paused: false }, show_proposals: false })), true);
+});
+
+test("curator rechecks quiet preference after a model result arrives", async () => {
+  let current = snapshot();
+  const callbacks = [];
+  const proposals = [];
+  const scheduler = createCuratorScheduler({
+    curator: {
+      enabled: true,
+      shouldRun: () => true,
+      propose: async () => {
+        current = snapshot({ preferences: { partner_mode: "quiet", mapping_paused: false } });
+        return { id: "late-proposal" };
+      },
+    },
+    loadSnapshot: async () => current,
+    onProposal: async (_id, proposal) => proposals.push(proposal),
+    setTimer: (callback, delay) => { callbacks.push({ callback, delay }); return callbacks.length; },
+    clearTimer: () => {},
+  });
+  scheduler.notify("session-1");
+  assert.equal(callbacks[0].delay, 10_000);
+  await callbacks[0].callback();
+  assert.deepEqual(proposals, []);
+  scheduler.dispose();
+});
+
+test("an in-flight curator result is discarded when the map controller becomes active", async () => {
+  const callbacks = [];
+  const proposals = [];
+  let blocked = false;
+  const scheduler = createCuratorScheduler({
+    curator: {
+      enabled: true, shouldRun: () => true,
+      propose: async () => { blocked = true; return { id: "stale-proposal" }; },
+    },
+    loadSnapshot: async () => snapshot(),
+    onProposal: async (_id, proposal) => proposals.push(proposal),
+    isBlocked: () => blocked,
+    setTimer: (callback) => { callbacks.push(callback); return callbacks.length; },
+    clearTimer: () => {},
+  });
+  scheduler.notify("session-1");
+  await callbacks[0]();
+  assert.deepEqual(proposals, []);
+  assert.equal(callbacks.length, 2);
+  scheduler.dispose();
+});
+
+test("curator leaves parked thoughts alone", async () => {
+  const curator = createCurator({
+    env: {},
+    client: { responses: { create: async () => ({ output_text: JSON.stringify({
+      rationale: "Connect parked idea", evidence: [], operations: [{ type: "connect_bubbles", from: "n1", to: "n2" }],
+    }) }) } },
+  });
+  const value = snapshot();
+  value.nodes[0].parked = true;
+  assert.equal(await curator.propose(value), null);
 });

@@ -38,6 +38,7 @@ export function createMapControllerScheduler({
         pendingWatermark: null,
         abortController: null,
         generation: 0,
+        paused: false,
       });
     }
     return sessions.get(sessionId);
@@ -105,6 +106,14 @@ export function createMapControllerScheduler({
     }
     if (disposed || generation !== entry.generation || !entry.preparing || entry.active) return;
     entry.preparing = false;
+    entry.paused = snapshot.preferences?.mapping_paused === true;
+    if (entry.paused) {
+      entry.pendingWatermark = null;
+      entry.retryAttempt = 0;
+      entry.queued = false;
+      reportState(sessionId);
+      return;
+    }
     if (entry.pendingWatermark === null) entry.pendingWatermark = snapshot.transcript?.length ?? 0;
     if (!hasPendingUser(snapshot, entry.pendingWatermark)) {
       entry.pendingWatermark = null;
@@ -129,7 +138,7 @@ export function createMapControllerScheduler({
     } finally {
       entry.active = false;
       entry.abortController = null;
-      if (completed) {
+      if (completed && !completed.paused && generation === entry.generation) {
         try {
           await onComplete(sessionId, completed);
         } catch (error) {
@@ -155,6 +164,7 @@ export function createMapControllerScheduler({
   const notify = (sessionId, completedUtterance) => {
     if (disposed || completedUtterance?.speaker !== "you" || !completedUtterance?.text?.trim()) return false;
     const entry = entryFor(sessionId);
+    if (entry.paused) return false;
     if (entry.preparing || entry.active) {
       entry.queued = true;
       reportState(sessionId);
@@ -218,6 +228,7 @@ export function createMapControllerScheduler({
       queued: Boolean(entry?.queued),
       retry_attempt: entry?.retryAttempt ?? 0,
       watermark: entry?.pendingWatermark ?? null,
+      paused: Boolean(entry?.paused),
     };
   };
 
@@ -234,10 +245,24 @@ export function createMapControllerScheduler({
     [...sessions.keys()].forEach(cancel);
   };
 
+  const preferencesChanged = async (sessionId) => {
+    if (disposed) return false;
+    const snapshot = await loadSnapshot(sessionId);
+    const entry = entryFor(sessionId);
+    entry.paused = snapshot.preferences?.mapping_paused === true;
+    if (entry.paused) {
+      cancel(sessionId);
+      reportState(sessionId);
+      return true;
+    }
+    return recover(sessionId);
+  };
+
   return {
     notify,
     retry,
     recover,
+    preferencesChanged,
     openSession: recover,
     cancel,
     state,

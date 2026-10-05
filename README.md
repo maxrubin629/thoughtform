@@ -19,7 +19,7 @@ I built ThoughtForm with my friend and co-contributor/co-submitter, **Hemanth Sa
 
 Most thinking tools make you choose: stay in the flow, or stop and organize what you are thinking. Voice AI has the opposite problem. The conversation can feel natural, but every idea is still trapped in a linear transcript.
 
-ThoughtForm is meant to feel more like a visible second working memory. You speak naturally with an AI partner while a map forms alongside the conversation. Completed thoughts become concise bubbles, related ideas connect, repeated ideas grow warmer instead of duplicating themselves, and every interpretation remains traceable to the exact words that produced it.
+ThoughtForm is meant to feel more like a visible second working memory. You speak naturally with an AI partner while a map forms alongside the conversation. Completed thoughts become concise bubbles, related ideas connect, and repeated ideas revisit existing bubbles. Their size and text stay stable. Every captured interpretation remains traceable to the exact words that produced it.
 
 The larger idea is a reciprocal loop:
 
@@ -27,20 +27,24 @@ The larger idea is a reciprocal loop:
 
 It is not a recorder that generates a diagram after the fact. The map is part of the thinking process while it is happening.
 
-## What the hackathon build does
+## What the current app does
 
-- Holds a low-latency voice conversation with a warm, brief AI `Partner`.
-- Commits only finalized utterances. Partial speech stays in the live caption and never rewrites the map.
+- Holds a voice conversation with a warm, brief AI `Partner` through GPT-Live, with separate mute and end controls.
+- Saves original transcript fragments and commits semantically complete thoughts. Partial speech stays in independent user and Partner captions and never rewrites the map.
 - Condenses one completed thought into at most three legible bubbles while preserving the full transcript.
-- Uses a silent GPT-5.6 controller to create, revisit, edit, connect, and reorganize ideas without delaying the spoken response.
-- Commits clear, reversible interpretations directly and turns uncertain or destructive interpretations into ghost proposals with explicit accept and dismiss controls.
+- Uses a silent GPT-6 Luna controller at high reasoning effort to create, revisit, edit, connect, and reorganize ideas without delaying the spoken response.
+- Commits clear, reversible interpretations directly and turns uncertain or destructive interpretations into ghost suggestions with explicit accept and dismiss controls.
 - Links bubbles back to exact transcript spans so the map remains correctable rather than becoming an untraceable AI summary.
 - Keeps one underlying graph with switchable organic cluster and hierarchy views.
 - Supports direct manipulation: drag, connect, edit, delete, rectangle-select, focus, zoom, undo, and redo.
-- Produces a written synthesis of the current map without turning the result into an action plan.
-- Persists the canonical session as local JSON, including transcript, graph, proposals, revisions, and activity history.
+- Offers new directions as reviewable suggestions after mapping settles. Quiet mode suppresses unsolicited suggestions while conversation and mapping continue.
+- Lets you pause mapping, pin a bubble's position, or keep a thought aside from automatic changes.
+- Shows recent map changes, groups a controller interpretation into one undo step, and restores the previous view after exploration.
+- Keeps conversation, exact sources, suggestions, and synthesis in one resizable panel. Session titles are editable, and each map remembers its browser view.
+- Saves written synthesis with its source revision and exports readable Markdown notes or the full JSON session.
+- Persists the canonical session as local JSON, including transcript, original fragments, graph, suggestions, preferences, revisions, and activity history.
 
-The primary conversation-first experience lives at `/`. The earlier Paper/Nocturne canvas remains available at `/?mode=classic` as a design and interaction sandbox, including direct AI branch generation.
+ThoughtForm has one workspace at `/`. Older `/?mode=session` and `/?mode=classic` bookmarks open this workspace and normalize to the main URL. The separate Classic interface has been retired.
 
 ## The two AI streams
 
@@ -49,42 +53,44 @@ ThoughtForm is designed around two related but different kinds of intelligence:
 1. **Your thought stream** becomes concise, provenance-linked bubbles. The system organizes what you meant without pretending its interpretation is the original source.
 2. **ThoughtForm's idea stream** introduces possibilities that were not already in your words: an analogy, counterexample, question, tension, connection, or new branch.
 
-The current primary session focuses on making the first stream trustworthy and gives uncertain structural work a complete ghost-proposal lifecycle. Classic mode already demonstrates generated ghost branches. The next product step is to bring a dedicated generative ideator into the primary session so those new possibilities can appear quietly while the conversation continues.
+Both streams are implemented in the primary session. The creative suggestion loop waits 10 seconds after the map controller finishes, reads the eight most recent utterances alongside the map, and may propose one card with at most three operations. It requires three new user turns between evaluations, allows one pending suggestion, and caps creative suggestions at three per session. Producing no suggestion is a valid result. All model activity appears under the single identity `Partner`.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    U["Voice or text"] --> R["Realtime Partner"]
-    R -->|"brief spoken response"| U
-    R -->|"finalized transcript"| S["Canonical session server"]
-
-    S --> T["Append-only transcript + exact provenance"]
-    S --> G["Accepted graph + revisions + history"]
-    S --> P["Reviewable ghost proposals"]
-
-    S -->|"completed transcript delta"| C["Silent GPT-5.6 map controller"]
-    C -->|"structured operations"| S
-    C -.->|"bounded transcript search"| T
-
+    U["Voice"] <--> L["GPT-Live Partner"]
+    L -->|"client delegation"| B["GPT-6 Luna high reasoning + explicit commands"]
+    B -->|"verified result"| L
+    L -->|"original transcript fragments"| C["GPT-6 Luna high completeness check"]
+    C -->|"complete thoughts"| S["Canonical local session"]
+    X["Typed conversation"] --> B
+    B --> S
+    S -->|"completed transcript delta"| M["GPT-6 Luna high map controller"]
+    M -->|"atomic map change or suggestion"| S
+    M -->|"after settling"| I["GPT-6 Luna high creative suggestions"]
+    I -->|"reviewable suggestion only"| S
     S -->|"REST + SSE snapshots"| V["React fluid canvas"]
     V -->|"edit, accept, dismiss, undo"| S
-    S -->|"on demand"| Y["GPT-5.6 synthesis"]
-    Y --> V
+    S -->|"on demand"| Y["GPT-6 Luna high synthesis"]
+    Y -->|"saved with source revision"| S
 ```
 
-The server owns semantic truth. It stores the complete transcript, accepted graph, proposal state, operation record, and revision history. The browser owns transient physics, deformation, and animation. That separation lets the canvas feel fluid without allowing an old React render or a stale model response to overwrite newer meaning.
+The server owns semantic truth. It stores the complete transcript, accepted graph, suggestion state, operation record, and revision history. The browser owns transient physics, deformation, and animation. That separation lets the canvas feel fluid without allowing an old React render or a stale model response to overwrite newer meaning.
 
-The controller uses strict structured output and exact evidence. It can search older transcript context when necessary, but it cannot treat transcript text as instructions or cite speech that occurred after the transcript watermark it was given. Revision checks, idempotent call IDs, proposal rebasing, and atomic undo protect the map when voice, UI, and background model work arrive concurrently.
+The controller uses strict structured output and exact evidence. It can search older transcript context when necessary, but it cannot treat transcript text as instructions or cite speech that occurred after the transcript watermark it was given. Revision checks, idempotent call IDs, suggestion rebasing, and atomic undo protect the map when voice, UI, and background model work arrive concurrently.
+
+GPT-Live does not send an authoritative utterance-completed event. The application preserves its original transcript fragments and asks GPT-6 Luna to identify complete thoughts without rewriting their text. Pauses and audio activity are hints, not completion guarantees. Unfinished speech remains saved for later processing and export. The foreground Partner delegates explicit map commands; automatic mapping and creative suggestions run separately.
 
 ## OpenAI technology
 
 ### In the product
 
-- **GPT Realtime (`gpt-realtime-2.1`)** powers the foreground voice conversation over WebRTC. It responds to the substance of the conversation and uses map tools only for explicit spoken map commands.
-- **GPT-5.6 Sol** runs as a silent, asynchronous map controller over the Responses API. It receives completed transcript deltas and returns schema-constrained map operations or a reviewable proposal.
-- **GPT-5.6 Terra** powers on-demand synthesis and the classic canvas AI flows by default. Models remain configurable through environment variables.
-- **Structured Outputs and function calling** constrain graph mutations, evidence, and proposal operations instead of asking the UI to interpret free-form model prose.
+- GPT-Live `gpt-live-1` runs the foreground voice conversation over WebRTC using client delegation.
+- GPT-6 Luna `gpt-6-luna` with high reasoning effort handles delegated reasoning and explicit commands, typed conversation, thought-completion checks, automatic mapping, creative suggestions, and synthesis. These are separate jobs with different permissions and context.
+- Structured Outputs and function calling constrain graph mutations, evidence, and suggestion operations. Models remain configurable through environment variables.
+
+Official references: [Live conversations](https://developers.openai.com/api/docs/guides/live-conversations), [client delegation](https://developers.openai.com/api/docs/guides/live-delegation), and [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna).
 
 ### In the development process
 
@@ -95,16 +101,16 @@ Codex accelerated our work on:
 - Turning the initial product conversation and visual references into interactive Paper and Nocturne prototypes.
 - Building the organic lobe renderer, fused connections, local physics, causal growth and rupture motion, and the canvas gesture system.
 - Moving the session model from browser-only prototype state into a server-owned, revisioned local session.
-- Implementing the Realtime WebRTC bridge, the GPT-5.6 controller, structured operations, SSE updates, provenance validation, proposal rebasing, and automated tests.
+- Implementing the Realtime WebRTC bridge, the GPT-5.6 controller, structured operations, SSE updates, provenance validation, suggestion rebasing, and automated tests.
 - Running repeated browser QA and adversarial review passes that caught stale snapshots, conflicting revisions, gesture collisions, and cross-boundary Realtime races.
 
-We kept the key product and design decisions explicit: conversation stays in the foreground; the graph changes only after a complete thought; the transcript is lossless; clear changes can be direct but meaning-changing uncertainty must stay reviewable; accepted nodes are never silently rewritten; semantic state belongs to the server while physical motion belongs to the browser; and the final artifact is a thinking map plus synthesis, not a generated task list.
+We kept the key product and design decisions explicit. Conversation stays in the foreground, and automatic mapping uses complete thoughts with exact provenance. Clear changes can be direct and reversible; uncertain or destructive interpretations stay reviewable. Semantic state belongs to the server while physical motion belongs to the browser. The final artifact is a thinking map plus synthesis.
 
 ## Design principles
 
 - **Do not interrupt thought to document thought.** Mapping should happen quietly around the conversation.
 - **Interpretation is not source.** Bubbles can be concise, but the complete transcript and exact provenance remain available.
-- **Agency scales with uncertainty.** Clear reversible intent can commit; uncertain or destructive interpretation becomes a proposal.
+- **Agency scales with uncertainty.** Clear reversible intent can commit; uncertain or destructive interpretation becomes a suggestion.
 - **Motion should explain cause.** Connections grow from a source, contact a target, and rupture from the exact click point. Nothing moves merely to look alive.
 - **One graph, multiple views.** Clusters and hierarchy are different ways to inspect the same ideas, not separate documents.
 - **Local-first by default.** The hackathon prototype stores session artifacts locally and does not retain raw audio.
@@ -113,7 +119,7 @@ We kept the key product and design decisions explicit: conversation stays in the
 
 ### Requirements
 
-- Node.js 20 or newer
+- Node.js 22.9 or newer
 - npm
 - An OpenAI API key for live voice and model-backed mapping
 - A modern browser with WebRTC and microphone support
@@ -131,11 +137,13 @@ Add your key to `.env`:
 
 ```dotenv
 OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-5.6-terra
-OPENAI_REALTIME_MODEL=gpt-realtime-2.1
-OPENAI_REALTIME_VOICE=marin
-OPENAI_MAP_CONTROLLER_MODEL=gpt-5.6-sol
+OPENAI_MODEL=gpt-6-luna
+OPENAI_LIVE_MODEL=gpt-live-1
+OPENAI_LIVE_BACKEND_MODEL=gpt-6-luna
+OPENAI_MAP_CONTROLLER_MODEL=gpt-6-luna
 THOUGHTFORM_MAP_CONTROLLER_ENABLED=true
+OPENAI_CURATOR_MODEL=gpt-6-luna
+THOUGHTFORM_CURATOR_ENABLED=true
 PORT=8787
 ```
 
@@ -147,7 +155,7 @@ npm run dev
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173), allow microphone access, and start with any unresolved idea.
 
-The server also starts without an API key in mock mode, which is useful for exploring the canvas and typed-thought flow. Live voice, synthesis, and the GPT-5.6 controller require a valid key. Local sessions are written to `data/sessions/` and are intentionally ignored by Git.
+The API key stays on the local server. Without a valid key, you can inspect saved maps and use manual canvas controls, but voice, typed Partner replies, automatic mapping, creative suggestions, and synthesis are unavailable. Local sessions are written to `data/sessions/` and are intentionally ignored by Git. Set `THOUGHTFORM_DATA_DIR` to use another session directory. Schema upgrades preserve a backup of the original session file.
 
 ### Useful commands
 
@@ -159,7 +167,27 @@ npm run preview      # preview the production build
 npm test             # automated unit and integration tests
 ```
 
-The current hackathon branch builds successfully and passes all 145 automated tests.
+Tests cover transcript preservation, Live transport and delegation, graph operations, concurrency, persistence, and canvas behavior. A synthetic-silence WebRTC smoke check has verified GPT-Live connection, mute, unmute, and close; an earlier Terra call verified the completeness-check contract before the GPT-6 Luna switch. Those checks do not establish spoken conversation quality or microphone performance.
+
+## Browser-local example
+
+The example opens the same organic canvas with an illustrative conversation about a neighborhood reading room. It needs no API server, API key, account, or paid model call. Voice and AI generation are off and labeled as such; the sample is authored content, not a recording of a real conversation.
+
+```bash
+npm run dev:example       # frontend only
+npm run build:example     # static files in dist-example/
+npm run preview:example   # preview that static build
+```
+
+The normal development app also exposes the example at `/example` or `/?example=1`. `/` continues to use the live server. Old Classic/session bookmarks still normalize as before.
+
+Each browser keeps its own example copies in IndexedDB. You can edit and connect thoughts, inspect exact source spans, accept or dismiss the saved suggestion, undo and redo, and reopen maps after a reload. Maps offers **New example copy**, which keeps previous copies, and **Import full session**. JSON export includes the complete transcript and reversible history; importing it creates a new copy and preserves its undo/redo branch. Markdown export contains the readable map, synthesis, and sources. Clearing browser data removes local copies, so export JSON to keep an independent backup.
+
+The live server and example share `shared/sessionSchema.mjs`, `shared/sessionOperations.mjs`, `shared/sessionSnapshot.mjs`, and `shared/sessionExport.mjs`. The example persists full canonical records and projects display snapshots only for rendering. The live server retains its local JSON store, background controllers, and SSE transport.
+
+`npm test` includes recovery and example-operation regression tests. With the example dev server running, `/test/example-browser.html` runs checks against real IndexedDB, including reopen, JSON round trips, concurrent writes, and transaction rollback. This development test page is excluded from the production build.
+
+Typed-message retries retain their submission ID if the message was saved but Partner failed. Speech-completion failures use bounded retries and expose **Retry thought capture** after a failure; unfinished speech still requires semantic completion.
 
 ## Built with
 
@@ -167,7 +195,7 @@ The current hackathon branch builds successfully and passes all 145 automated te
 - Express 5
 - OpenAI JavaScript SDK
 - OpenAI Responses API
-- OpenAI Realtime API over WebRTC
+- OpenAI Live API over WebRTC
 - Server-Sent Events
 - Canvas 2D and WebGL2
 - Tabler Icons and Manrope
@@ -194,7 +222,7 @@ The connected lobes are not cards with lines between them. They are one continuo
 ## Accomplishments we're proud of
 
 - A real conversation-first session rather than a scripted voice mockup.
-- A server-owned semantic graph with append-only transcript, exact source spans, revisions, proposals, activity history, and reversible map edits.
+- A server-owned semantic graph with append-only transcript, exact source spans, revisions, suggestions, activity history, and reversible map edits.
 - A silent controller that can work after each completed utterance without slowing or narrating the conversation.
 - Reviewable ghost operations that can rebase against a newer map and drop invalid or duplicate changes safely.
 - A visual system where the interaction model and the product idea are the same thing: ideas feel distinct, connected, movable, and alive without becoming visually noisy.
@@ -203,13 +231,13 @@ The connected lobes are not cards with lines between them. They are one continuo
 
 The important boundary is not simply which model is more capable. It is which model is allowed to act, on what evidence, and at what moment.
 
-Realtime is best when it protects the conversational flow. GPT-5.6 is best when it can reason over a larger semantic state without needing to speak. The canonical session is what makes those two forms of intelligence feel like one product rather than two competing agents.
+The voice model protects conversational flow. The reasoning model works over the semantic state without needing to speak. The canonical session lets those jobs contribute to one product without competing to control the map.
 
 We also learned that provenance changes the experience more than we expected. Once a bubble can reveal the exact moment it came from, aggressive condensation becomes much safer because the user's original meaning is never gone.
 
 ## What's next
 
-- Bring a dedicated generative ideator into the primary session so new analogies, questions, tensions, and branches can appear as quiet ghost possibilities while the user keeps speaking.
+- Evaluate GPT-Live with real spoken sessions, especially interruptions, corrections, overlapping speech, and long thinking pauses.
 - Package the experience as the intended local-first Electron app.
 - Add multi-speaker sessions and diarization after the solo thinking loop is stable.
 - Add end-of-session consolidation and richer synthesis without turning ThoughtForm into an action-plan generator.
@@ -218,3 +246,5 @@ We also learned that provenance changes the experience more than we expected. On
 ## Build Week scope
 
 ThoughtForm's repository, interaction system, canonical session architecture, OpenAI integrations, and primary conversation-first experience were created during the OpenAI Build Week submission period by Max Rubin and Hemanth Sammatur, working with Codex and GPT-5.6 Sol.
+
+The GPT-Live/Terra migration and the workspace controls described above extend that original build.

@@ -1,9 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   IconAffiliate,
   IconArrowBackUp,
+  IconArrowLeft,
+  IconDownload,
+  IconDots,
+  IconMicrophoneOff,
+  IconPlayerPause,
+  IconPlayerPlay,
+  IconPlayerStop,
   IconArrowForwardUp,
   IconCheck,
+  IconChevronDown,
   IconClock,
   IconEye,
   IconFocusCentered,
@@ -11,6 +19,8 @@ import {
   IconHierarchy2,
   IconMap2,
   IconMarquee,
+  IconLasso,
+  IconLink,
   IconMessageCircle,
   IconMicrophone,
   IconMinus,
@@ -28,6 +38,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import { IconButton, MindMap, layoutHierarchy } from "./App.jsx";
+import { canConnect } from "./connectionGesture.js";
 import { BASE_HEIGHT, BASE_WIDTH } from "./mapData.js";
 import {
   FLUID_PHYSICS_SETTINGS,
@@ -35,7 +46,6 @@ import {
   stepFluidPhysics,
 } from "./fluidPhysics.js";
 import { clamp, withWobble } from "./fluidMaterial.js";
-import { condenseUtterance, informativeTokens, overlapScore } from "./session/condense.js";
 import {
   applyConnectionGrowthMotion,
   buildConnectionPopTransition,
@@ -54,30 +64,31 @@ import {
   proposalVisuals,
   visualizeSession,
 } from "./session/presentation.js";
+import { SessionApiError, shouldApplySessionSnapshot } from "./sessionApi.js";
+import { createSessionLiveClient } from "./sessionLive.js";
+import { liveWorkspaceClient } from "./workspaceClient.js";
+import { createChatSubmission } from "./chatSubmission.js";
+import { suggestionDisplayText } from "../shared/presentationText.mjs";
+import { readWorkspaceState, writeWorkspaceState, recentMapChange, latestUndoLabel, groupUtterancesByPause, WORKSPACE_CAMERA_VERSION } from "./workspaceUi.js";
 import {
-  SessionApiError,
-  applySessionOperation,
-  createSession,
-  deleteSession,
-  getSession,
-  listSessions,
-  renameSession,
-  retrySessionMapController,
-  shouldApplySessionSnapshot,
-  subscribeSessionEvents,
-  synthesizeSession,
-  updateSessionUiContext,
-} from "./sessionApi.js";
-import { createSessionRealtimeClient } from "./sessionRealtime.js";
+  MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM, DEFAULT_CAMERA_ZOOM, cameraTransform, cameraCenteredOn,
+  zoomCameraAt, initialMapCamera, fitMapCamera, revealNodeCamera,
+} from "./mapCamera.js";
 
-const MIN_ZOOM = 0.72;
-const MAX_ZOOM = 1.36;
-const ZOOM_STEP = 0.08;
-const REMENTION_MIN_OVERLAP = 2;
-const REMENTION_COVERAGE = 0.6;
-const ATTACH_MIN_OVERLAP = 1;
+const bootstrapPromises = new WeakMap();
 
-let bootstrapPromise;
+function RailButton({ label, children, active = false, pressed, expanded, onClick, testId, className = "" }) {
+  return (
+    <div className={`session-rail-item ${active ? "is-current" : ""}`}>
+      <button type="button" className={`icon-button ${active ? "is-active" : ""} ${className}`}
+        aria-label={label} aria-pressed={pressed} aria-expanded={expanded}
+        onClick={onClick} data-testid={testId}>
+        {children}
+      </button>
+      <span className="session-rail-tooltip" aria-hidden="true">{label}</span>
+    </div>
+  );
+}
 
 function snapshotFrom(value) {
   return value?.snapshot ?? value?.session ?? (value?.id && value?.schema_version ? value : null);
@@ -91,9 +102,14 @@ function listPayload(value) {
   };
 }
 
-async function bootstrapCanonicalSession() {
-  if (!bootstrapPromise) {
-    bootstrapPromise = (async () => {
+async function bootstrapCanonicalSession(client) {
+  if (!bootstrapPromises.has(client)) {
+    const { listSessions, createSession, getSession } = client;
+    const promise = (async () => {
+      if (client.bootstrap) {
+        const result = await client.bootstrap();
+        return { ...result, listed: listPayload(result.listed) };
+      }
       const listed = listPayload(await listSessions());
       const targetId = listed.activeSessionId ?? listed.sessions[0]?.id;
       if (targetId) return { listed, snapshot: snapshotFrom(await getSession(targetId)) };
@@ -104,11 +120,12 @@ async function bootstrapCanonicalSession() {
         snapshot,
       };
     })().catch((error) => {
-      bootstrapPromise = null;
+      bootstrapPromises.delete(client);
       throw error;
     });
+    bootstrapPromises.set(client, promise);
   }
-  return bootstrapPromise;
+  return bootstrapPromises.get(client);
 }
 
 function formatClock(value) {
@@ -127,11 +144,6 @@ function nodeLabel(node) {
   return node?.text ?? node?.lines?.join(" ") ?? "Thought";
 }
 
-function makeRealtimeItemId(prefix = "item") {
-  const value = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return `${prefix}_${value.replaceAll("-", "")}`;
-}
-
 function summaryFromSession(session) {
   return {
     id: session.id,
@@ -142,13 +154,21 @@ function summaryFromSession(session) {
   };
 }
 
-export function CanonicalSessionApp() {
+export function CanonicalSessionApp({ client = liveWorkspaceClient }) {
+  const {
+    applySessionOperation, createSession, deleteSession, getSession, listSessions, renameSession,
+    retrySessionMapController, subscribeSessionEvents, synthesizeSession, updateSessionUiContext,
+    sendSessionChat, retryLiveCapture, updateWorkspacePreferences, downloadSessionExport,
+  } = client;
+  const example = client.example === true;
   const [canonical, setCanonical] = useState(null);
   const canonicalRef = useRef(null);
   const sessionIdRef = useRef(null);
   const committedPositionsRef = useRef(new Map());
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [saveFailure, setSaveFailure] = useState("");
 
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
@@ -166,13 +186,53 @@ export function CanonicalSessionApp() {
   const [selectedId, setSelectedId] = useState(null);
   const [selectedIds, setSelectedIds] = useState([]);
   const [connectFromId, setConnectFromId] = useState(null);
-  const [zoom, setZoom] = useState(1);
+  const [bubbleActionsId, setBubbleActionsId] = useState(null);
+  const armConnection = useCallback((id) => setConnectFromId((current) => current === id ? null : id), []);
+  const cancelConnection = useCallback(() => setConnectFromId(null), []);
+  const [zoom, setZoom] = useState(DEFAULT_CAMERA_ZOOM);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  const shellRef = useRef(null);
+  const [viewport, setViewport] = useState(() => ({ width: window.innerWidth, height: window.innerHeight }));
+  const cameraRef = useRef({ zoom, pan });
+  cameraRef.current = { zoom, pan };
+  const initialCameraRef = useRef(false);
+  const awaitingFirstContentRef = useRef(false);
+  const skipCameraRevealRef = useRef(false);
+  const previousViewportRef = useRef(viewport);
+  const [cameraRevealRequest, setCameraRevealRequest] = useState(0);
+  const previousRevealRequestRef = useRef(0);
+  const panCanvas = useCallback((value) => { awaitingFirstContentRef.current = false; setPan(value); }, []);
+  const zoomCanvas = useCallback((value) => { awaitingFirstContentRef.current = false; setZoom(value); }, []);
   const [viewMode, setViewMode] = useState("clusters");
   const [focusId, setFocusId] = useState(null);
-  const [marqueeActive, setMarqueeActive] = useState(false);
+  const [selectionMode, setSelectionMode] = useState(null);
+  const marqueeActive = selectionMode !== null;
+  const [selectionPickerOpen, setSelectionPickerOpen] = useState(false);
+  const selectionPickerRef = useRef(null);
 
-  const [drawerOpen, setDrawerOpen] = useState(true);
+  useEffect(() => {
+    if (!selectionPickerOpen) return;
+    const picker = selectionPickerRef.current;
+    picker?.querySelector('[data-selection-option]')?.focus();
+    const dismiss = (event) => {
+      if (!picker?.contains(event.target)) setSelectionPickerOpen(false);
+    };
+    window.addEventListener("pointerdown", dismiss);
+    return () => window.removeEventListener("pointerdown", dismiss);
+  }, [selectionPickerOpen]);
+
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerWidth, setDrawerWidth] = useState(360);
+  const workspaceRestoredRef = useRef(null);
+  const workspaceStateRef = useRef(null);
+  const [previousViews, setPreviousViews] = useState([]);
+  const [recentChange, setRecentChange] = useState(null);
+  const [pendingWrites, setPendingWrites] = useState(0);
+  const [syncConnected, setSyncConnected] = useState(true);
+  const [preferenceBusy, setPreferenceBusy] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [mutePending, setMutePending] = useState(false);
+  const [backendState, setBackendState] = useState("idle");
   const [drawerTab, setDrawerTab] = useState("conversation");
   const [searchQuery, setSearchQuery] = useState("");
   const [favorite, setFavorite] = useState(true);
@@ -185,11 +245,17 @@ export function CanonicalSessionApp() {
   ));
   const reducedMotionRef = useRef(reducedMotion);
   reducedMotionRef.current = reducedMotion;
-  const [voiceMode, setVoiceMode] = useState("vad");
 
   const [chatValue, setChatValue] = useState("");
+  const [chatFailure, setChatFailure] = useState(null);
+  const [chatSubmissions] = useState(() => createChatSubmission());
+  const [captureRetrying, setCaptureRetrying] = useState(false);
   const [composer, setComposer] = useState(null);
   const [composerValue, setComposerValue] = useState("");
+  const [composerSaving, setComposerSaving] = useState(false);
+  const composerSubmissionRef = useRef(false);
+  const editorReturnFocusRef = useRef(null);
+  const editorWasOpenRef = useRef(false);
   const [highlight, setHighlight] = useState(null);
   const [toast, setToast] = useState("");
   const [busy, setBusy] = useState(false);
@@ -238,6 +304,103 @@ export function CanonicalSessionApp() {
     controllerActivityDelayRef.current?.update(canonical);
   }, [canonical?.id, canonical?.map_controller?.status]);
 
+  useLayoutEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return undefined;
+    const measure = () => {
+      const { width, height } = shell.getBoundingClientRect();
+      setViewport((current) => current.width === width && current.height === height ? current : { width, height });
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(shell);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+
+  // Measure the visible chrome, so camera framing and CSS share the same space.
+  const availableCanvasRect = useCallback(({ ignoreDrawer = false, ignoreComposer = false } = {}) => {
+    const shell = shellRef.current;
+    const bounds = shell?.getBoundingClientRect() ?? { left: 0, top: 0, ...viewport };
+    const railWidth = shell ? parseFloat(getComputedStyle(shell).getPropertyValue("--workspace-rail-width")) || 60 : 60;
+    const rect = { left: railWidth + 16, top: 100, right: bounds.width - 20, bottom: bounds.height - 24 };
+    const visibleBounds = (selector) => {
+      const element = shell?.querySelector(selector);
+      if (!element?.getClientRects().length) return null;
+      const box = element.getBoundingClientRect();
+      return { left: box.left - bounds.left, right: box.right - bounds.left, top: box.top - bounds.top, bottom: box.bottom - bounds.top };
+    };
+    for (const selector of [".session-identity", ".top-dock", ".session-selection-context"]) {
+      const box = visibleBounds(selector);
+      if (box) rect.top = Math.max(rect.top, box.bottom + 16);
+    }
+    for (const selector of [".zoom-controls", ".session-conversation-controls"]) {
+      const box = visibleBounds(selector);
+      if (box) rect.bottom = Math.min(rect.bottom, box.top - 20);
+    }
+    const drawer = !ignoreDrawer && visibleBounds(".session-drawer");
+    if (drawer) {
+      if (bounds.width <= 760) rect.bottom = Math.min(rect.bottom, drawer.top - 16);
+      else rect.left = Math.max(rect.left, drawer.right + 20);
+    }
+    const editor = !ignoreComposer && visibleBounds(".session-composer");
+    if (editor) rect.bottom = Math.min(rect.bottom, editor.top - 16);
+    return { ...rect, right: Math.max(rect.left + 40, rect.right), bottom: Math.max(rect.top + 40, rect.bottom) };
+  }, [viewport]);
+
+  const applyCamera = useCallback((camera) => {
+    cameraRef.current = camera;
+    setZoom(camera.zoom);
+    setPan(camera.pan);
+  }, []);
+
+  const openThoughtEditor = (next, value = "") => {
+    if (composerSubmissionRef.current) return;
+    editorReturnFocusRef.current = {
+      element: document.activeElement,
+      selector: next.parentId ? '[data-testid="add-connected-thought"]'
+        : next.mode === "edit" && !next.fresh ? '[data-testid="thought-more-actions"]'
+          : '[data-testid="new-thought-tool"]',
+    };
+    setComposer(next);
+    setComposerValue(value);
+  };
+
+  useLayoutEffect(() => {
+    const closed = editorWasOpenRef.current && !composer;
+    editorWasOpenRef.current = Boolean(composer);
+    if (!closed || !editorReturnFocusRef.current) return undefined;
+    const target = editorReturnFocusRef.current;
+    editorReturnFocusRef.current = null;
+    const frame = requestAnimationFrame(() => {
+      const element = target.element?.isConnected && target.element !== document.body ? target.element
+        : shellRef.current?.querySelector(target.selector);
+      element?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [composer]);
+
+  const restoreWorkspace = useCallback((snapshot) => {
+    const saved = readWorkspaceState(snapshot.id);
+    const ids = new Set(snapshot.nodes.map((node) => node.id));
+    initialCameraRef.current = saved.camera_version !== WORKSPACE_CAMERA_VERSION
+      || (saved.camera_viewport_width <= 760) !== (window.innerWidth <= 760);
+    awaitingFirstContentRef.current = snapshot.nodes.length === 0;
+    setPan(saved.pan);
+    setZoom(saved.zoom);
+    setViewMode(saved.view_mode);
+    setFocusId(ids.has(saved.focus_id) ? saved.focus_id : null);
+    const selection = saved.selected_node_ids.filter((id) => ids.has(id));
+    setSelectedIds(selection);
+    setSelectedId(selection.length === 1 ? selection[0] : null);
+    setDrawerTab(saved.drawer_tab);
+    setDrawerOpen(saved.drawer_open);
+    setDrawerWidth(saved.drawer_width);
+    setShowSuggestions(saved.show_suggestions);
+    setPreviousViews([]);
+    setRecentChange(null);
+    workspaceRestoredRef.current = snapshot.id;
+  }, []);
+
   const applyCanonicalSnapshot = useCallback((
     snapshot,
     { animateNew = true, allowSessionSwitch = false } = {},
@@ -250,6 +413,9 @@ export function CanonicalSessionApp() {
     ) return;
     const currentSnapshot = canonicalRef.current;
     if (!shouldApplySessionSnapshot(currentSnapshot, snapshot)) return;
+    const switching = currentSnapshot?.id !== snapshot.id;
+    const changed = recentMapChange(currentSnapshot, snapshot);
+    if (!switching && animateNew && changed) setRecentChange(changed);
     const motionEnabled = animateNew && !reducedMotionRef.current;
     const visual = visualizeSession(
       snapshot,
@@ -318,15 +484,25 @@ export function CanonicalSessionApp() {
     nodesRef.current = nextNodes;
     edgesRef.current = nextEdges;
     setCanonical(snapshot);
+    setSynthesis(snapshot.synthesis?.text ?? "");
     setNodes(nextNodes);
     setEdges(nextEdges);
     setSessions((current) => {
       const next = current.filter((item) => item.id !== snapshot.id);
       return [summaryFromSession(snapshot), ...next];
     });
-    setSelectedIds((current) => current.filter((id) => snapshot.nodes.some((node) => node.id === id)));
-    setSelectedId((current) => (current && snapshot.nodes.some((node) => node.id === current) ? current : null));
-  }, []);
+    setSelectedIds((current) => {
+      const next = current.filter((id) => snapshot.nodes.some((node) => node.id === id)
+        || proposalNodesRef.current.some((node) => node.id === id && (snapshot.proposals ?? []).some((proposal) => proposal.id === node.proposalId && proposal.status === "pending")));
+      return next.length === current.length ? current : next;
+    });
+    setSelectedId((current) => {
+      const ghost = proposalNodesRef.current.find((node) => node.id === current);
+      return current && (snapshot.nodes.some((node) => node.id === current)
+        || (snapshot.proposals ?? []).some((proposal) => proposal.id === ghost?.proposalId && proposal.status === "pending")) ? current : null;
+    });
+    if (switching) restoreWorkspace(snapshot);
+  }, [restoreWorkspace]);
 
   const stopRealtime = useCallback(() => {
     realtimeRef.current?.disconnect();
@@ -335,6 +511,8 @@ export function CanonicalSessionApp() {
     setLiveCaption("");
     setPartnerCaption("");
     setSeconds(0);
+    setMuted(false);
+    setBackendState("idle");
   }, []);
 
   const refreshSessions = useCallback(async () => {
@@ -345,8 +523,12 @@ export function CanonicalSessionApp() {
 
   const openSession = useCallback(async (id) => {
     if (!id) return;
+    if (sessionIdRef.current) writeWorkspaceState(sessionIdRef.current, workspaceStateRef.current);
     stopRealtime();
     setLoading(true);
+    setSaveFailure("");
+    setChatFailure(null);
+    setChatValue("");
     try {
       const snapshot = snapshotFrom(await getSession(id));
       committedPositionsRef.current = new Map();
@@ -359,18 +541,19 @@ export function CanonicalSessionApp() {
       setSelectedIds([]);
       setFocusId(null);
       setConnectFromId(null);
+      editorReturnFocusRef.current = null;
       setComposer(null);
       setComposerValue("");
-      setMarqueeActive(false);
+      setSelectionMode(null);
       setHighlight(null);
       setViewMode("clusters");
       organicPositionsRef.current = new Map();
       setPan({ x: 0, y: 0 });
-      setZoom(1);
+      setZoom(DEFAULT_CAMERA_ZOOM);
       setSynthesis("");
+      setSynthesizing(false);
       applyCanonicalSnapshot(snapshot, { animateNew: false, allowSessionSwitch: true });
       await refreshSessions();
-      setDrawerOpen(false);
     } catch (error) {
       showToast(error.message);
     } finally {
@@ -380,7 +563,7 @@ export function CanonicalSessionApp() {
 
   useEffect(() => {
     let cancelled = false;
-    bootstrapCanonicalSession()
+    bootstrapCanonicalSession(client)
       .then(({ listed, snapshot }) => {
         if (cancelled) return;
         setSessions(listed.sessions);
@@ -390,6 +573,7 @@ export function CanonicalSessionApp() {
       .catch((error) => {
         if (cancelled) return;
         setLoading(false);
+        setLoadError(error.message);
         showToast(error.message);
       });
     return () => { cancelled = true; };
@@ -399,14 +583,15 @@ export function CanonicalSessionApp() {
     if (!canonical?.id) return undefined;
     return subscribeSessionEvents(canonical.id, {
       onSnapshot: applyCanonicalSnapshot,
-      onError: () => setVoiceError((current) => current || "Live updates are reconnecting…"),
-      onOpen: () => setVoiceError((current) => (current === "Live updates are reconnecting…" ? "" : current)),
+      onError: () => setSyncConnected(false),
+      onOpen: () => setSyncConnected(true),
     });
   }, [canonical?.id, applyCanonicalSnapshot]);
 
   const perform = useCallback(async (operation, { actor = "you", callId } = {}) => {
     const id = sessionIdRef.current;
     if (!id || !canonicalRef.current) throw new Error("No map session is open");
+    setPendingWrites((value) => value + 1);
     try {
       const result = await applySessionOperation(id, operation, {
         expectedRevision: canonicalRef.current.revision,
@@ -415,39 +600,17 @@ export function CanonicalSessionApp() {
       });
       const snapshot = snapshotFrom(result);
       if (snapshot) applyCanonicalSnapshot(snapshot);
-      if (result?.warnings?.length) showToast(result.warnings.join(" · "));
+      setSaveFailure("");
+      if (result?.warnings?.length) showToast(result.warnings.map(suggestionDisplayText).join(" · "));
       return result;
     } catch (error) {
       if (error instanceof SessionApiError && error.snapshot) applyCanonicalSnapshot(error.snapshot);
+      setSaveFailure(error.message);
       throw error;
+    } finally {
+      setPendingWrites((value) => Math.max(0, value - 1));
     }
   }, [applyCanonicalSnapshot, showToast]);
-
-  const appendUtterance = useCallback(async (speaker, text, realtimeItemId) => {
-    const normalized = text?.trim();
-    if (!normalized) return null;
-    let result;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        result = await perform({
-          type: "append_utterance",
-          speaker,
-          text: normalized,
-          realtime_item_id: realtimeItemId ?? null,
-          completed_at: new Date().toISOString(),
-        }, { actor: speaker === "you" ? "you" : "partner" });
-        break;
-      } catch (error) {
-        if (!(error instanceof SessionApiError)
-          || error.code !== "revision_conflict"
-          || attempt === 2) throw error;
-      }
-    }
-    if (speaker === "you" && realtimeItemId) {
-      await realtimeRef.current?.notifyTranscriptCommitted(realtimeItemId);
-    }
-    return result;
-  }, [perform]);
 
   useEffect(() => {
     let animationFrame;
@@ -502,15 +665,42 @@ export function CanonicalSessionApp() {
   useEffect(() => {
     if (!canonical?.id) return undefined;
     const timer = window.setTimeout(() => {
+      const ghost = proposalNodesRef.current.find((node) => node.id === selectedId);
+      const committedIds = new Set(canonicalRef.current?.nodes.map((node) => node.id));
+      const committedSelection = selectedIds.filter((id) => committedIds.has(id));
       updateSessionUiContext(canonical.id, {
-        selected_node_ids: selectedIds,
+        selected_node_ids: committedSelection,
+        selected_proposal_id: ghost?.proposalId ?? null,
         focus_id: focusId,
         view_mode: viewMode,
-        voice_mode: voiceMode,
       }).catch(() => {});
-    }, 100);
+      realtimeRef.current?.updateContext({
+        selectedNodeIds: committedSelection,
+        selectedProposalId: ghost?.proposalId ?? null,
+        selectedText: ghost ? nodeLabel(ghost) : nodesRef.current.filter((node) => committedSelection.includes(node.id)).map(nodeLabel).join("; "),
+      })?.catch?.(() => {});
+    }, 150);
     return () => window.clearTimeout(timer);
-  }, [canonical?.id, focusId, selectedIds, viewMode, voiceMode]);
+  }, [canonical?.id, focusId, selectedId, selectedIds, viewMode]);
+
+  workspaceStateRef.current = { pan, zoom, camera_version: WORKSPACE_CAMERA_VERSION, camera_viewport_width: viewport.width, selected_node_ids: selectedIds, focus_id: focusId, view_mode: viewMode, drawer_tab: drawerTab, drawer_open: drawerOpen, drawer_width: drawerWidth, show_suggestions: showSuggestions };
+  useEffect(() => {
+    if (!canonical?.id || workspaceRestoredRef.current !== canonical.id || initialCameraRef.current) return undefined;
+    const sessionId = canonical.id;
+    const timer = window.setTimeout(() => writeWorkspaceState(sessionId, workspaceStateRef.current), 500);
+    const flush = () => writeWorkspaceState(sessionId, workspaceStateRef.current);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("pagehide", flush);
+    };
+  }, [canonical?.id, pan, zoom, viewport.width, selectedIds, focusId, viewMode, drawerTab, drawerOpen, drawerWidth, showSuggestions]);
+
+  useEffect(() => {
+    if (!recentChange) return undefined;
+    const timer = window.setTimeout(() => setRecentChange(null), 12000);
+    return () => window.clearTimeout(timer);
+  }, [recentChange]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -521,6 +711,7 @@ export function CanonicalSessionApp() {
   const selectOne = useCallback((id) => {
     setSelectedId(id);
     setSelectedIds(id ? [id] : []);
+    setBubbleActionsId(null);
   }, []);
 
   const touchGraph = (nextNodes, nextEdges = edgesRef.current) => {
@@ -530,126 +721,116 @@ export function CanonicalSessionApp() {
     setEdges(nextEdges);
   };
 
-  const materializeTypedThought = useCallback(async (text, itemId) => {
-    const ideas = condenseUtterance(text).slice(0, 3);
-    for (const idea of ideas) {
-      const tokens = new Map(nodesRef.current.map((node) => [node.id, informativeTokens(nodeLabel(node))]));
-      let best = null;
-      let bestScore = 0;
-      tokens.forEach((candidateTokens, id) => {
-        const score = overlapScore(idea.tokens, candidateTokens);
-        if (score > bestScore) {
-          best = nodesRef.current.find((node) => node.id === id);
-          bestScore = score;
-        }
-      });
-      const quote = text.slice(idea.span[0], idea.span[1]);
-      const repeated = best && bestScore >= REMENTION_MIN_OVERLAP
-        && bestScore / Math.max(idea.tokens.size, 1) >= REMENTION_COVERAGE;
-      const operation = repeated
-        ? {
-          type: "revisit_bubble",
-          node_reference: best.id,
-          transcript_quote: quote,
-          realtime_item_id: itemId,
-        }
-        : {
-          type: "create_bubble",
-          text: idea.label,
-          parent_reference: bestScore >= ATTACH_MIN_OVERLAP ? best?.id ?? null : null,
-          transcript_quote: quote,
-          realtime_item_id: itemId,
-        };
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          await perform(operation, { actor: "partner" });
-          break;
-        } catch (error) {
-          if (!(error instanceof SessionApiError)
-            || error.code !== "revision_conflict"
-            || attempt === 2) throw error;
-        }
-      }
-    }
-  }, [perform]);
+  const sendConversation = async (text, options) => {
+    const targetSessionId = sessionIdRef.current;
+    const client = realtimeRef.current;
+    if (!targetSessionId) throw new Error("Open a map before starting a conversation");
+    const ghost = proposalNodesRef.current.find((node) => node.id === selectedId);
+    await updateSessionUiContext(targetSessionId, {
+      selected_node_ids: selectedIds.filter((id) => canonicalRef.current.nodes.some((node) => node.id === id)),
+      selected_proposal_id: ghost?.proposalId ?? null,
+      focus_id: focusId,
+      view_mode: viewMode,
+    });
+    const result = client?.connected
+      ? await client.sendText(text, options)
+      : await sendSessionChat(targetSessionId, text, options);
+    const snapshot = snapshotFrom(result);
+    if (snapshot) applyCanonicalSnapshot(snapshot);
+    return result;
+  };
 
   const submitChat = async (event) => {
     event.preventDefault();
     const text = chatValue.trim();
     if (!text || busy) return;
+    const submittedSessionId = sessionIdRef.current;
     setChatValue("");
+    setChatFailure(null);
     setBusy(true);
     try {
-      if (realtimeRef.current?.connected) {
-        await realtimeRef.current.sendText(text, {
-          beforeResponse: ({ itemId }) => appendUtterance("you", text, itemId),
-        });
-      } else {
-        const itemId = makeRealtimeItemId("text");
-        await appendUtterance("you", text, itemId);
-        await materializeTypedThought(text, itemId);
-      }
+      await chatSubmissions.send(submittedSessionId, text, sendConversation);
     } catch (error) {
+      if (sessionIdRef.current === submittedSessionId) {
+        if (error.snapshot) applyCanonicalSnapshot(error.snapshot);
+        setChatValue((current) => current || text);
+        setChatFailure({ sessionId: submittedSessionId, message: error.code === "chat_already_attempted"
+          ? "Your message is saved. This request may already have changed the map; review it before sending a new request."
+          : error.details?.error?.message_saved
+          ? "Your message is saved. Send again to retry Partner’s response."
+          : "Your draft is kept below. Send again to retry." });
+      }
       showToast(error.message);
     } finally {
       setBusy(false);
     }
   };
 
-  const buildRealtime = () => createSessionRealtimeClient({
+  const buildRealtime = () => createSessionLiveClient({
     sessionId: sessionIdRef.current,
-    voiceMode,
     audioElement: audioRef.current,
-    getExpectedRevision: () => canonicalRef.current?.revision,
+    getSelectedContext: () => ({
+      selectedNodeIds: (workspaceStateRef.current?.selected_node_ids ?? []).filter((id) => nodesRef.current.some((node) => node.id === id)),
+      selectedProposalId: proposalNodesRef.current.find((node) => workspaceStateRef.current?.selected_node_ids?.includes(node.id))?.proposalId ?? null,
+      selectedText: nodesRef.current.filter((node) => workspaceStateRef.current?.selected_node_ids?.includes(node.id)).map(nodeLabel).join("; "),
+    }),
     onStateChange: ({ state }) => {
       setVoiceState(state);
-      if (state === "connected") {
-        setSeconds(0);
-        setVoiceError("");
-      }
+      if (state === "connected") setVoiceError("");
     },
     onUserTranscriptPartial: ({ text }) => setLiveCaption(text),
-    onInputTranscriptDone: async ({ text, itemId }) => {
-      setLiveCaption("");
-      await appendUtterance("you", text, itemId);
-      return { committed: true };
-    },
     onPartnerTranscriptPartial: ({ text }) => setPartnerCaption(text),
-    onPartnerTranscriptFinal: ({ text, itemId }) => {
-      setPartnerCaption("");
-      return appendUtterance("partner", text, itemId).catch((error) => showToast(error.message));
-    },
-    onToolResult: ({ result }) => {
-      const snapshot = snapshotFrom(result);
-      if (snapshot) applyCanonicalSnapshot(snapshot);
-    },
+    onSnapshot: applyCanonicalSnapshot,
+    onBackendStatus: ({ state }) => setBackendState(state),
+    onMutedChange: ({ muted: nextMuted, pending }) => { setMuted(nextMuted); setMutePending(Boolean(pending)); },
     onError: (error) => setVoiceError(error.message),
   });
 
-  const toggleVoice = async () => {
-    if (realtimeRef.current?.connected || ["connecting", "requesting_microphone"].includes(voiceState)) {
-      stopRealtime();
-      showToast("Voice conversation paused");
-      return;
-    }
-    if (!canonical?.id) return;
+  const startVoice = async () => {
+    if (!canonical?.id || realtimeRef.current?.connected) return;
     setVoiceError("");
+    setSeconds(0);
     const realtime = buildRealtime();
     realtimeRef.current = realtime;
     try {
-      await realtime.connect({ voiceMode });
-      showToast(voiceMode === "vad" ? "Voice conversation is live" : "Voice ready — hold the mic to talk");
+      await realtime.connect();
     } catch (error) {
       realtimeRef.current = null;
       setVoiceError(error.message);
     }
   };
 
-  const setNextVoiceMode = (mode) => {
-    if (mode === voiceMode) return;
-    stopRealtime();
-    setVoiceMode(mode);
-    showToast(mode === "vad" ? "Server voice detection selected" : "Push-to-talk selected");
+  const endVoice = async () => {
+    try { await realtimeRef.current?.end(); }
+    catch (error) { setVoiceError(error.message); }
+    finally { stopRealtime(); }
+  };
+
+  const toggleMute = async () => {
+    try { await realtimeRef.current?.setMuted(!muted); }
+    catch (error) { setVoiceError(error.message); }
+  };
+
+  const retryCapture = async () => {
+    const id = sessionIdRef.current;
+    if (!id || captureRetrying) return;
+    setCaptureRetrying(true);
+    try {
+      const result = await retryLiveCapture(id);
+      if (sessionIdRef.current === id) applyCanonicalSnapshot(snapshotFrom(result));
+    } catch (error) { showToast(error.message); }
+    finally { setCaptureRetrying(false); }
+  };
+
+  const setPreferences = async (patch) => {
+    if (!canonical?.id || preferenceBusy) return;
+    setPreferenceBusy(true);
+    try {
+      const result = await updateWorkspacePreferences(canonical.id, patch);
+      const snapshot = snapshotFrom(result);
+      if (snapshot) applyCanonicalSnapshot(snapshot);
+    } catch (error) { showToast(error.message); }
+    finally { setPreferenceBusy(false); }
   };
 
   const retryMapController = async () => {
@@ -664,27 +845,6 @@ export function CanonicalSessionApp() {
       showToast(error.message);
     } finally {
       setControllerRetrying(false);
-    }
-  };
-
-  const startPushToTalk = (event) => {
-    try {
-      event.currentTarget.setPointerCapture?.(event.pointerId);
-      realtimeRef.current?.startPushToTalk();
-    } catch (error) {
-      setVoiceError(error.message);
-    }
-  };
-
-  const stopPushToTalk = (event) => {
-    try {
-      realtimeRef.current?.stopPushToTalk();
-    } catch (error) {
-      setVoiceError(error.message);
-    } finally {
-      if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
     }
   };
 
@@ -730,6 +890,7 @@ export function CanonicalSessionApp() {
   };
 
   const finishMoveNode = (id, vx, vy, moved) => {
+    if (drawerOpen || composer) setCameraRevealRequest((request) => request + 1);
     if (proposalNodesRef.current.some((node) => node.id === id)) {
       proposalDragStartRef.current.delete(id);
       const release = 0.08 + (1 - FLUID_PHYSICS_SETTINGS.viscosity) * 0.08;
@@ -789,9 +950,8 @@ export function CanonicalSessionApp() {
       : node));
   };
 
-  const connectTarget = async (targetId) => {
-    if (!connectFromId || connectFromId === targetId) return;
-    const sourceId = connectFromId;
+  const connectTarget = async (targetId, sourceId = connectFromId) => {
+    if (!canConnect(sourceId, targetId, nodesRef.current, edgesRef.current)) return;
     const source = nodesRef.current.find((node) => node.id === sourceId);
     const target = nodesRef.current.find((node) => node.id === targetId);
     if (!source || !target) {
@@ -894,36 +1054,61 @@ export function CanonicalSessionApp() {
   };
 
   const spawnFreeform = (x, y) => {
+    awaitingFirstContentRef.current = false;
     perform({
       type: "create_bubble",
       text: "New thought",
+      create_distinct: true,
       parent_reference: null,
       x: clamp(x, 60, BASE_WIDTH - 60),
       y: clamp(y, 140, BASE_HEIGHT - 60),
     }).then((result) => {
       const createdId = result?.affected_ids?.[0];
-      if (createdId) selectOne(createdId);
+      if (createdId) {
+        selectOne(createdId);
+        openThoughtEditor({ mode: "edit", id: createdId, fresh: true });
+      }
     }).catch((error) => showToast(error.message));
   };
 
   const submitComposer = async (event) => {
     event.preventDefault();
     const text = composerValue.trim();
-    if (!text || !composer) return;
+    if (!text || !composer || composerSubmissionRef.current) return;
+    awaitingFirstContentRef.current = false;
+    composerSubmissionRef.current = true;
+    setComposerSaving(true);
     try {
       if (composer.mode === "edit") {
         await perform({ type: "edit_bubble", node_reference: composer.id, text });
         selectOne(composer.id);
       } else {
-        const result = await perform({ type: "create_bubble", text, parent_reference: composer.parentId ?? null });
+        const result = await perform({ type: "create_bubble", text, create_distinct: true, parent_reference: composer.parentId ?? null, ...(composer.position ?? {}) });
         const createdId = result?.affected_ids?.[0];
         if (createdId) selectOne(createdId);
       }
+      setCameraRevealRequest((request) => request + 1);
       setComposer(null);
       setComposerValue("");
     } catch (error) {
       showToast(error.message);
+    } finally {
+      composerSubmissionRef.current = false;
+      setComposerSaving(false);
     }
+  };
+
+  const openNewThought = () => {
+    if (composerSubmissionRef.current) return;
+    setSelectionMode(null);
+    setBubbleActionsId(null);
+    setConnectFromId(null);
+    const transform = cameraTransform(viewport, zoom, pan);
+    const rect = availableCanvasRect();
+    openThoughtEditor({ mode: "add", parentId: null, position: {
+      x: clamp(((rect.left + rect.right) / 2 - transform.offsetX) / transform.scale, 60, BASE_WIDTH - 60),
+      y: clamp(((rect.top + rect.bottom) / 2 - transform.offsetY) / transform.scale, 140, BASE_HEIGHT - 60),
+    } });
   };
 
   const deleteSelected = async () => {
@@ -939,8 +1124,48 @@ export function CanonicalSessionApp() {
     }
   };
 
-  const changeView = (nextMode) => {
-    if (nextMode === viewMode) return;
+  const centerOnNode = (id, options) => {
+    const node = nodesRef.current.find((candidate) => candidate.id === id);
+    if (!node) return;
+    applyCamera(cameraCenteredOn(node, viewport, availableCanvasRect(options), Math.max(DEFAULT_CAMERA_ZOOM, zoom)));
+  };
+
+  const adjustZoom = (factor) => {
+    awaitingFirstContentRef.current = false;
+    const rect = availableCanvasRect();
+    applyCamera(zoomCameraAt(cameraRef.current, zoom * factor,
+      { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 }, viewport));
+  };
+
+  const fitMap = () => {
+    awaitingFirstContentRef.current = false;
+    rememberView();
+    applyCamera(fitMapCamera(mapNodes, viewport, availableCanvasRect()));
+    setFocusId(null);
+  };
+
+  const rememberView = () => {
+    setPreviousViews((current) => [...current.slice(-11), { pan, zoom, focusId, viewMode, selectedId, selectedIds, drawerTab, drawerOpen }]);
+  };
+
+  const restorePreviousView = () => {
+    const previous = previousViews.at(-1);
+    if (!previous) return;
+    skipCameraRevealRef.current = true;
+    requestAnimationFrame(() => { skipCameraRevealRef.current = false; });
+    setPan(previous.pan);
+    setZoom(previous.zoom);
+    setFocusId(previous.focusId);
+    if (previous.viewMode !== viewMode) applyViewLayout(previous.viewMode);
+    setViewMode(previous.viewMode);
+    setSelectedId(previous.selectedId);
+    setSelectedIds(previous.selectedIds);
+    setDrawerTab(previous.drawerTab);
+    setDrawerOpen(previous.drawerOpen);
+    setPreviousViews((current) => current.slice(0, -1));
+  };
+
+  const applyViewLayout = (nextMode) => {
     if (nextMode === "hierarchy") {
       nodesRef.current.forEach((node) => organicPositionsRef.current.set(node.id, { x: node.x, y: node.y }));
       const next = layoutHierarchy(nodesRef.current, edgesRef.current);
@@ -951,9 +1176,14 @@ export function CanonicalSessionApp() {
       nodesRef.current = next;
       setNodes(next);
     }
+  };
+
+  const changeView = (nextMode) => {
+    if (nextMode === viewMode) return;
+    rememberView();
+    applyViewLayout(nextMode);
     setViewMode(nextMode);
-    setPan({ x: 0, y: 0 });
-    setZoom(1);
+    applyCamera(initialMapCamera(nodesRef.current, rootId, viewport, availableCanvasRect({ ignoreDrawer: true })));
     setDrawerOpen(false);
     showToast(nextMode === "clusters" ? "Cluster view" : "Hierarchy view");
   };
@@ -962,9 +1192,6 @@ export function CanonicalSessionApp() {
   const redo = () => perform({ type: "redo_map_change" }).catch((error) => showToast(error.message));
 
   const acceptProposal = (proposal) => perform({ type: "accept_proposal", proposal_id: proposal.id })
-    .then((result) => {
-      if (result?.warnings?.some((warning) => /stale/i.test(warning))) showToast("Applied what still fit; stale changes were dropped");
-    })
     .catch((error) => showToast(error.message));
 
   const dismissProposal = (proposal) => perform({ type: "dismiss_proposal", proposal_id: proposal.id })
@@ -977,6 +1204,7 @@ export function CanonicalSessionApp() {
   }).catch((error) => showToast(error.message));
 
   const openEvidence = (utteranceId, nodeId = null, spans = null) => {
+    rememberView();
     setDrawerOpen(true);
     setDrawerTab("conversation");
     setHighlight({ utteranceId, nodeId, spans });
@@ -984,20 +1212,24 @@ export function CanonicalSessionApp() {
   };
 
   const askAboutBubble = (id) => {
-    const node = nodesRef.current.find((candidate) => candidate.id === id);
+    const node = [...nodesRef.current, ...proposalNodesRef.current].find((candidate) => candidate.id === id);
     if (!node) return;
+    rememberView();
+    selectOne(id);
     setDrawerOpen(true);
     setDrawerTab("conversation");
-    setChatValue(`About “${nodeLabel(node)}”: `);
+    setChatValue(`Let’s explore ${node.ghost ? "this suggestion" : "this thought"}: “${nodeLabel(node)}”. `);
     window.setTimeout(() => chatInputRef.current?.focus(), 50);
   };
 
   const toggleFocus = () => {
+    rememberView();
     if (focusId) {
       setFocusId(null);
       showToast("Showing the full map");
     } else if (selectedId && !selectedId.startsWith("proposal-node-")) {
       setFocusId(selectedId);
+      centerOnNode(selectedId);
       showToast("Focused this branch");
     } else {
       showToast("Select a committed bubble first");
@@ -1007,6 +1239,7 @@ export function CanonicalSessionApp() {
   const openDrawer = (tab) => {
     if (drawerOpen && drawerTab === tab) setDrawerOpen(false);
     else {
+      if (!drawerOpen) rememberView();
       setDrawerTab(tab);
       setDrawerOpen(true);
     }
@@ -1020,6 +1253,22 @@ export function CanonicalSessionApp() {
     } catch (error) {
       showToast(error.message);
     }
+  };
+
+  const newExample = async () => {
+    try { const created = await client.createExample(); await openSession(created.id); }
+    catch (error) { showToast(error.message); }
+  };
+
+  const importExample = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      if (file.size > 10 * 1024 * 1024) throw new Error("Choose a session file smaller than 10 MB.");
+      const created = await client.importSession(JSON.parse(await file.text()));
+      await openSession(created.id);
+    } catch (error) { showToast(`Could not import this session: ${error.message}`); }
   };
 
   const saveRename = async (event) => {
@@ -1054,14 +1303,18 @@ export function CanonicalSessionApp() {
 
   const requestSynthesis = async () => {
     if (!canonical?.nodes?.length) return;
+    const requestedSessionId = canonical.id;
     setSynthesizing(true);
     try {
-      const result = await synthesizeSession(canonical.id, { expectedRevision: canonical.revision });
-      setSynthesis(result?.synthesis ?? "No synthesis was returned.");
+      const result = await synthesizeSession(requestedSessionId, { expectedRevision: canonical.revision });
+      if (sessionIdRef.current !== requestedSessionId) return;
+      const snapshot = snapshotFrom(result);
+      if (snapshot) applyCanonicalSnapshot(snapshot);
+      setSynthesis(result?.synthesis?.text ?? result?.synthesis ?? snapshot?.synthesis?.text ?? "No synthesis was returned.");
     } catch (error) {
-      showToast(error.message);
+      if (sessionIdRef.current === requestedSessionId) showToast(error.message);
     } finally {
-      setSynthesizing(false);
+      if (sessionIdRef.current === requestedSessionId) setSynthesizing(false);
     }
   };
 
@@ -1070,13 +1323,18 @@ export function CanonicalSessionApp() {
       const target = event.target;
       const editing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable;
       if (event.key === "Escape") {
+        if (selectionPickerOpen) {
+          setSelectionPickerOpen(false);
+          selectionPickerRef.current?.querySelector('[data-testid="selection-tools"]')?.focus();
+        }
         if (marqueeActive) {
-          setMarqueeActive(false);
+          setSelectionMode(null);
           setSelectedIds([]);
           setSelectedId(null);
         }
-        setComposer(null);
+        if (!composerSubmissionRef.current) setComposer(null);
         setConnectFromId(null);
+        setBubbleActionsId(null);
         setHighlight(null);
       }
       if (!editing && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
@@ -1097,6 +1355,34 @@ export function CanonicalSessionApp() {
     [pendingProposals, nodes, proposalPositions],
   );
   proposalNodesRef.current = ghostVisuals.ghostNodes;
+  useLayoutEffect(() => {
+    if (!canonical?.id || workspaceRestoredRef.current !== canonical.id) return;
+    const previousViewport = previousViewportRef.current;
+    previousViewportRef.current = viewport;
+    const requestedReveal = previousRevealRequestRef.current !== cameraRevealRequest;
+    previousRevealRequestRef.current = cameraRevealRequest;
+    const crossedBreakpoint = (previousViewport.width <= 760) !== (viewport.width <= 760);
+    const selectedNode = [...nodesRef.current, ...proposalNodesRef.current].find((node) => node.id === selectedId);
+    const rect = availableCanvasRect();
+    const firstContent = awaitingFirstContentRef.current && nodesRef.current.length > 0;
+    if (firstContent) awaitingFirstContentRef.current = false;
+    if (initialCameraRef.current || crossedBreakpoint || firstContent) {
+      initialCameraRef.current = false;
+      const visibleNodes = showSuggestionsRef.current ? [...nodesRef.current, ...proposalNodesRef.current] : nodesRef.current;
+      const initial = selectedNode
+        ? cameraCenteredOn(selectedNode, viewport, rect)
+        : initialMapCamera(visibleNodes, rootId, viewport, rect);
+      applyCamera(revealNodeCamera(initial, selectedNode, viewport, rect));
+      return;
+    }
+    if (skipCameraRevealRef.current) {
+      skipCameraRevealRef.current = false;
+      return;
+    }
+    // Never chase physics frames or move the canvas under a drag in progress.
+    if (selectedNode?.dragging || (!requestedReveal && !drawerOpen && !composer && viewport === previousViewport)) return;
+    applyCamera(revealNodeCamera(cameraRef.current, selectedNode, viewport, rect));
+  }, [canonical?.id, Boolean(canonical?.nodes?.length), selectedId, drawerOpen, drawerWidth, Boolean(composer), cameraRevealRequest, viewport, availableCanvasRect, applyCamera]);
   const previousProposalEdges = new Map(proposalEdgesRef.current.map((edge) => [edge.id, edge]));
   const retainedProposalEdges = ghostVisuals.ghostEdges.map((edge) => {
     const previous = previousProposalEdges.get(edge.id);
@@ -1117,10 +1403,6 @@ export function CanonicalSessionApp() {
     [edges, physicalProposalEdges, showSuggestions],
   );
   const selected = mapNodes.find((node) => node.id === selectedId);
-  const selectedSource = selected?.sources?.[0];
-  const sourceUtterance = selectedSource
-    ? canonical?.transcript?.find((utterance) => utterance.id === selectedSource.utteranceId)
-    : null;
   const conversationTimeline = useMemo(
     () => buildConversationTimeline(canonical?.transcript, canonical?.operations),
     [canonical?.operations, canonical?.transcript],
@@ -1152,26 +1434,32 @@ export function CanonicalSessionApp() {
 
   const drawerPresentation = {
     maps: { eyebrow: "Workspace", title: "Your maps", icon: IconMap2 },
+    sources: { eyebrow: "Exact words", title: "Thought sources", icon: IconQuote },
     conversation: { eyebrow: "Session", title: "Conversation", icon: IconMessageCircle },
     activity: { eyebrow: "Timeline", title: "Map activity", icon: IconClock },
     search: { eyebrow: "Find", title: "Search this map", icon: IconSearch },
-    proposals: { eyebrow: "Partner", title: "Review proposals", icon: IconSparkles },
+    proposals: { eyebrow: "Partner", title: "Suggestions", icon: IconSparkles },
     layouts: { eyebrow: "One graph", title: "Switch the view", icon: IconHierarchy2 },
-    overview: { eyebrow: "Working artifact", title: "Map overview", icon: IconGridDots },
+    overview: { eyebrow: "Your thinking, together", title: "Synthesis", icon: IconGridDots },
     layers: { eyebrow: "Visibility", title: "Canvas layers", icon: IconStack2 },
-    profile: { eyebrow: "Local profile", title: "MR", icon: IconUser },
+    profile: { eyebrow: "Local profile", title: example ? "TF" : "MR", icon: IconUser },
     settings: { eyebrow: "Preferences", title: "Session settings", icon: IconSettings },
   };
   const presentation = drawerPresentation[drawerTab] ?? drawerPresentation.conversation;
   const DrawerIcon = presentation.icon;
   const timer = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
   const voiceConnected = realtimeRef.current?.connected;
-  const voiceStarting = ["connecting", "requesting_microphone"].includes(voiceState);
+  const voiceStarting = ["connecting", "requesting_microphone", "reconnecting", "ending"].includes(voiceState);
   const controllerStatus = mapControllerPresentation(canonical?.map_controller, {
     activeVisible: controllerActivity.sessionId === canonical?.id
       && controllerActivity.active
       && controllerActivity.visible,
   });
+  const mappingPaused = Boolean(canonical?.preferences?.mapping_paused);
+  const partnerMode = canonical?.preferences?.partner_mode ?? "proactive";
+  const undoLabel = latestUndoLabel(canonical);
+  const selectedCanonical = canonical?.nodes?.find((node) => node.id === selectedId);
+  const selectedProposal = pendingProposals.find((proposal) => proposal.id === selected?.proposalId);
   const committedNodeIds = new Set(canonical?.nodes?.map((node) => node.id) ?? []);
   const deletableSelection = selectedIds.filter((id) => id !== rootId && committedNodeIds.has(id));
   const historyLength = canonical?.history_length
@@ -1192,7 +1480,7 @@ export function CanonicalSessionApp() {
   };
 
   return (
-    <main className="app-shell paper session-shell canonical-session-shell">
+    <main ref={shellRef} className={`app-shell paper session-shell canonical-session-shell ${example ? "is-example" : ""} ${drawerOpen ? "has-workspace-drawer" : ""}`} style={{ "--session-drawer-width": `${drawerWidth}px` }}>
       <audio ref={audioRef} autoPlay playsInline className="session-audio" />
       <MindMap
         concept="paper"
@@ -1214,13 +1502,20 @@ export function CanonicalSessionApp() {
         onEdit={(id) => {
           const node = nodesRef.current.find((candidate) => candidate.id === id);
           if (!node) return;
-          setComposer({ mode: "edit", id });
-          setComposerValue(nodeLabel(node));
+          openThoughtEditor({ mode: "edit", id }, nodeLabel(node));
         }}
-        onAdd={(parentId) => { setComposer({ mode: "add", parentId }); setComposerValue(""); }}
-        onAskAI={askAboutBubble}
-        onArmConnect={(id) => setConnectFromId((current) => current === id ? null : id)}
-        onConnectTarget={connectTarget}
+        onAdd={(parentId) => openThoughtEditor({ mode: "add", parentId })}
+        onAskAI={example ? undefined : askAboutBubble}
+        controlsHidden={Boolean(composer)}
+        onPin={(id) => perform({ type: "set_node_pinned", node_id: id, pinned: !nodesRef.current.find((node) => node.id === id)?.pinned }).catch((error) => showToast(error.message))}
+        onPark={(id) => perform({ type: "set_node_parked", node_id: id, parked: !nodesRef.current.find((node) => node.id === id)?.parked }).catch((error) => showToast(error.message))}
+        onSources={(id) => { selectOne(id); rememberView(); setDrawerTab("sources"); setDrawerOpen(true); }}
+        onArmConnect={armConnection}
+        onCancelConnect={cancelConnection}
+        onConnect={(sourceId, targetId) => connectTarget(targetId, sourceId)}
+        actionsNodeId={bubbleActionsId}
+        onActionsChange={setBubbleActionsId}
+        rootId={rootId}
         onSpawnFreeform={spawnFreeform}
         onDelete={deleteBubble}
         onAcceptGhost={acceptGhost}
@@ -1228,48 +1523,94 @@ export function CanonicalSessionApp() {
         onRemoveConnection={removeConnection}
         connectFromId={connectFromId}
         zoom={zoom}
-        setZoom={setZoom}
+        setZoom={zoomCanvas}
         pan={pan}
-        setPan={setPan}
+        setPan={panCanvas}
         showSuggestions={showSuggestions}
         showProvenance={showProvenance}
         focusId={focusId}
         reducedMotion={reducedMotion}
         marqueeActive={marqueeActive}
+        lassoActive={selectionMode === "lasso"}
         connectionPopQueueRef={connectionPopQueueRef}
       />
 
-      {!nodes.length && !loading && (
+      {!nodes.length && !loading && !composer && (
         <div className="session-empty" aria-hidden="true">
           <IconSparkles />
-          <p>Say what you're thinking.</p>
-          <small>Complete thoughts become bubbles; the full transcript stays underneath.</small>
+          <p>{example ? "A little room to think." : "Say what you're thinking."}</p>
+          <small>{example ? "Double-click the canvas to add a thought." : "Double-click the canvas to add a thought, or start talking."}</small>
         </div>
       )}
       {loading && <div className="session-loading" role="status">Opening your map…</div>}
+      {loadError && <div className="session-open-error" role="alert"><p>{loadError}</p><button type="button" onClick={() => window.location.reload()}>Retry opening</button></div>}
+
+      <header className="session-identity" aria-label="Current map">
+        {example && <span className="session-example-label">Example</span>}
+        {renameId === canonical?.id ? (
+          <form onSubmit={saveRename}>
+            <input aria-label="Map name" autoFocus value={renameValue} onChange={(event) => setRenameValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") setRenameId(null); }} />
+            <IconButton type="submit" label="Save map name" disabled={!renameValue.trim()}><IconCheck /></IconButton>
+            <IconButton label="Cancel rename" onClick={() => setRenameId(null)}><IconX /></IconButton>
+          </form>
+        ) : <button type="button" className="session-title" title="Rename map" onClick={() => { if (canonical) { setRenameId(canonical.id); setRenameValue(canonical.title); } }}><span>{canonical?.title ?? "Opening map…"}</span><IconPencil /></button>}
+        <small className={!syncConnected || saveFailure ? "is-disconnected" : ""} role="status">{loadError ? "Could not open saved map" : !canonical ? "Opening your map…" : saveFailure ? "Changes not saved" : !syncConnected ? "Reconnecting to local save…" : pendingWrites || busy || preferenceBusy || synthesizing ? "Saving…" : "Saved"}</small>
+        {saveFailure && <span className="session-save-error" role="alert">{saveFailure}</span>}
+      </header>
 
       <nav className="side-rail session-side-rail" aria-label="Workspace and session tools">
-        <IconButton label="Maps" active={drawerOpen && drawerTab === "maps"} onClick={() => openDrawer("maps")} testId="maps-tool"><IconAffiliate /></IconButton>
-        <IconButton label="Conversation" active={drawerOpen && drawerTab === "conversation"} onClick={() => openDrawer("conversation")} testId="conversation-tool"><IconMessageCircle /></IconButton>
-        <IconButton label="Search" active={drawerOpen && drawerTab === "search"} onClick={() => openDrawer("search")} testId="search-tool"><IconSearch /></IconButton>
-        <IconButton label={focusId ? "Show full map" : "Focus selected branch"} active={Boolean(focusId)} onClick={toggleFocus} testId="focus-tool"><IconFocusCentered /></IconButton>
-        <IconButton label="Activity" active={drawerOpen && drawerTab === "activity"} onClick={() => openDrawer("activity")} testId="activity-tool"><IconClock /></IconButton>
-        <IconButton label={favorite ? "Remove favorite" : "Add favorite"} pressed={favorite} onClick={() => setFavorite((value) => !value)} testId="favorite-tool"><IconStar /></IconButton>
-        <IconButton label="Account" active={drawerOpen && drawerTab === "profile"} onClick={() => openDrawer("profile")} className="avatar-button rail-bottom" testId="profile-tool">MR</IconButton>
-        <IconButton label="Settings" active={drawerOpen && drawerTab === "settings"} onClick={() => openDrawer("settings")} testId="settings-tool"><IconSettings /></IconButton>
+        <div className="session-rail-home">
+          <RailButton label="Maps" active={drawerOpen && drawerTab === "maps"} expanded={drawerOpen && drawerTab === "maps"} onClick={() => openDrawer("maps")} className="session-brand-button" testId="maps-tool"><IconAffiliate /></RailButton>
+        </div>
+        <div className="session-rail-group" role="group" aria-label="Your workspace">
+          <RailButton label="Conversation" active={drawerOpen && drawerTab === "conversation"} expanded={drawerOpen && drawerTab === "conversation"} onClick={() => openDrawer("conversation")} testId="conversation-tool"><IconMessageCircle /></RailButton>
+          <RailButton label="Search" active={drawerOpen && drawerTab === "search"} expanded={drawerOpen && drawerTab === "search"} onClick={() => openDrawer("search")} testId="search-tool"><IconSearch /></RailButton>
+          <RailButton label="Activity" active={drawerOpen && drawerTab === "activity"} expanded={drawerOpen && drawerTab === "activity"} onClick={() => openDrawer("activity")} testId="activity-tool"><IconClock /></RailButton>
+        </div>
+        <div className="session-rail-divider" />
+        <div className="session-rail-group" role="group" aria-label="This map">
+          <RailButton label={focusId ? "Show full map" : "Focus selected branch"} active={Boolean(focusId)} pressed={Boolean(focusId)} onClick={toggleFocus} testId="focus-tool"><IconFocusCentered /></RailButton>
+          <RailButton label={favorite ? "Remove favorite" : "Add favorite"} pressed={favorite} className="session-favorite-button" onClick={() => setFavorite((value) => !value)} testId="favorite-tool"><IconStar /></RailButton>
+        </div>
+        <div className="session-rail-group session-rail-footer" role="group" aria-label="Account and preferences">
+          <RailButton label="Settings" active={drawerOpen && drawerTab === "settings"} expanded={drawerOpen && drawerTab === "settings"} onClick={() => openDrawer("settings")} testId="settings-tool"><IconSettings /></RailButton>
+          <RailButton label="Account" active={drawerOpen && drawerTab === "profile"} expanded={drawerOpen && drawerTab === "profile"} onClick={() => openDrawer("profile")} className="avatar-button" testId="profile-tool">{example ? "TF" : "MR"}</RailButton>
+        </div>
       </nav>
 
       <div className="top-dock" aria-label="Canvas modes">
-        <IconButton label="Rectangle select" active={marqueeActive} pressed={marqueeActive} onClick={() => { setMarqueeActive((value) => !value); setSelectedIds([]); setSelectedId(null); }} testId="marquee-tool"><IconMarquee /></IconButton>
-        <IconButton label={`${pendingProposals.length} proposals waiting`} active={drawerOpen && drawerTab === "proposals"} onClick={() => openDrawer("proposals")} testId="ai-tool"><IconSparkles />{pendingProposals.length > 0 && <i className="tool-pip">{pendingProposals.length}</i>}</IconButton>
+        <IconButton label="New thought" onClick={openNewThought} disabled={composerSaving} testId="new-thought-tool"><IconPlus /></IconButton>
+        <div className="selection-picker" ref={selectionPickerRef} onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) setSelectionPickerOpen(false);
+        }}>
+          <button type="button" className={`icon-button selection-picker-trigger ${marqueeActive || selectionPickerOpen ? "is-active" : ""}`}
+            aria-label="Selection tools" title="Selection tools" aria-expanded={selectionPickerOpen} aria-controls="selection-modes"
+            onClick={() => setSelectionPickerOpen((value) => !value)} data-testid="selection-tools">
+            {selectionMode === "lasso" ? <IconLasso /> : <IconMarquee />}<IconChevronDown className="selection-picker-chevron" />
+          </button>
+          {selectionPickerOpen && <div id="selection-modes" className="selection-picker-menu" role="group" aria-label="Selection mode">
+            {[["rectangle", "Rectangle select", IconMarquee], ["lasso", "Lasso select", IconLasso]].map(([mode, label, ModeIcon]) => (
+              <button type="button" key={mode} aria-pressed={selectionMode === mode} data-selection-option
+                data-testid={mode === "lasso" ? "lasso-tool" : "marquee-tool"}
+                onClick={() => {
+                  setSelectionMode((current) => current === mode ? null : mode);
+                  setSelectedIds([]); setSelectedId(null); setSelectionPickerOpen(false);
+                  selectionPickerRef.current?.querySelector('[data-testid="selection-tools"]')?.focus();
+                }}>
+                <ModeIcon /><span>{label}</span>{selectionMode === mode && <IconCheck className="selection-picker-check" />}
+              </button>
+            ))}
+            <small>Esc to exit selection</small>
+          </div>}
+        </div>
+        <IconButton label={`${pendingProposals.length} ${pendingProposals.length === 1 ? "suggestion" : "suggestions"}`} active={drawerOpen && drawerTab === "proposals"} onClick={() => openDrawer("proposals")} testId="ai-tool"><IconSparkles />{pendingProposals.length > 0 && <i className="tool-pip">{pendingProposals.length}</i>}</IconButton>
         <IconButton label="Switch graph view" active={drawerOpen && drawerTab === "layouts"} onClick={() => openDrawer("layouts")} testId="layout-tool"><IconAffiliate /></IconButton>
         <IconButton label="Map overview and synthesis" active={drawerOpen && drawerTab === "overview"} onClick={() => openDrawer("overview")} testId="overview-tool"><IconGridDots /></IconButton>
         <IconButton label="Layers" active={drawerOpen && drawerTab === "layers"} onClick={() => openDrawer("layers")} testId="layers-tool"><IconStack2 /></IconButton>
-        <IconButton label="Canvas settings" active={drawerOpen && drawerTab === "settings"} onClick={() => openDrawer("settings")} testId="canvas-settings-tool"><IconSettings /></IconButton>
       </div>
 
       {marqueeActive && selectedIds.length > 0 && (
-        <div className="selection-toolbar" role="toolbar" aria-label="Rectangle selection actions" data-testid="selection-toolbar">
+        <div className="selection-toolbar" role="toolbar" aria-label="Selection actions" data-testid="selection-toolbar">
           <span>{selectedIds.length} selected{selectedIds.includes(rootId) ? " · starting thought protected" : ""}</span>
           <IconButton label={`Delete ${deletableSelection.length} selected thoughts`} disabled={!deletableSelection.length} onClick={deleteSelected} className="danger-action" testId="delete-selection"><IconTrash /></IconButton>
         </div>
@@ -1283,16 +1624,17 @@ export function CanonicalSessionApp() {
             <IconButton label="Close panel" onClick={() => setDrawerOpen(false)} className="panel-close"><IconX /></IconButton>
           </header>
 
-          {(drawerTab === "conversation" || drawerTab === "activity") && (
-            <div className="session-tabs" role="tablist">
-              <button type="button" role="tab" aria-selected={drawerTab === "conversation"} className={drawerTab === "conversation" ? "is-active" : ""} onClick={() => setDrawerTab("conversation")}>Conversation</button>
-              <button type="button" role="tab" aria-selected={drawerTab === "activity"} className={drawerTab === "activity" ? "is-active" : ""} onClick={() => setDrawerTab("activity")}>Activity</button>
-            </div>
-          )}
+          {["conversation", "sources", "proposals", "overview"].includes(drawerTab) && <div className="session-tabs session-primary-tabs" role="tablist" aria-label="Session details">
+            {[["conversation", "Conversation", IconMessageCircle], ["sources", "Sources", IconQuote], ["proposals", "Suggestions", IconSparkles], ["overview", "Synthesis", IconGridDots]].map(([tab, label, TabIcon]) => (
+              <button key={tab} type="button" role="tab" aria-selected={drawerTab === tab} className={drawerTab === tab ? "is-active" : ""} onClick={() => setDrawerTab(tab)} title={label}><TabIcon /><span>{label}</span>{tab === "proposals" && pendingProposals.length > 0 && <i>{pendingProposals.length}</i>}</button>
+            ))}
+          </div>}
+          <div className="session-resize-handle" role="separator" aria-label="Resize detail panel" aria-orientation="vertical" aria-valuemin={300} aria-valuemax={560} aria-valuenow={drawerWidth} aria-valuetext={`${Math.round(drawerWidth)} pixels wide`} tabIndex={0} onKeyDown={(event) => { if (["ArrowLeft", "ArrowRight"].includes(event.key)) { event.preventDefault(); setDrawerWidth((width) => clamp(width + (event.key === "ArrowRight" ? 20 : -20), 300, 560)); } }} onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) setDrawerWidth(clamp(event.clientX - event.currentTarget.parentElement.getBoundingClientRect().left, 300, Math.min(560, window.innerWidth - event.currentTarget.parentElement.getBoundingClientRect().left - 20))); }} onPointerUp={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }} />
 
           {drawerTab === "maps" ? (
             <div className="session-maps-panel">
               <button type="button" className="wide-action session-new-map" onClick={createNewMap}><IconPlus />New map</button>
+              {example && <div className="session-example-map-actions"><button type="button" className="wide-action" onClick={newExample}><IconPlus />New example copy</button><label className="wide-action session-import"><IconDownload />Import full session<input type="file" accept=".json,application/json" aria-label="Import full session" onChange={importExample} /></label></div>}
               <div className="session-map-list">
                 {sessions.map((item) => (
                   <div key={item.id} className={`session-map-row ${item.id === canonical?.id ? "is-current" : ""}`}>
@@ -1305,7 +1647,7 @@ export function CanonicalSessionApp() {
                     ) : (
                       <>
                         <button type="button" className="session-map-open" onClick={() => openSession(item.id)}>
-                          <span><strong>{item.title}</strong><small>{item.thought_count ?? item.node_count ?? 0} thoughts · {formatUpdated(item.updated_at)}</small></span>
+                          <span><strong>{item.title}</strong><small>{item.thought_count ?? item.node_count ?? 0} {(item.thought_count ?? item.node_count ?? 0) === 1 ? "thought" : "thoughts"} · {formatUpdated(item.updated_at)}</small></span>
                           {item.id === canonical?.id && <IconCheck />}
                         </button>
                         <IconButton label="Rename map" onClick={() => { setRenameId(item.id); setRenameValue(item.title); }}><IconPencil /></IconButton>
@@ -1315,12 +1657,13 @@ export function CanonicalSessionApp() {
                   </div>
                 ))}
               </div>
-              <div className="panel-note"><IconEye /><span>Sessions are stored as local JSON and resume after restart.</span></div>
+              <div className="panel-note"><IconEye /><span>{example ? "Each copy stays in this browser. Export a full session to keep it if you clear browser data." : "Your maps stay on this device, ready to pick up where you left off."}</span></div>
             </div>
           ) : drawerTab === "conversation" ? (
             <>
+              {example && <p className="session-example-note">Illustrative conversation. Select a thought to inspect its exact sources.</p>}
               <div className="session-transcript" data-testid="transcript">
-                {!canonical?.transcript?.length && <p className="empty-state">The transcript is the record; the map is the interpretation. Start anywhere.</p>}
+                {!canonical?.transcript?.length && <div className="session-conversation-empty"><IconMessageCircle /><h3>A little room to think.</h3><p>Start with a thought, a question, or something you haven’t figured out yet.</p></div>}
                 {conversationTimeline.map((turn) => {
                   const firstUtterance = turn.utterances[0];
                   const highlighted = turn.utterances.some((utterance) => utterance.id === highlight?.utteranceId);
@@ -1328,9 +1671,11 @@ export function CanonicalSessionApp() {
                   return (
                     <div key={turn.id} className={`session-utterance ${turn.speaker} ${highlighted ? "is-highlighted" : ""}`}>
                       <time>{turn.speaker === "you" ? "You" : "Partner"} · {formatClock(timestamp)}</time>
-                      {turn.utterances.length > 0 && (
+                      {groupUtterancesByPause(turn.utterances).map((group, groupIndex) => (
+                        <React.Fragment key={group[0].id}>
+                        {groupIndex > 0 && <time className="session-turn-pause">{formatClock(group[0].completed_at)}</time>}
                         <p>
-                          {turn.utterances.map((utterance, index) => (
+                          {group.map((utterance, index) => (
                             <React.Fragment key={utterance.id}>
                               {index > 0 && " "}
                               <span
@@ -1345,7 +1690,8 @@ export function CanonicalSessionApp() {
                             </React.Fragment>
                           ))}
                         </p>
-                      )}
+                        </React.Fragment>
+                      ))}
                       {turn.actions.length > 0 && (
                         <div className="session-turn-actions" aria-label="Partner map actions">
                           {turn.actions.map((action) => <span key={action.id}>{action.label}</span>)}
@@ -1356,16 +1702,17 @@ export function CanonicalSessionApp() {
                 })}
                 <div ref={transcriptEndRef} />
               </div>
-              <form className="session-chat" onSubmit={submitChat}>
-                <input ref={chatInputRef} value={chatValue} onChange={(event) => setChatValue(event.target.value)} placeholder={voiceConnected ? "Type into the live conversation…" : "Type a complete thought…"} />
+              {chatFailure?.sessionId === canonical?.id && <p className="session-recovery-note" role="status">{chatFailure.message}</p>}
+              {!example && <form className="session-chat" onSubmit={submitChat}>
+                <input ref={chatInputRef} value={chatValue} onChange={(event) => { chatSubmissions.edit(sessionIdRef.current, event.target.value); setChatFailure(null); setChatValue(event.target.value); }} aria-label="Message Partner" placeholder={selected ? "Talk about the selected thought…" : "Think aloud with Partner…"} />
                 <IconButton type="submit" label="Send" disabled={!chatValue.trim() || busy}><IconSend /></IconButton>
-              </form>
+              </form>}
             </>
           ) : drawerTab === "activity" ? (
             <>
               <div className="history-actions">
-                <IconButton label="Undo map change" onClick={undo} disabled={!canonical?.history_cursor}><IconArrowBackUp /></IconButton>
-                <IconButton label="Redo map change" onClick={redo} disabled={!canRedo}><IconArrowForwardUp /></IconButton>
+                <IconButton label={undoLabel} onClick={undo} disabled={!canonical?.history_cursor}><IconArrowBackUp /></IconButton>
+                <IconButton label={canonical?.redo_label ? `Redo ${canonical.redo_label}` : "Redo map change"} onClick={redo} disabled={!canRedo}><IconArrowForwardUp /></IconButton>
               </div>
               <div className="session-ledger">
                 {!canonical?.operations?.length && <p className="empty-state">Every map change lands here with who made it.</p>}
@@ -1378,16 +1725,41 @@ export function CanonicalSessionApp() {
             </>
           ) : drawerTab === "search" ? (
             <div className="session-search-panel">
-              <label className="search-field"><IconSearch /><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search thoughts…" /></label>
+              <label className="search-field"><IconSearch /><input aria-label="Search thoughts" autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search thoughts…" /></label>
               <div className="panel-list search-results">
-                {searchResults.map((node) => <button type="button" key={node.id} onClick={() => { selectOne(node.id); setDrawerOpen(false); }}><span>{nodeLabel(node)}</span></button>)}
+                {searchResults.map((node) => <button type="button" key={node.id} onClick={() => { rememberView(); selectOne(node.id); setFocusId(node.id); centerOnNode(node.id, { ignoreDrawer: true }); setDrawerOpen(false); }}><span>{nodeLabel(node)}</span></button>)}
                 {!searchResults.length && <p className="empty-state">No matching thoughts yet.</p>}
               </div>
             </div>
+          ) : drawerTab === "sources" ? (
+            <div className="session-panel-copy session-sources">
+              {selected ? <><h3>{nodeLabel(selected)}</h3>{selected.sources?.length ? selected.sources.map((source, index) => {
+                const utterance = canonical.transcript.find((item) => item.id === source.utteranceId);
+                return utterance ? <blockquote key={`${source.utteranceId}-${index}`}><p>{utterance.text.slice(source.span[0], source.span[1])}</p><footer>{utterance.speaker === "you" ? "You" : "Partner"} · {formatClock(utterance.completed_at)}<button type="button" onClick={() => openEvidence(utterance.id, selected.id)}>Show in conversation</button></footer></blockquote> : null;
+              }) : <p>{selected.ghost ? "This suggestion goes beyond the conversation. Review its reasoning in Suggestions." : "This thought was added directly to the map."}</p>}</> : <p>Select a thought to see the exact words it came from.</p>}
+            </div>
           ) : drawerTab === "proposals" ? (
-            <div className="session-panel-copy">
-              <p>{pendingProposals.length ? `${pendingProposals.length} Partner ${pendingProposals.length === 1 ? "proposal" : "proposals"} are visible on the canvas.` : "No proposals are waiting for review."}</p>
-              <label className="session-setting-row"><span><strong>Show proposals</strong><small>Ghost tethers and review cards</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
+            <div className="session-panel-copy session-suggestions-list">
+              <label className="session-setting-row"><span><strong>Show on canvas</strong><small>Suggestions stay separate until accepted</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
+              {!pendingProposals.length && <p className="empty-state">No suggestions.</p>}
+              {pendingProposals.map((proposal) => (
+                <article key={proposal.id} className={`session-proposal ${proposal.status === "stale" ? "is-stale" : ""}`} data-testid="partner-proposal">
+                  <header><i className="session-proposal-mark"><IconSparkles /></i><span>Partner suggests</span></header>
+                  <p>{proposal.rationale}</p>
+                  {proposal.status === "stale" && <small>This suggestion no longer fits the current map.</small>}
+                  <div className="session-proposal-operations">{(proposal.operations ?? []).map((operation) => <div key={operation.id} className={operation.excluded ? "is-excluded" : ""}><span>{proposalOperationLabel(operation)}</span>{proposal.status === "pending" && !operation.excluded && <IconButton label="Exclude this change" onClick={() => excludeProposalOperation(proposal, operation)}><IconX /></IconButton>}</div>)}</div>
+                  <details className="session-proposal-evidence"><summary>Why this idea?</summary><p>{proposal.rationale}</p>{(proposal.evidence ?? []).map((evidence, index) => {
+                    const utteranceId = evidence.utterance_id ?? (typeof evidence === "string" ? evidence : null);
+                    const spans = Number.isInteger(evidence?.start) && Number.isInteger(evidence?.end) ? [[evidence.start, evidence.end]] : null;
+                    return utteranceId ? <button key={`${utteranceId}-${index}`} type="button" className="session-evidence" onClick={() => openEvidence(utteranceId, null, spans)}><IconQuote />{evidence.quote ? `“${evidence.quote}”` : "Conversation source"}</button> : null;
+                  })}</details>
+                  <footer>
+                    {!example && <button type="button" className="session-proposal-explore" onClick={() => { const ghost = ghostVisuals.ghostNodes.find((node) => node.proposalId === proposal.id); if (ghost) askAboutBubble(ghost.id); else { setDrawerTab("conversation"); setChatValue(`Let’s explore this suggestion without changing the map: ${proposal.rationale}`); window.setTimeout(() => chatInputRef.current?.focus(), 50); } }}><IconMessageCircle />Explore</button>}
+                    <IconButton label="Accept AI suggestion" className="session-accept" disabled={proposal.status === "stale" || !(proposal.operations ?? []).some((operation) => !operation.excluded)} onClick={() => acceptProposal(proposal)} testId="accept-suggestion"><IconCheck /></IconButton>
+                    <IconButton label="Dismiss AI suggestion" className="session-dismiss" onClick={() => dismissProposal(proposal)} testId="dismiss-suggestion"><IconX /></IconButton>
+                  </footer>
+                </article>
+              ))}
             </div>
           ) : drawerTab === "layouts" ? (
             <div className="session-panel-copy">
@@ -1395,93 +1767,83 @@ export function CanonicalSessionApp() {
                 <button type="button" className={viewMode === "clusters" ? "is-active" : ""} onClick={() => changeView("clusters")}>Clusters</button>
                 <button type="button" className={viewMode === "hierarchy" ? "is-active" : ""} onClick={() => changeView("hierarchy")}>Hierarchy</button>
               </div>
-              <p className="panel-description">Two views of the same canonical graph. Cluster mode keeps the fluid physics active.</p>
+              <p className="panel-description">One map, two views.</p>
             </div>
           ) : drawerTab === "overview" ? (
             <div className="session-panel-copy">
-              <div className="map-stats"><span><strong>{canonical?.nodes?.length ?? 0}</strong><small>Thoughts</small></span><span><strong>{canonical?.edges?.length ?? 0}</strong><small>Links</small></span><span><strong>{pendingProposals.length}</strong><small>Proposals</small></span></div>
-              <button type="button" className="wide-action" disabled={synthesizing || !canonical?.nodes?.length} onClick={requestSynthesis}><IconSparkles />{synthesizing ? "Synthesizing…" : "Write a synthesis"}</button>
-              {synthesis && <div className="session-synthesis"><p>{synthesis}</p></div>}
+              <div className="map-stats"><span><strong>{canonical?.nodes?.length ?? 0}</strong><small>Thoughts</small></span><span><strong>{canonical?.edges?.length ?? 0}</strong><small>Links</small></span><span><strong>{pendingProposals.length}</strong><small>Suggestions</small></span></div>
+              {example ? <p className="session-example-note">The saved synthesis belongs to the example. Live generation is off.</p> : <button type="button" className="wide-action" disabled={synthesizing || !canonical?.nodes?.length} onClick={requestSynthesis}><IconSparkles />{synthesizing ? "Synthesizing…" : "Write a synthesis"}</button>}
+              {synthesis && <><div className="session-synthesis"><p>{synthesis}</p></div><p className="session-synthesis-meta">Saved {formatUpdated(canonical?.synthesis?.created_at)}{canonical?.synthesis?.revision !== canonical?.revision ? " · The conversation may have moved on since this was written." : ""}</p></>}
+              <div className="session-export-actions"><button type="button" onClick={() => downloadSessionExport(canonical.id, "markdown").catch((error) => showToast(error.message))}><IconDownload />Export notes</button><button type="button" onClick={() => downloadSessionExport(canonical.id, "json").catch((error) => showToast(error.message))}>Full session</button></div>
             </div>
           ) : drawerTab === "layers" ? (
             <div className="session-settings-panel">
-              <label className="session-setting-row"><span><strong>Partner proposals</strong><small>Show ghost branches and tethers</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
+              <label className="session-setting-row"><span><strong>Suggestions</strong><small>Show ghost branches and tethers</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
               <label className="session-setting-row"><span><strong>Provenance labels</strong><small>Reveal transcript-source labels on bubbles</small></span><input type="checkbox" checked={showProvenance} onChange={(event) => setShowProvenance(event.target.checked)} /></label>
             </div>
           ) : drawerTab === "profile" ? (
-            <div className="session-profile-panel"><div className="profile-card"><span>MR</span><div><strong>Solo workspace</strong><small>Private by default</small></div></div><div className="panel-note"><IconUser /><span>The transcript and accepted map stay together in this local session.</span></div></div>
+            <div className="session-profile-panel"><div className="profile-card"><span>{example ? "TF" : "MR"}</span><div><strong>{example ? "Example workspace" : "Solo workspace"}</strong><small>{example ? "Saved only in this browser" : "Private by default"}</small></div></div><div className="panel-note"><IconUser /><span>The transcript and accepted map stay together in this local session.</span></div></div>
           ) : (
             <div className="session-settings-panel">
-              <div className="session-voice-mode"><span><strong>Voice turn-taking</strong><small>Changing modes disconnects the current call.</small></span><div className="segmented-control"><button type="button" className={voiceMode === "vad" ? "is-active" : ""} onClick={() => setNextVoiceMode("vad")}>Automatic</button><button type="button" className={voiceMode === "push-to-talk" ? "is-active" : ""} onClick={() => setNextVoiceMode("push-to-talk")}>Push to talk</button></div></div>
+              {!example && <><div className="session-voice-mode"><span><strong>Partner’s initiative</strong><small>Quiet keeps conversation and mapping active. Proactive also offers new angles.</small></span><div className="segmented-control"><button type="button" disabled={preferenceBusy} className={partnerMode === "quiet" ? "is-active" : ""} onClick={() => setPreferences({ partner_mode: "quiet" })}>Quiet</button><button type="button" disabled={preferenceBusy} className={partnerMode === "proactive" ? "is-active" : ""} onClick={() => setPreferences({ partner_mode: "proactive" })}>Proactive</button></div></div><label className="session-setting-row"><span><strong>Pause mapping</strong><small>Keep talking; your full conversation is still saved</small></span><input type="checkbox" checked={mappingPaused} disabled={preferenceBusy} onChange={(event) => setPreferences({ mapping_paused: event.target.checked })} /></label></>}
               <label className="session-setting-row"><span><strong>Reduced motion</strong><small>Freeze deformation cues and reveal connections immediately</small></span><input type="checkbox" checked={reducedMotion} onChange={(event) => setReducedMotion(event.target.checked)} /></label>
-              <label className="session-setting-row"><span><strong>Partner proposals</strong><small>Show reviewable ghost suggestions</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
+              <label className="session-setting-row"><span><strong>Suggestions</strong><small>Show on canvas</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
             </div>
           )}
         </aside>
       )}
 
-      {selected && sourceUtterance && (
-        <div className="session-provenance" data-testid="provenance-chip"><IconQuote /><p>“…{sourceUtterance.text.slice(selectedSource.span[0], selectedSource.span[1])}…”</p><button type="button" onClick={() => openEvidence(sourceUtterance.id, selected.id)}>Show in transcript</button></div>
-      )}
-
-      {showSuggestions && <div className="session-proposals">
-        {pendingProposals.map((proposal) => (
-          <article key={proposal.id} className={`session-proposal ${proposal.status === "stale" ? "is-stale" : ""}`} data-testid="partner-proposal">
-            <header><i className="session-proposal-mark"><IconSparkles /></i><span>Partner suggests</span></header>
-            <p>{proposal.rationale}</p>
-            <small className="session-proposal-stale">Source map revision {proposal.base_revision}{proposal.base_revision !== canonical?.revision ? " — re-checked on accept" : ""}</small>
-            <div className="session-proposal-operations">
-              {(proposal.operations ?? []).map((operation) => (
-                <div key={operation.id} className={operation.excluded ? "is-excluded" : ""}><span>{proposalOperationLabel(operation)}</span>{proposal.status === "pending" && !operation.excluded && <IconButton label="Exclude this change" onClick={() => excludeProposalOperation(proposal, operation)}><IconX /></IconButton>}</div>
-              ))}
-            </div>
-            <footer>
-              <IconButton label="Accept AI suggestion" className="session-accept" disabled={proposal.status === "stale" || !(proposal.operations ?? []).some((operation) => !operation.excluded)} onClick={() => acceptProposal(proposal)} testId="accept-suggestion"><IconCheck /></IconButton>
-              <IconButton label="Dismiss AI suggestion" className="session-dismiss" onClick={() => dismissProposal(proposal)} testId="dismiss-suggestion"><IconX /></IconButton>
-              {(proposal.evidence ?? []).slice(0, 2).map((evidence, index) => {
-                const utteranceId = evidence.utterance_id ?? (typeof evidence === "string" ? evidence : null);
-                const spans = Number.isInteger(evidence?.start) && Number.isInteger(evidence?.end)
-                  ? [[evidence.start, evidence.end]]
-                  : null;
-                const label = evidence.quote ? `“${evidence.quote}”` : "Transcript source";
-                return utteranceId ? <button key={`${utteranceId}-${index}`} type="button" className="session-evidence" onClick={() => openEvidence(utteranceId, null, spans)}><IconQuote />{label}</button> : null;
-              })}
-            </footer>
-          </article>
-        ))}
+      {selected && !marqueeActive && !composer && <div className="session-selection-context" data-testid="selection-context">
+        <div className="session-selection-label"><small>{selected.ghost ? "Suggestion" : selectedCanonical?.parked ? "Kept aside" : "Selected thought"}</small><strong title={nodeLabel(selected)}>{nodeLabel(selected)}</strong></div>
+        <div className="session-context-actions">
+          {!selected.ghost && <IconButton label="New connected thought" onClick={() => openThoughtEditor({ mode: "add", parentId: selected.id })} testId="add-connected-thought"><IconPlus /></IconButton>}
+          {!selected.ghost && <IconButton label="More thought actions" testId="thought-more-actions" onClick={() => setBubbleActionsId((current) => current === selected.id ? null : selected.id)}><IconDots /></IconButton>}
+          {selected.ghost && !example && <IconButton label="Explore suggestion" onClick={() => askAboutBubble(selected.id)}><IconMessageCircle /></IconButton>}
+          {selectedProposal && <IconButton label="Review suggestion" onClick={() => { setDrawerTab("proposals"); setDrawerOpen(true); }}><IconSparkles /></IconButton>}
+          <IconButton label="Clear selection" onClick={() => selectOne(null)}><IconX /></IconButton>
+        </div>
       </div>}
 
+      {recentChange && <div className="session-recent-change" role="status"><span>{recentChange.label}</span><button type="button" onClick={() => { rememberView(); const id = recentChange.nodeIds.find((candidate) => canonical.nodes.some((node) => node.id === candidate)); if (id) { selectOne(id); setFocusId(id); centerOnNode(id); } else { setDrawerTab("activity"); setDrawerOpen(true); } }}>Show</button><IconButton label={undoLabel} onClick={undo} disabled={!canonical?.history_cursor}><IconArrowBackUp /></IconButton><IconButton label="Dismiss recent change" onClick={() => setRecentChange(null)}><IconX /></IconButton></div>}
+
       {composer && (
-        <form className="session-composer" onSubmit={submitComposer}>
-          <label><span>{composer.mode === "edit" ? "Rewrite this bubble" : "Add a thought"}</span><textarea autoFocus rows="3" value={composerValue} onChange={(event) => setComposerValue(event.target.value)} placeholder="Keep it concise; the transcript keeps the rest" /></label>
-          <div><IconButton label="Cancel" onClick={() => setComposer(null)}><IconX /></IconButton><IconButton type="submit" label={composer.mode === "edit" ? "Save label" : "Add bubble"} disabled={!composerValue.trim()}><IconCheck /></IconButton></div>
+        <form className="session-composer" onSubmit={submitComposer} aria-label={composer.fresh ? "New thought" : composer.mode === "edit" ? "Edit thought" : composer.parentId ? "New connected thought" : "New thought"}>
+          <header className="thought-editor-header">
+            <div><strong>{composer.fresh ? "New thought" : composer.mode === "edit" ? "Edit thought" : composer.parentId ? "New connected thought" : "New thought"}</strong>
+              {composer.parentId && <small><IconLink />Connected to {nodeLabel(nodes.find((node) => node.id === composer.parentId) ?? { lines: ["selected thought"] })}</small>}
+            </div>
+            <IconButton label="Close thought editor" disabled={composerSaving} onClick={() => setComposer(null)}><IconX /></IconButton>
+          </header>
+          <textarea aria-label="Thought text" autoFocus rows="3" value={composerValue} disabled={composerSaving} onChange={(event) => setComposerValue(event.target.value)} placeholder="What's the thought?" onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form.requestSubmit(); }
+          }} />
+          <footer className="thought-editor-footer"><small>Enter to save · Shift + Enter for a new line</small><button type="submit" disabled={!composerValue.trim() || composerSaving}>{composerSaving ? "Saving…" : composer.mode === "edit" ? "Save" : "Add thought"}</button></footer>
         </form>
       )}
 
-      {(voiceStarting || voiceConnected || liveCaption || partnerCaption) && (
-        <div className="voice-caption session-caption" role="status" aria-live="polite"><span /><p>{partnerCaption ? "Partner" : voiceStarting ? "Connecting…" : voiceMode === "push-to-talk" ? "Hold the mic while you speak…" : "Listening for a complete thought…"}</p><small>{partnerCaption || liveCaption || "Speak naturally."}</small></div>
-      )}
+      {(liveCaption || partnerCaption) && <div className="session-live-captions" aria-label="Live captions">
+        {liveCaption && <div><span>You</span><p>{liveCaption}</p></div>}
+        {partnerCaption && <div><span>Partner</span><p>{partnerCaption}</p></div>}
+      </div>}
 
-      {controllerStatus && (
-        <div className={`session-controller-status is-${controllerStatus.kind}`} role="status" aria-live="polite">
-          <span>{controllerStatus.label}</span>
-          {controllerStatus.kind === "error" && <button type="button" onClick={retryMapController} disabled={controllerRetrying}>{controllerRetrying ? "Retrying…" : "Retry"}</button>}
+      {!example && <div className="session-conversation-controls">
+        <div className="session-presence-controls" aria-label="Partner and mapping preferences">
+          <button type="button" title={partnerMode === "quiet" ? "Quiet: conversation and capture, without unsolicited suggestions" : "Proactive: Partner may suggest useful new angles"} disabled={preferenceBusy} onClick={() => setPreferences({ partner_mode: partnerMode === "quiet" ? "proactive" : "quiet" })}><IconSparkles /><span>{partnerMode === "quiet" ? "Quiet" : "Proactive"}</span></button>
+          <button type="button" className={mappingPaused ? "is-paused" : ""} title={mappingPaused ? "Resume mapping completed thoughts" : "Pause mapping; keep the conversation going"} aria-pressed={mappingPaused} disabled={preferenceBusy} onClick={() => setPreferences({ mapping_paused: !mappingPaused })}>{mappingPaused ? <IconPlayerPlay /> : <IconPlayerPause />}<span>{mappingPaused ? "Mapping paused" : "Mapping on"}</span></button>
         </div>
-      )}
-
-      <div className={`voice-control ${voiceConnected ? "is-listening" : ""}`}>
-        <span className="voice-timer">{timer}</span>
-        {voiceMode === "push-to-talk" && voiceConnected ? (
-          <button type="button" className="icon-button" aria-label="Hold to talk" title="Hold to talk" onPointerDown={startPushToTalk} onPointerUp={stopPushToTalk} onPointerCancel={stopPushToTalk}><IconMicrophone /></button>
-        ) : (
-          <IconButton label={voiceConnected || voiceStarting ? "Stop voice conversation" : "Start voice conversation"} pressed={voiceConnected} onClick={toggleVoice} testId="voice-control"><IconMicrophone /></IconButton>
-        )}
-        {voiceMode === "push-to-talk" && voiceConnected && <IconButton label="Disconnect voice" onClick={stopRealtime}><IconX /></IconButton>}
-      </div>
+        <div className="session-backend-status" role="status" aria-live="polite">
+          {canonical?.capture_status?.last_error && <div className="session-capture-error"><span>{canonical.capture_status.last_error}</span><button type="button" onClick={retryCapture} disabled={captureRetrying}>{captureRetrying ? "Retrying…" : "Retry thought capture"}</button></div>}
+          {controllerStatus?.kind === "error" ? <><span>{controllerStatus.label}</span><button type="button" onClick={retryMapController} disabled={controllerRetrying}>{controllerRetrying ? "Retrying…" : "Retry"}</button></> : <span>{backendState === "working" ? "Partner is thinking…" : controllerStatus?.kind === "active" ? controllerStatus.label : mappingPaused ? "Your conversation is still being saved" : ""}</span>}
+        </div>
+        <div className={`voice-control ${voiceConnected && !muted ? "is-listening" : ""}`}>
+          <span className="voice-timer">{voiceConnected ? timer : voiceStarting ? "Connecting…" : "Start talking"}</span>
+          {voiceConnected ? <><IconButton label={muted ? "Unmute microphone" : "Mute microphone"} pressed={muted} disabled={mutePending} onClick={toggleMute} testId="voice-control">{muted ? <IconMicrophoneOff /> : <IconMicrophone />}</IconButton><IconButton label="End voice conversation" className="session-end-voice" onClick={endVoice}><IconPlayerStop /></IconButton></> : <IconButton label={voiceStarting ? "Cancel voice connection" : "Start voice conversation"} onClick={voiceStarting ? stopRealtime : startVoice} testId="voice-control">{voiceStarting ? <IconX /> : <IconMicrophone />}</IconButton>}
+          {voiceConnected && <small className="session-mute-label">{muted ? "Mic muted" : "Listening"}</small>}
+        </div>
+      </div>}
       {voiceError && <div className="session-voice-error" role="status">{voiceError} <button type="button" onClick={() => setVoiceError("")}>Dismiss</button></div>}
 
-      <div className="zoom-controls" aria-label="Canvas zoom"><IconButton label="Center map" onClick={() => { setPan({ x: 0, y: 0 }); setZoom(1); }}><IconFocusCentered /></IconButton><IconButton label="Zoom out" onClick={() => setZoom((value) => clamp(value - ZOOM_STEP, MIN_ZOOM, MAX_ZOOM))}><IconMinus /></IconButton><span>{Math.round(zoom * 100)}%</span><IconButton label="Zoom in" onClick={() => setZoom((value) => clamp(value + ZOOM_STEP, MIN_ZOOM, MAX_ZOOM))}><IconPlus /></IconButton></div>
-      {connectFromId && <div className="connect-hint" role="status"><span>Select another bubble to connect</span><IconButton label="Cancel connection" onClick={() => setConnectFromId(null)}><IconX /></IconButton></div>}
+      <div className="zoom-controls" aria-label="Canvas zoom"><IconButton label="Back to previous view" disabled={!previousViews.length} onClick={restorePreviousView}><IconArrowLeft /></IconButton><IconButton label={undoLabel} onClick={undo} disabled={!canonical?.history_cursor}><IconArrowBackUp /></IconButton><IconButton label="Fit map" onClick={fitMap}><IconFocusCentered /></IconButton><IconButton label="Zoom out" disabled={zoom <= MIN_CAMERA_ZOOM} onClick={() => adjustZoom(1 / 1.2)}><IconMinus /></IconButton><span>{Math.round(zoom * 100)}%</span><IconButton label="Zoom in" disabled={zoom >= MAX_CAMERA_ZOOM} onClick={() => adjustZoom(1.2)}><IconPlus /></IconButton></div>
       {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
     </main>
   );

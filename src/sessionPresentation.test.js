@@ -176,19 +176,17 @@ test("a map-controller snapshot reconciles into the same generic Partner action 
   assert.doesNotMatch(timeline[0].actions[0].label, /controller|private-node-id|map_controller/i);
 });
 
-test("classic and session routes reuse one sizing and canvas renderer", () => {
+test("workspace preserves shared sizing, canvas rendering, and causal motion", () => {
   const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
   const motionSource = readFileSync(new URL("./connectionVisualMotion.js", import.meta.url), "utf8");
   const sessionMotionSource = readFileSync(new URL("./session/connectionMotion.js", import.meta.url), "utf8");
   const presentationSource = readFileSync(new URL("./session/presentation.js", import.meta.url), "utf8");
   const sessionSource = readFileSync(new URL("./CanonicalSessionApp.jsx", import.meta.url), "utf8");
 
-  assert.match(appSource, /import \{ radiusForThought, wrapThought \} from "\.\/thoughtSizing\.js"/);
   assert.match(presentationSource, /import \{ radiusForThought, wrapThought \} from "\.\.\/thoughtSizing\.js"/);
   assert.doesNotMatch(appSource, /function (?:wrapThought|radiusForThought)\(/);
   assert.doesNotMatch(presentationSource, /function (?:wrapThought|radiusForThought)\(/);
   assert.match(sessionSource, /import \{ IconButton, MindMap, layoutHierarchy \} from "\.\/App\.jsx"/);
-  assert.match(appSource, /from "\.\/connectionVisualMotion\.js"/);
   assert.match(sessionMotionSource, /from "\.\.\/connectionVisualMotion\.js"/);
   assert.match(motionSource, /export function applyConnectionGrowthMotion/);
   assert.match(motionSource, /export function buildConnectionPopTransition/);

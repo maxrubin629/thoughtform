@@ -1,3 +1,4 @@
+import { sessionSnapshot } from "../shared/sessionSnapshot.mjs";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -30,9 +31,12 @@ import {
   createMapControllerScheduler,
 } from "./mapController.mjs";
 import { createCurator, createCuratorScheduler, isCuratorEnabled } from "./curator.mjs";
+import { registerLiveRoutes } from "./live.mjs";
+import { sessionMarkdown } from "./sessionExport.mjs";
+import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
 
 const PORT = Number(process.env.PORT ?? 8787);
-const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6";
+const MODEL = process.env.OPENAI_MODEL ?? DEFAULT_REASONING_MODEL;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? DEFAULT_REALTIME_MODEL;
 const hasKey = Boolean(process.env.OPENAI_API_KEY);
 const client = hasKey ? new OpenAI() : null;
@@ -44,7 +48,7 @@ const asJsonSchema = (name, schema) => ({
 async function structuredCall({ system, payload, schemaName, schema }) {
   const response = await client.responses.create({
     model: MODEL,
-    reasoning: { effort: "low" },
+    reasoning: { effort: DEFAULT_REASONING_EFFORT },
     instructions: system,
     input: JSON.stringify(payload),
     text: asJsonSchema(schemaName, schema),
@@ -150,7 +154,7 @@ export function createSseEventWriter() {
 }
 
 export async function createThoughtformServer({
-  store = createSessionStore(),
+  store = createSessionStore(process.env.THOUGHTFORM_DATA_DIR ? { directory: process.env.THOUGHTFORM_DATA_DIR } : {}),
   openaiClient = client,
   fetchImpl = globalThis.fetch,
   env = process.env,
@@ -203,34 +207,14 @@ export async function createThoughtformServer({
   };
 
   const snapshotFor = (session) => {
-    const nodeIds = new Set(session.nodes.map((node) => node.id));
-    const storedContext = uiContexts.get(session.id) ?? {
-      selected_node_ids: [],
-      focus_id: null,
-      view_mode: "clusters",
-      voice_mode: "vad",
-    };
-    const context = {
-      ...storedContext,
-      selected_node_ids: (storedContext.selected_node_ids ?? []).filter((id) => nodeIds.has(id)),
-      focus_id: nodeIds.has(storedContext.focus_id) ? storedContext.focus_id : null,
-    };
-    uiContexts.set(session.id, context);
-    const history = [...session.operations].reverse()
-      .find((operation) => Array.isArray(operation.history_entry_ids))?.history_entry_ids ?? [];
-    const operations = session.operations.map(({ change: _change, history_entry_ids: _history, ...record }) => record);
-    return {
-      ...session,
-      controller_event_epoch: controllerEventEpoch,
-      controller_event_sequence: controllerEventSequenceFor(session.id),
-      map_controller: {
-        ...session.map_controller,
-        status: mapControllerStatusFor(session),
-      },
-      operations,
-      history_length: history.length,
-      ui_context: context,
-    };
+    const snapshot = sessionSnapshot(session, {
+      uiContext: uiContexts.get(session.id),
+      controllerEventEpoch,
+      controllerEventSequence: controllerEventSequenceFor(session.id),
+      controllerStatus: mapControllerStatusFor(session),
+    });
+    uiContexts.set(session.id, snapshot.ui_context);
+    return snapshot;
   };
 
   const realtimeSnapshotFor = (snapshot) => ({
@@ -302,7 +286,11 @@ export async function createThoughtformServer({
   };
 
   const commitCuratorProposal = async (sessionId, proposal) => {
-    const result = await store.transact(sessionId, (session) => applyOperation(session, {
+    const result = await store.transact(sessionId, (session) => {
+      if (session.preferences?.partner_mode === "quiet" || session.preferences?.mapping_paused) {
+        return { session, skipped: true };
+      }
+      return applyOperation(session, {
       type: "propose_changes",
       actor: "curator",
       origin: "ui",
@@ -313,7 +301,9 @@ export async function createThoughtformServer({
       rationale: proposal.rationale,
       evidence: proposal.evidence,
       operations: proposal.operations,
-    }));
+      });
+    });
+    if (result.skipped) return result;
     const snapshot = snapshotFor(result.session);
     publish(result.session, "operation", { operation_id: result.operation_id }, snapshot);
     return { ...result, snapshot };
@@ -406,11 +396,50 @@ export async function createThoughtformServer({
     }
   };
 
+  const updatePreferences = async (sessionId, patch = {}) => {
+    const allowed = new Set(["mapping_paused", "partner_mode"]);
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)
+      || Object.keys(patch).some((key) => !allowed.has(key))
+      || (patch.mapping_paused !== undefined && typeof patch.mapping_paused !== "boolean")
+      || (patch.partner_mode !== undefined && !["quiet", "proactive"].includes(patch.partner_mode))) {
+      throw new SessionOperationError("Choose a valid mapping or Partner setting.", { code: "invalid_preferences" });
+    }
+    const updated = await store.transact(sessionId, (session) => ({
+      ...session,
+      preferences: { mapping_paused: false, partner_mode: "proactive", ...session.preferences, ...patch },
+      updated_at: new Date().toISOString(),
+    }));
+    await mapControllerScheduler?.preferencesChanged?.(sessionId);
+    if (updated.preferences.partner_mode === "quiet" || updated.preferences.mapping_paused) curatorScheduler?.cancel(sessionId);
+    const snapshot = await publishMapControllerSnapshot(sessionId);
+    return { ok: true, snapshot };
+  };
+
+  const liveService = registerLiveRoutes(app, {
+    store, openaiClient, env, fetchImpl, jsonRoute, publish, snapshotFor, performOperation,
+    updatePreferences,
+    getUiContext: (sessionId) => uiContexts.get(sessionId) ?? {},
+    mapControllerScheduler,
+    onTranscriptCommitted: async (sessionId, utterance) => {
+      if (mapControllerScheduler?.notify(sessionId, utterance)) await publishMapControllerSnapshot(sessionId);
+    },
+  });
+
+  app.patch("/api/sessions/:id/preferences", jsonRoute((req) => updatePreferences(req.params.id, req.body)));
+
+  app.get("/api/sessions/:id/export", jsonRoute(async (req, res) => {
+    const session = await store.get(req.params.id);
+    const markdown = req.query.format === "markdown";
+    res.set("Content-Disposition", `attachment; filename="thoughtform-${session.id}.${markdown ? "md" : "json"}"`);
+    res.type(markdown ? "text/markdown" : "application/json").send(markdown ? sessionMarkdown(session) : JSON.stringify(session, null, 2));
+  }));
+
   app.get("/api/health", (req, res) => {
     res.json({
       ok: true,
-      model: MODEL,
-      mock: !hasKey,
+      model: env.OPENAI_MODEL ?? MODEL,
+      mock: !controllerConfigured,
+      live: { configured: controllerConfigured, model: env.OPENAI_LIVE_MODEL ?? "gpt-live-1", backend_model: env.OPENAI_LIVE_BACKEND_MODEL ?? DEFAULT_REASONING_MODEL, reasoning_effort: DEFAULT_REASONING_EFFORT },
       realtime: { configured: hasKey, model: REALTIME_MODEL },
       map_controller: {
         configured: controllerConfigured,
@@ -436,6 +465,7 @@ export async function createThoughtformServer({
     const session = await store.get(req.params.id);
     await store.setActive(session.id);
     recoverMapController(session);
+    liveService.recoverCapture(session);
     return snapshotFor(session);
   }));
 
@@ -464,6 +494,7 @@ export async function createThoughtformServer({
       selected_node_ids: Array.isArray(req.body?.selected_node_ids)
         ? [...new Set(req.body.selected_node_ids.filter((id) => nodeIds.has(id)))]
         : [],
+      selected_proposal_id: session.proposals.some((proposal) => proposal.id === req.body?.selected_proposal_id && ["pending", "stale"].includes(proposal.status)) ? req.body.selected_proposal_id : null,
       focus_id: nodeIds.has(req.body?.focus_id) ? req.body.focus_id : null,
       view_mode: req.body?.view_mode === "hierarchy" ? "hierarchy" : "clusters",
       voice_mode: req.body?.voice_mode === "push-to-talk" ? "push-to-talk" : "vad",
@@ -653,16 +684,21 @@ export async function createThoughtformServer({
     if (!session.nodes.length) {
       throw new SessionOperationError("Add at least one bubble before synthesizing.", { code: "empty_map" });
     }
-    if (!hasKey) {
-      return { synthesis: `Offline mock synthesis of ${session.nodes.length} thoughts — set OPENAI_API_KEY to enable ${MODEL}.`, revision: session.revision };
-    }
+    if (!openaiClient) throw new SessionOperationError("Connect OpenAI to write a synthesis.", { code: "model_unavailable", status: 503 });
     const response = await openaiClient.responses.create({
-      model: MODEL,
-      reasoning: { effort: "low" },
+      model: env.OPENAI_MODEL ?? MODEL,
+      reasoning: { effort: DEFAULT_REASONING_EFFORT },
       instructions: SYNTHESIZE_SYSTEM,
       input: JSON.stringify({ graph: classicGraphFromSession(session), transcript: session.transcript }),
     });
-    return { synthesis: response.output_text.trim(), revision: session.revision };
+    const text = response.output_text?.trim();
+    if (!text) throw new SessionOperationError("The synthesis was empty. Please try again.", { code: "empty_synthesis", status: 502 });
+    const saved = await store.transact(session.id, (current) => ({
+      ...current,
+      synthesis: { text, revision: session.revision, created_at: new Date().toISOString() },
+    }));
+    const snapshot = await publishMapControllerSnapshot(session.id, saved);
+    return { synthesis: text, revision: session.revision, snapshot };
   }));
 
   // Classic-mode endpoints remain unchanged and continue to operate on the
@@ -672,7 +708,7 @@ export async function createThoughtformServer({
     if (!graph?.thoughts?.length || !prompt) throw new Error("propose needs { graph, prompt }");
     if (!hasKey) {
       const parent = graph.thoughts.find((thought) => thought.id === selectedId) ?? graph.thoughts[0];
-      return { proposals: [{ parent_id: parent.id, text: `Mock proposal for “${prompt.slice(0, 32)}”`, reason: "offline mock — set OPENAI_API_KEY" }] };
+      return { proposals: [{ parent_id: parent.id, text: `Mock suggestion for “${prompt.slice(0, 32)}”`, reason: "offline mock — set OPENAI_API_KEY" }] };
     }
     const { proposals } = await structuredCall({ system: PROPOSE_SYSTEM, payload: { graph, selected_id: selectedId, request: prompt }, schemaName: "proposals", schema: PROPOSAL_SCHEMA });
     const validIds = new Set(graph.thoughts.map((thought) => thought.id));
@@ -698,7 +734,7 @@ export async function createThoughtformServer({
     const { graph } = req.body ?? {};
     if (!graph?.thoughts?.length) throw new Error("synthesize needs { graph }");
     if (!hasKey) return { synthesis: `Offline mock synthesis of ${graph.thoughts.length} thoughts — set OPENAI_API_KEY to enable ${MODEL}.` };
-    const response = await openaiClient.responses.create({ model: MODEL, reasoning: { effort: "low" }, instructions: SYNTHESIZE_SYSTEM, input: JSON.stringify({ graph }) });
+    const response = await openaiClient.responses.create({ model: MODEL, reasoning: { effort: DEFAULT_REASONING_EFFORT }, instructions: SYNTHESIZE_SYSTEM, input: JSON.stringify({ graph }) });
     return { synthesis: response.output_text.trim() };
   }));
 
@@ -708,6 +744,7 @@ export async function createThoughtformServer({
   if (curator) app.locals.curator = curator;
   if (curatorScheduler) app.locals.curatorScheduler = curatorScheduler;
   app.locals.dispose = () => {
+    liveService?.dispose?.();
     mapControllerScheduler?.dispose();
     curatorScheduler?.dispose();
     eventClients.forEach((listeners) => listeners.forEach((response) => {
@@ -723,7 +760,7 @@ const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === proce
 if (isEntrypoint) {
   const app = await createThoughtformServer();
   const server = app.listen(PORT, "127.0.0.1", () => {
-    console.log(`thoughtform server on http://localhost:${PORT} (model: ${MODEL}${hasKey ? `, realtime: ${REALTIME_MODEL}` : ", MOCK MODE — no OPENAI_API_KEY"})`);
+    console.log(`thoughtform server on http://localhost:${PORT} (model: ${MODEL}${hasKey ? `, live: ${process.env.OPENAI_LIVE_MODEL ?? "gpt-live-1"}, backend: ${process.env.OPENAI_LIVE_BACKEND_MODEL ?? DEFAULT_REASONING_MODEL} / ${DEFAULT_REASONING_EFFORT}` : ", MOCK MODE — no OPENAI_API_KEY"})`);
   });
   const shutdown = () => {
     app.locals.dispose?.();

@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => {
     server: {
       host: "127.0.0.1",
       allowedHosts: ["terminal.local"],
-      proxy: {
+      proxy: mode === "example" ? undefined : {
         "/api": {
           target: `http://127.0.0.1:${apiPort}`,
           changeOrigin: true,
