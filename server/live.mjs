@@ -161,12 +161,13 @@ function replaceSelectedReferences(value, selectedIds) {
 }
 
 export function registerLiveRoutes(app, {
-  store, openaiClient, env = process.env, fetchImpl = globalThis.fetch,
+  store, openaiClient, apiKey = null, liveModel = DEFAULT_LIVE_MODEL, backendModel = DEFAULT_LIVE_BACKEND_MODEL,
+  fetchImpl = globalThis.fetch,
   jsonRoute, publish = () => {}, snapshotFor = (session) => session,
   performOperation, getUiContext = () => ({}), onTranscriptCommitted = () => {}, updatePreferences,
   sessionSignal = null, captureOptions = {},
 }) {
-  const model = env.OPENAI_LIVE_BACKEND_MODEL || DEFAULT_LIVE_BACKEND_MODEL;
+  const model = backendModel;
   const capture = createLiveCapture({ store, openaiClient, model, publish, onTranscriptCommitted, sessionSignal, ...captureOptions });
   const jobs = new Map();
   const chatJobs = new Map();
@@ -279,8 +280,8 @@ export function registerLiveRoutes(app, {
     res.once?.("close", () => { if (!res.writableEnded) controller.abort(); });
     const answer = await forwardLiveSdp({
       sdp: req.body?.sdp,
-      sessionConfig: buildLiveSessionConfig(session, { model: env.OPENAI_LIVE_MODEL || DEFAULT_LIVE_MODEL }),
-      apiKey: env.OPENAI_API_KEY, fetchImpl, signal: controller.signal,
+      sessionConfig: buildLiveSessionConfig(session, { model: liveModel }),
+      apiKey, fetchImpl, signal: controller.signal,
       safetyIdentifier: createHash("sha256").update(`thoughtform:${session.id}`).digest("hex"),
     });
     const updated = await store.transact(session.id, (current) => {

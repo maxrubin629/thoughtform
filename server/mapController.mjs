@@ -182,6 +182,7 @@ function transientCode(error) {
 export function createMapController({
   env = process.env,
   client,
+  model = env.OPENAI_MAP_CONTROLLER_MODEL ?? DEFAULT_MAP_CONTROLLER_MODEL,
   now = () => new Date(),
   idFactory = (kind) => `${kind}-${randomUUID()}`,
   loadSnapshot,
@@ -191,7 +192,6 @@ export function createMapController({
   if (typeof loadSnapshot !== "function" || typeof transact !== "function") {
     throw new TypeError("Map controller requires loadSnapshot and transact callbacks.");
   }
-  const model = env.OPENAI_MAP_CONTROLLER_MODEL ?? DEFAULT_MAP_CONTROLLER_MODEL;
   let openai = client;
 
   const api = async () => {

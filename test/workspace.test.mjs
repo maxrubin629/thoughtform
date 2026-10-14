@@ -118,6 +118,21 @@ test("deleting a session aborts its in-flight Partner request", async (t) => {
   assert.equal((await chat).status, 410);
 });
 
+test("server configuration comes only from the injected environment", async (t) => {
+  const health = async (env) => {
+    const { base } = await fixture(t, { env: { THOUGHTFORM_MAP_CONTROLLER_ENABLED: "false", ...env } });
+    return (await fetch(`${base}/health`)).json();
+  };
+  const unconfigured = await health({});
+  assert.equal(unconfigured.live.configured, false);
+  assert.equal(unconfigured.live.voice_configured, false);
+  const configured = await health({ OPENAI_API_KEY: "test-key", OPENAI_LIVE_MODEL: "custom-live", OPENAI_LIVE_BACKEND_MODEL: " " });
+  assert.equal(configured.live.configured, true);
+  assert.equal(configured.live.voice_configured, true);
+  assert.equal(configured.live.model, "custom-live");
+  assert.equal(configured.live.backend_model, "gpt-6-luna");
+});
+
 test("public session snapshots omit raw Live storage while export preserves it", async (t) => {
   const { request, store, base } = await fixture(t);
   const session = await store.create();

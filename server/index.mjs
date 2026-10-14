@@ -9,21 +9,12 @@ import {
   SessionOperationError,
   applyOperation,
 } from "./sessionOperations.mjs";
-import {
-  DEFAULT_MAP_CONTROLLER_MODEL,
-  createMapController,
-  createMapControllerScheduler,
-} from "./mapController.mjs";
-import { createCurator, createCuratorScheduler, isCuratorEnabled } from "./curator.mjs";
+import { createMapController, createMapControllerScheduler } from "./mapController.mjs";
+import { createCurator, createCuratorScheduler } from "./curator.mjs";
+import { resolveServerConfig } from "./config.mjs";
 import { registerLiveRoutes } from "./live.mjs";
 import { createSessionJobs, isCancellation } from "./sessionJobs.mjs";
 import { sessionMarkdown } from "./sessionExport.mjs";
-import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
-
-const PORT = Number(process.env.PORT ?? 8787);
-const MODEL = process.env.OPENAI_MODEL ?? DEFAULT_REASONING_MODEL;
-const hasKey = Boolean(process.env.OPENAI_API_KEY);
-const client = hasKey ? new OpenAI() : null;
 
 function synthesisGraph(session) {
   return {
@@ -123,10 +114,10 @@ export function createSseEventWriter() {
 }
 
 export async function createThoughtformServer({
-  store = createSessionStore(process.env.THOUGHTFORM_DATA_DIR ? { directory: process.env.THOUGHTFORM_DATA_DIR } : {}),
-  openaiClient = client,
-  fetchImpl = globalThis.fetch,
   env = process.env,
+  store: suppliedStore,
+  openaiClient: suppliedOpenaiClient,
+  fetchImpl = globalThis.fetch,
   controllerEventEpoch = Date.now(),
   mapController: suppliedMapController,
   mapControllerScheduler: suppliedMapControllerScheduler,
@@ -137,6 +128,9 @@ export async function createThoughtformServer({
   curatorFactory = createCurator,
   curatorSchedulerFactory = createCuratorScheduler,
 } = {}) {
+  const config = resolveServerConfig(env);
+  const store = suppliedStore ?? createSessionStore(config.dataDirectory ? { directory: config.dataDirectory } : {});
+  const openaiClient = suppliedOpenaiClient ?? (config.apiKey ? new OpenAI({ apiKey: config.apiKey }) : null);
   await store.init();
   const app = express();
   const uiContexts = new Map();
@@ -145,9 +139,8 @@ export async function createThoughtformServer({
   const sseWriter = createSseEventWriter();
   const sessionJobs = createSessionJobs();
   const synthesisRuns = new Map();
-  const controllerConfigured = Boolean(openaiClient ?? env.OPENAI_API_KEY);
-  const controllerRequested = env.THOUGHTFORM_MAP_CONTROLLER_ENABLED !== "false";
-  const controllerRuntimeEnabled = controllerRequested && (
+  const controllerConfigured = Boolean(openaiClient);
+  const controllerRuntimeEnabled = config.mapControllerEnabled && (
     controllerConfigured || suppliedMapController || suppliedMapControllerScheduler
   );
   let mapController = null;
@@ -268,6 +261,7 @@ export async function createThoughtformServer({
     mapController = suppliedMapController ?? mapControllerFactory({
       env,
       client: openaiClient ?? undefined,
+      model: config.models.mapController,
       loadSnapshot: (sessionId) => store.get(sessionId),
       transact: (sessionId, transform) => store.transact(sessionId, transform),
     });
@@ -285,13 +279,14 @@ export async function createThoughtformServer({
 
   const curatorRuntimeEnabled = Boolean(
     mapControllerScheduler
-    && isCuratorEnabled(env)
+    && config.curatorEnabled
     && (controllerConfigured || suppliedCurator || suppliedCuratorScheduler),
   );
   if (curatorRuntimeEnabled) {
     curator = suppliedCurator ?? curatorFactory({
       env,
       client: openaiClient ?? undefined,
+      model: config.models.curator,
     });
     curatorScheduler = suppliedCuratorScheduler ?? curatorSchedulerFactory({
       curator,
@@ -362,7 +357,8 @@ export async function createThoughtformServer({
   };
 
   const liveService = registerLiveRoutes(app, {
-    store, openaiClient, env, fetchImpl, jsonRoute, publish, snapshotFor, performOperation,
+    store, openaiClient, fetchImpl, jsonRoute,
+    apiKey: config.apiKey, liveModel: config.models.live, backendModel: config.models.liveBackend, publish, snapshotFor, performOperation,
     updatePreferences, sessionSignal: sessionJobs.signal,
     getUiContext: (sessionId) => uiContexts.get(sessionId) ?? {},
     mapControllerScheduler,
@@ -383,12 +379,18 @@ export async function createThoughtformServer({
   app.get("/api/health", (req, res) => {
     res.json({
       ok: true,
-      model: env.OPENAI_MODEL ?? MODEL,
-      live: { configured: controllerConfigured, model: env.OPENAI_LIVE_MODEL ?? "gpt-live-1", backend_model: env.OPENAI_LIVE_BACKEND_MODEL ?? DEFAULT_REASONING_MODEL, reasoning_effort: DEFAULT_REASONING_EFFORT },
+      model: config.models.synthesis,
+      live: {
+        configured: controllerConfigured,
+        voice_configured: Boolean(config.apiKey),
+        model: config.models.live,
+        backend_model: config.models.liveBackend,
+        reasoning_effort: config.reasoningEffort,
+      },
       map_controller: {
         configured: controllerConfigured,
         enabled: Boolean(mapControllerScheduler),
-        model: mapController?.model ?? env.OPENAI_MAP_CONTROLLER_MODEL ?? DEFAULT_MAP_CONTROLLER_MODEL,
+        model: mapController?.model ?? config.models.mapController,
       },
       ...(curator ? {
         curator: {
@@ -547,8 +549,8 @@ export async function createThoughtformServer({
 
   const synthesize = async (session) => {
     const response = await openaiClient.responses.create({
-      model: env.OPENAI_MODEL ?? MODEL,
-      reasoning: { effort: DEFAULT_REASONING_EFFORT },
+      model: config.models.synthesis,
+      reasoning: { effort: config.reasoningEffort },
       instructions: SYNTHESIZE_SYSTEM,
       input: JSON.stringify({ graph: synthesisGraph(session), transcript: session.transcript }),
     }, { signal: sessionJobs.signal(session.id) });
@@ -586,9 +588,13 @@ export async function createThoughtformServer({
 
 const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isEntrypoint) {
-  const app = await createThoughtformServer();
-  const server = app.listen(PORT, "127.0.0.1", () => {
-    console.log(`thoughtform server on http://localhost:${PORT} (model: ${MODEL}${hasKey ? `, live: ${process.env.OPENAI_LIVE_MODEL ?? "gpt-live-1"}, backend: ${process.env.OPENAI_LIVE_BACKEND_MODEL ?? DEFAULT_REASONING_MODEL} / ${DEFAULT_REASONING_EFFORT}` : ", MOCK MODE — no OPENAI_API_KEY"})`);
+  const config = resolveServerConfig(process.env);
+  const app = await createThoughtformServer({ env: process.env });
+  const server = app.listen(config.port, "127.0.0.1", () => {
+    const { models, reasoningEffort, apiKey } = config;
+    console.log(`thoughtform server on http://localhost:${config.port} (${apiKey
+      ? `live: ${models.live}, backend: ${models.liveBackend} / ${reasoningEffort}`
+      : "no OPENAI_API_KEY: editing only, model features unavailable"})`);
   });
   const shutdown = () => {
     app.locals.dispose?.();

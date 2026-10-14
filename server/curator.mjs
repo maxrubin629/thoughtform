@@ -176,12 +176,12 @@ function normalizeProposal(result, snapshot, { now, idFactory }) {
 export function createCurator({
   env = process.env,
   client,
+  model = env.OPENAI_CURATOR_MODEL ?? DEFAULT_REASONING_MODEL,
   now = () => new Date(),
   idFactory = (prefix) => `${prefix}_${randomUUID()}`,
   minimumUserTurns = 2,
 } = {}) {
   const enabled = isCuratorEnabled(env);
-  const model = env.OPENAI_CURATOR_MODEL ?? DEFAULT_REASONING_MODEL;
   let openai = client;
 
   return {
