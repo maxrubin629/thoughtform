@@ -97,16 +97,17 @@ export function validateCompletionGroups(fragments, groups) {
   });
 }
 
-export function createLiveCapture({ store, openaiClient, model = DEFAULT_LIVE_BACKEND_MODEL, publish = () => {}, onTranscriptCommitted = () => {}, classify, debounceMs = 350, retryDelays = [1000, 4000, 15000], setTimer = setTimeout, clearTimer = clearTimeout }) {
+export function createLiveCapture({ store, openaiClient, model = DEFAULT_LIVE_BACKEND_MODEL, publish = () => {}, onTranscriptCommitted = () => {}, sessionSignal = null, classify, debounceMs = 350, retryDelays = [1000, 4000, 15000], setTimer = setTimeout, clearTimer = clearTimeout }) {
   const timers = new Map();
   const runs = new Map();
   const requested = new Set();
   const activity = new Map();
   const retryAttempts = new Map();
   const abort = new AbortController();
+  const signalFor = (id) => (sessionSignal ? AbortSignal.any([abort.signal, sessionSignal(id)]) : abort.signal);
   let disposed = false;
 
-  const classifyFragments = classify ?? (async ({ fragments, transcript, activity, ended }) => {
+  const classifyFragments = classify ?? (async ({ fragments, transcript, activity, ended, signal }) => {
     if (!openaiClient?.responses) throw new LiveError("Partner is not configured.", "live_backend_unavailable", 503);
     const response = await openaiClient.responses.create({
       model,
@@ -114,7 +115,7 @@ export function createLiveCapture({ store, openaiClient, model = DEFAULT_LIVE_BA
       instructions: COMPLETENESS_INSTRUCTIONS,
       input: JSON.stringify({ fragments, previous_utterances: transcript.slice(-8), activity, ended }),
       text: { format: { type: "json_schema", name: "completed_spoken_thoughts", strict: true, schema: completionSchema } },
-    }, { signal: abort.signal });
+    }, { signal });
     try { return JSON.parse(response.output_text).groups; }
     catch { throw new LiveError("Partner could not read the completed thought result.", "invalid_completion", 502); }
   });
@@ -126,7 +127,7 @@ export function createLiveCapture({ store, openaiClient, model = DEFAULT_LIVE_BA
     if (!fragments.length || disposed) return { committed_utterance_ids: [], stale: false };
     if (activity.get(id)?.active === true && fragments.some((fragment) => fragment.speaker === "you")) return { committed_utterance_ids: [], stale: false };
     const fingerprint = allPending.map(({ id: fragmentId }) => fragmentId).join("|");
-    const groups = validateCompletionGroups(fragments, await classifyFragments({ fragments, transcript: initial.transcript, ...hints, activity: activity.get(id) }));
+    const groups = validateCompletionGroups(fragments, await classifyFragments({ fragments, transcript: initial.transcript, ...hints, activity: activity.get(id), signal: signalFor(id) }));
     if (disposed) return { committed_utterance_ids: [], stale: true };
     const outcome = await store.transact(id, (session) => {
       ensureLiveState(session);
@@ -261,6 +262,13 @@ export function createLiveCapture({ store, openaiClient, model = DEFAULT_LIVE_BA
     ingest,
     schedule,
     resetActivity(id) { activity.delete(id); },
+    cancel(id) {
+      clearTimer(timers.get(id));
+      timers.delete(id);
+      requested.delete(id);
+      activity.delete(id);
+      retryAttempts.delete(id);
+    },
     async flush(id, hints = {}) {
       const currentSession = await store.get(id);
       const activeId = currentSession.live_capture?.active_session_id;

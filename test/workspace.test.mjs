@@ -75,6 +75,49 @@ test("synthesis is saved against its source revision even if the map changes whi
   assert.match(sessionMarkdown(saved), /map has changed since/);
 });
 
+test("an older synthesis never replaces a newer one, and repeated requests share one call", async (t) => {
+  const pending = [];
+  const openaiClient = { responses: { create: (body) => new Promise((resolve) => pending.push({ body, resolve })) } };
+  const { request, store } = await fixture(t, { openaiClient });
+  const session = await store.create();
+  const first = await store.transact(session.id, (s) => applyOperation(s, { type: "create_bubble", actor: "you", text: "A thought", expected_revision: s.revision }));
+  const older = request(`/sessions/${session.id}/synthesize`, { expected_revision: first.revision });
+  const duplicate = request(`/sessions/${session.id}/synthesize`, { expected_revision: first.revision });
+  while (pending.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  const later = await store.transact(session.id, (s) => applyOperation(s, { type: "edit_bubble", actor: "you", node_id: s.nodes[0].id, text: "A refined thought", expected_revision: s.revision }));
+  const newer = request(`/sessions/${session.id}/synthesize`, { expected_revision: later.revision });
+  while (pending.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(pending.length, 2, "same-revision requests share one model call");
+  pending[1].resolve({ output_text: "Newer synthesis." });
+  assert.equal((await newer).data.synthesis, "Newer synthesis.");
+  pending[0].resolve({ output_text: "Older synthesis." });
+  const [olderResult, duplicateResult] = await Promise.all([older, duplicate]);
+  assert.equal(olderResult.data.synthesis, "Newer synthesis.");
+  assert.equal(olderResult.data.revision, later.revision);
+  assert.equal(duplicateResult.data.synthesis, "Newer synthesis.");
+  const saved = await store.get(session.id);
+  assert.deepEqual([saved.synthesis.text, saved.synthesis.revision], ["Newer synthesis.", later.revision]);
+});
+
+test("deleting a session aborts its in-flight Partner request", async (t) => {
+  let signal;
+  let started;
+  const began = new Promise((resolve) => { started = resolve; });
+  const openaiClient = { responses: { create: (_body, options) => {
+    signal = options?.signal;
+    started();
+    return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  } } };
+  const { request, store } = await fixture(t, { openaiClient });
+  const session = await store.create();
+  const chat = request(`/sessions/${session.id}/chat`, { text: "What am I missing here?", request_id: "chat-delete-1" });
+  await began;
+  assert.equal(signal.aborted, false);
+  assert.equal((await request(`/sessions/${session.id}`, undefined, "DELETE")).status, 200);
+  assert.equal(signal.aborted, true);
+  assert.equal((await chat).status, 410);
+});
+
 test("public session snapshots omit raw Live storage while export preserves it", async (t) => {
   const { request, store, base } = await fixture(t);
   const session = await store.create();

@@ -186,7 +186,7 @@ export function createCurator({
     enabled,
     model,
     shouldRun: (snapshot) => enabled && shouldRunCurator(snapshot, { minimumUserTurns }),
-    async propose(snapshot) {
+    async propose(snapshot, { signal } = {}) {
       if (!enabled || !shouldRunCurator(snapshot, { minimumUserTurns })) return null;
       if (!openai) {
         if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required when the curator is enabled");
@@ -206,7 +206,7 @@ export function createCurator({
             schema: CURATOR_PROPOSAL_SCHEMA,
           },
         },
-      });
+      }, { signal });
 
       return normalizeProposal(parseOutput(response), snapshot, { now, idFactory });
     },
@@ -235,6 +235,7 @@ export function createCuratorScheduler({
   const active = new Set();
   const queued = new Set();
   const generations = new Map();
+  const runControllers = new Map();
   let disposed = false;
 
   const userTurnCount = (snapshot) => (snapshot.transcript ?? [])
@@ -254,6 +255,8 @@ export function createCuratorScheduler({
     if (timer !== undefined) clearTimer(timer);
     timers.delete(sessionId);
     queued.delete(sessionId);
+    runControllers.get(sessionId)?.abort(new Error("Suggestion run cancelled."));
+    runControllers.delete(sessionId);
   };
 
   const schedule = (sessionId) => {
@@ -272,6 +275,7 @@ export function createCuratorScheduler({
         return;
       }
       active.add(sessionId);
+      const runController = new AbortController();
       try {
         const snapshot = await loadSnapshot(sessionId);
         if (disposed || generation !== generations.get(sessionId)) return;
@@ -280,7 +284,8 @@ export function createCuratorScheduler({
         const turns = userTurnCount(snapshot);
         const previousTurns = lastRunUserTurnCount.get(sessionId);
         if (previousTurns !== undefined && turns - previousTurns < minimumUserTurnsBetweenRuns) return;
-        const proposal = await curator.propose(snapshot);
+        runControllers.set(sessionId, runController);
+        const proposal = await curator.propose(snapshot, { signal: runController.signal });
         if (disposed || generation !== generations.get(sessionId)) return;
         lastRunFingerprint.set(sessionId, fingerprint);
         lastRunUserTurnCount.set(sessionId, turns);
@@ -297,8 +302,9 @@ export function createCuratorScheduler({
           await onProposal(sessionId, proposal);
         }
       } catch (error) {
-        onError(error, sessionId);
+        if (!disposed && generation === generations.get(sessionId)) onError(error, sessionId);
       } finally {
+        if (runControllers.get(sessionId) === runController) runControllers.delete(sessionId);
         active.delete(sessionId);
         if (queued.delete(sessionId)) schedule(sessionId);
       }

@@ -16,6 +16,7 @@ import {
 } from "./mapController.mjs";
 import { createCurator, createCuratorScheduler, isCuratorEnabled } from "./curator.mjs";
 import { registerLiveRoutes } from "./live.mjs";
+import { createSessionJobs, isCancellation } from "./sessionJobs.mjs";
 import { sessionMarkdown } from "./sessionExport.mjs";
 import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
 
@@ -142,6 +143,8 @@ export async function createThoughtformServer({
   const eventClients = new Map();
   const controllerEventSequences = new Map();
   const sseWriter = createSseEventWriter();
+  const sessionJobs = createSessionJobs();
+  const synthesisRuns = new Map();
   const controllerConfigured = Boolean(openaiClient ?? env.OPENAI_API_KEY);
   const controllerRequested = env.THOUGHTFORM_MAP_CONTROLLER_ENABLED !== "false";
   const controllerRuntimeEnabled = controllerRequested && (
@@ -328,7 +331,7 @@ export async function createThoughtformServer({
       const value = await handler(req, res);
       if (!res.headersSent) res.json(value);
     } catch (error) {
-      const status = error?.status ?? (error instanceof RevisionConflictError ? 409 : 500);
+      const status = isCancellation(error) ? 410 : error?.status ?? (error instanceof RevisionConflictError ? 409 : 500);
       let snapshot = error?.snapshot ?? error?.details?.snapshot ?? null;
       if (!snapshot && req.params?.id) {
         snapshot = await store.get(req.params.id).catch(() => null);
@@ -360,7 +363,7 @@ export async function createThoughtformServer({
 
   const liveService = registerLiveRoutes(app, {
     store, openaiClient, env, fetchImpl, jsonRoute, publish, snapshotFor, performOperation,
-    updatePreferences,
+    updatePreferences, sessionSignal: sessionJobs.signal,
     getUiContext: (sessionId) => uiContexts.get(sessionId) ?? {},
     mapControllerScheduler,
     onTranscriptCommitted: async (sessionId, utterance) => {
@@ -415,6 +418,8 @@ export async function createThoughtformServer({
   )));
 
   app.delete("/api/sessions/:id", jsonRoute(async (req) => {
+    sessionJobs.cancel(req.params.id);
+    liveService.cancel(req.params.id);
     mapControllerScheduler?.cancel(req.params.id);
     curatorScheduler?.cancel(req.params.id);
     uiContexts.delete(req.params.id);
@@ -531,21 +536,34 @@ export async function createThoughtformServer({
       throw new SessionOperationError("Add at least one bubble before synthesizing.", { code: "empty_map" });
     }
     if (!openaiClient) throw new SessionOperationError("Connect OpenAI to write a synthesis.", { code: "model_unavailable", status: 503 });
+    // Repeated requests for the same map revision share one model call.
+    const runKey = `${session.id}:${session.revision}`;
+    if (!synthesisRuns.has(runKey)) {
+      const run = synthesize(session).finally(() => synthesisRuns.delete(runKey));
+      synthesisRuns.set(runKey, run);
+    }
+    return synthesisRuns.get(runKey);
+  }));
+
+  const synthesize = async (session) => {
     const response = await openaiClient.responses.create({
       model: env.OPENAI_MODEL ?? MODEL,
       reasoning: { effort: DEFAULT_REASONING_EFFORT },
       instructions: SYNTHESIZE_SYSTEM,
       input: JSON.stringify({ graph: synthesisGraph(session), transcript: session.transcript }),
-    });
+    }, { signal: sessionJobs.signal(session.id) });
     const text = response.output_text?.trim();
     if (!text) throw new SessionOperationError("The synthesis was empty. Please try again.", { code: "empty_synthesis", status: 502 });
-    const saved = await store.transact(session.id, (current) => ({
-      ...current,
-      synthesis: { text, revision: session.revision, created_at: new Date().toISOString() },
-    }));
+    // A synthesis of a newer map revision may finish first; never replace it
+    // with this older result.
+    const saved = await store.transact(session.id, (current) => (
+      current.synthesis?.revision > session.revision
+        ? current
+        : { ...current, synthesis: { text, revision: session.revision, created_at: new Date().toISOString() } }
+    ));
     const snapshot = await publishMapControllerSnapshot(session.id, saved);
-    return { synthesis: text, revision: session.revision, snapshot };
-  }));
+    return { synthesis: saved.synthesis.text, revision: saved.synthesis.revision, snapshot };
+  };
 
   app.locals.sessionStore = store;
   app.locals.mapController = mapController;
@@ -553,6 +571,7 @@ export async function createThoughtformServer({
   if (curator) app.locals.curator = curator;
   if (curatorScheduler) app.locals.curatorScheduler = curatorScheduler;
   app.locals.dispose = () => {
+    sessionJobs.dispose();
     liveService?.dispose?.();
     mapControllerScheduler?.dispose();
     curatorScheduler?.dispose();
