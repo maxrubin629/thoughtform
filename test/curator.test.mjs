@@ -369,3 +369,16 @@ test("curator leaves parked thoughts alone", async () => {
   value.nodes[0].parked = true;
   assert.equal(await curator.propose(value), null);
 });
+
+test("curator drops invented evidence and discards a suggestion left with none", async () => {
+  const respond = (evidence) => createCurator({
+    env: {},
+    client: { responses: { create: async () => ({ output_text: JSON.stringify({
+      rationale: "Connect these ideas", evidence, operations: [{ type: "connect_bubbles", from: "n1", to: "n2" }],
+    }) }) } },
+  });
+  const invented = { utterance_id: "u1", quote: "words nobody said" };
+  assert.equal(await respond([invented, { utterance_id: "missing", quote: "Voice" }]).propose(snapshot()), null);
+  const mixed = await respond([invented, { utterance_id: "u1", quote: "Voice should make the map feel immediate." }]).propose(snapshot());
+  assert.deepEqual(mixed.evidence, [{ utterance_id: "u1", start: 0, end: 41, quote: "Voice should make the map feel immediate." }]);
+});

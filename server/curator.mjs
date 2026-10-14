@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
 import { PROPOSAL_OPERATION_SCHEMA } from "./mapTools.mjs";
+import { resolveQuoteSpan } from "./sessionOperations.mjs";
 
 export const CURATOR_SYSTEM = `You are Thoughtform's silent creative curator. You inspect the current canonical mind map and a bounded window of recent conversation, then decide whether one genuinely useful new direction is worth the user's attention.
 
@@ -132,24 +133,23 @@ function normalizeOperation(operation, idFactory) {
   return normalized;
 }
 
-function resolveEvidence(evidence, transcript) {
-  const utterances = new Map((transcript ?? []).map((utterance) => [utterance.id, utterance]));
+// Evidence uses the canonical resolver, so the curator cannot cite a quote
+// the reducer would reject. Invalid entries are dropped; a suggestion left
+// with no valid evidence is discarded rather than shown as an unsupported card.
+function resolveEvidence(evidence, snapshot) {
   const seen = new Set();
   return (evidence ?? []).flatMap((item) => {
-    const utterance = utterances.get(item?.utterance_id);
-    const quote = typeof item?.quote === "string" ? item.quote : "";
-    if (!utterance || !quote) return [];
-    const start = utterance.text.indexOf(quote);
-    if (start < 0 || utterance.text.indexOf(quote, start + 1) >= 0) return [];
-    const key = `${utterance.id}:${start}:${quote.length}`;
+    if (typeof item?.utterance_id !== "string" || typeof item?.quote !== "string") return [];
+    let span;
+    try {
+      span = resolveQuoteSpan(snapshot, { utterance_id: item.utterance_id, quote: item.quote });
+    } catch {
+      return [];
+    }
+    const key = `${span.utterance_id}:${span.start}:${span.end}`;
     if (seen.has(key)) return [];
     seen.add(key);
-    return [{
-      utterance_id: utterance.id,
-      start,
-      end: start + quote.length,
-      quote,
-    }];
+    return [span];
   });
 }
 
@@ -159,13 +159,15 @@ function normalizeProposal(result, snapshot, { now, idFactory }) {
   if (result.operations.some((operation) => (
     [operation.node_id, operation.from, operation.to, operation.parent].some((id) => parked.has(id))
   ))) return null;
+  const evidence = resolveEvidence(result.evidence, snapshot);
+  if (!evidence.length) return null;
   return {
     id: idFactory("proposal"),
     status: "pending",
     base_revision: snapshot.revision,
     actor: "curator",
     rationale: String(result.rationale ?? "A possible map refinement").trim(),
-    evidence: resolveEvidence(result.evidence, snapshot.transcript),
+    evidence,
     operations: result.operations.slice(0, 3).map((operation) => normalizeOperation(operation, idFactory)),
     created_at: now().toISOString(),
   };
