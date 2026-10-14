@@ -6,3 +6,4 @@ dist-example/
 qa/
 .env
 data/sessions/
+sites/fluid-bubble-lab/

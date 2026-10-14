@@ -101,7 +101,7 @@ Codex accelerated our work on:
 - Turning the initial product conversation and visual references into interactive Paper and Nocturne prototypes.
 - Building the organic lobe renderer, fused connections, local physics, causal growth and rupture motion, and the canvas gesture system.
 - Moving the session model from browser-only prototype state into a server-owned, revisioned local session.
-- Implementing the Realtime WebRTC bridge, the GPT-5.6 controller, structured operations, SSE updates, provenance validation, suggestion rebasing, and automated tests.
+- Implementing the live voice bridge, the map controller, structured operations, SSE updates, provenance validation, suggestion rebasing, and automated tests.
 - Running repeated browser QA and adversarial review passes that caught stale snapshots, conflicting revisions, gesture collisions, and cross-boundary Realtime races.
 
 We kept the key product and design decisions explicit. Conversation stays in the foreground, and automatic mapping uses complete thoughts with exact provenance. Clear changes can be direct and reversible; uncertain or destructive interpretations stay reviewable. Semantic state belongs to the server while physical motion belongs to the browser. The final artifact is a thinking map plus synthesis.
@@ -205,7 +205,7 @@ Typed-message retries retain their submission ID if the message was saved but Pa
 
 ### Keeping conversation and mapping independent
 
-The fastest voice response and the best map update do not have the same timing. Making one model responsible for both creates awkward speech, tool preambles, and pressure to update the map from partial thoughts. The solution was to split the foreground Realtime partner from the silent GPT-5.6 controller and let them meet at the canonical transcript.
+The fastest voice response and the best map update do not have the same timing. Making one model responsible for both creates awkward speech, tool preambles, and pressure to update the map from partial thoughts. The solution was to split the foreground GPT-Live partner from the silent GPT-6 Luna controller and let them meet at the canonical transcript.
 
 ### Preserving one source of truth without making the canvas feel rigid
 
