@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
-import { PROPOSAL_OPERATION_SCHEMA } from "./realtime.mjs";
+import { PROPOSAL_OPERATION_SCHEMA } from "./mapTools.mjs";
 
 export const CURATOR_SYSTEM = `You are Thoughtform's silent creative curator. You inspect the current canonical mind map and a bounded window of recent conversation, then decide whether one genuinely useful new direction is worth the user's attention.
 

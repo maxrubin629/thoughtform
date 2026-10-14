@@ -145,23 +145,6 @@ export async function applySessionOperation(
   throw new Error("Session operation retry exhausted");
 }
 
-export function executeSessionToolCall(
-  sessionId,
-  { name, arguments: toolArguments = {}, callId, expectedRevision },
-  { signal } = {},
-) {
-  return request(sessionPath(sessionId, "/tool-calls"), {
-    method: "POST",
-    body: {
-      name,
-      arguments: toolArguments,
-      call_id: callId,
-      ...(expectedRevision === undefined ? {} : { expected_revision: expectedRevision }),
-    },
-    signal,
-  });
-}
-
 export function synthesizeSession(sessionId, { expectedRevision, signal } = {}) {
   return request(sessionPath(sessionId, "/synthesize"), {
     method: "POST",
@@ -200,57 +183,6 @@ export function shouldApplySessionSnapshot(current, incoming) {
     ? incoming.controller_event_sequence
     : 0;
   return incomingControllerSequence >= currentControllerSequence;
-}
-
-export async function negotiateRealtimeSession(
-  sessionId,
-  sdp,
-  { voiceMode = "vad", signal } = {},
-) {
-  if (typeof sdp !== "string" || !sdp.trim()) {
-    throw new TypeError("A WebRTC offer SDP is required");
-  }
-
-  const query = new URLSearchParams({ voice_mode: voiceMode });
-  let response;
-  try {
-    response = await fetch(`${sessionPath(sessionId, "/realtime")}?${query}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/sdp",
-        Accept: "application/sdp, application/json",
-      },
-      body: sdp,
-      signal,
-    });
-  } catch (cause) {
-    if (cause?.name === "AbortError") throw cause;
-    throw new SessionApiError("Realtime voice could not reach the session server", {
-      code: "realtime_network_error",
-      cause,
-    });
-  }
-
-  const answer = await parseResponseBody(response);
-  if (!response.ok) {
-    const message = typeof answer === "string"
-      ? answer
-      : answer?.error?.message ?? answer?.error ?? answer?.message ?? `Realtime setup failed (${response.status})`;
-    throw new SessionApiError(message, {
-      status: response.status,
-      code: answer?.code ?? answer?.error?.code ?? "realtime_setup_failed",
-      details: answer,
-    });
-  }
-
-  const answerSdp = typeof answer === "string" ? answer : answer?.sdp;
-  if (!answerSdp) {
-    throw new SessionApiError("Realtime setup returned no answer SDP", {
-      code: "invalid_realtime_answer",
-      details: answer,
-    });
-  }
-  return answerSdp;
 }
 
 function decodeEvent(event) {
@@ -347,10 +279,3 @@ export function subscribeSessionEvents(
     source = null;
   };
 }
-
-// Concise aliases for callers that already operate in a session namespace.
-export const patchSessionUiContext = updateSessionUiContext;
-export const performSessionOperation = applySessionOperation;
-export const postSessionToolCall = executeSessionToolCall;
-export const requestSessionSynthesis = synthesizeSession;
-export const retryMapController = retrySessionMapController;

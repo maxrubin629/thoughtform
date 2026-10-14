@@ -3,7 +3,6 @@ import { afterEach, test } from "node:test";
 
 import {
   applySessionOperation,
-  negotiateRealtimeSession,
   retrySessionMapController,
   shouldApplySessionSnapshot,
   subscribeSessionEvents,
@@ -93,26 +92,6 @@ test("map controller retry posts to the session retry endpoint and returns its s
   assert.equal(request.options.method, "POST");
   assert.equal(request.options.body, "{}");
   assert.equal(result.snapshot.map_controller.status, "waiting");
-});
-
-test("Realtime negotiation sends raw SDP without exposing a credential", async () => {
-  let request;
-  globalThis.fetch = async (url, options) => {
-    request = { url, options };
-    return new Response("answer-sdp", {
-      headers: { "Content-Type": "application/sdp" },
-    });
-  };
-
-  const answer = await negotiateRealtimeSession("session-1", "offer-sdp", {
-    voiceMode: "push-to-talk",
-  });
-
-  assert.equal(answer, "answer-sdp");
-  assert.equal(request.url, "/api/sessions/session-1/realtime?voice_mode=push-to-talk");
-  assert.equal(request.options.body, "offer-sdp");
-  assert.equal(request.options.headers["Content-Type"], "application/sdp");
-  assert.equal("Authorization" in request.options.headers, false);
 });
 
 test("SSE subscriptions dispatch snapshots and close idempotently", () => {

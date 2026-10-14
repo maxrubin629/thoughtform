@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { REALTIME_TOOL_DEFINITIONS } from "./realtime.mjs";
+import { MAP_TOOL_DEFINITIONS } from "./mapTools.mjs";
 import { resolveQuoteSpan } from "./sessionOperations.mjs";
 import { ensureLiveState } from "./liveState.mjs";
 import { createLiveCapture, DEFAULT_LIVE_MODEL, DEFAULT_LIVE_BACKEND_MODEL, LiveError, liveDigest, pendingFragments } from "./liveCapture.mjs";
@@ -211,7 +211,7 @@ export function registerLiveRoutes(app, {
       return { pending: true, reply: "", operations: [] };
     }
 
-    const tools = [...REALTIME_TOOL_DEFINITIONS.map((tool) => ({ ...tool, strict: true })), ...nodePreferenceTools, transcriptSearchTool, ...(updatePreferences ? [preferenceTool] : [])];
+    const tools = [...MAP_TOOL_DEFINITIONS.map((tool) => ({ ...tool, strict: true })), ...nodePreferenceTools, transcriptSearchTool, ...(updatePreferences ? [preferenceTool] : [])];
     const input = [{ role: "user", content: JSON.stringify({ explicit_request: intent.request_quote, application: context }) }];
     const operations = [];
     for (let step = 0; step < 4; step += 1) {
@@ -244,7 +244,7 @@ export function registerLiveRoutes(app, {
             await beforeMutation();
             output = await updatePreferences(id, patch);
             operations.push({ type: call.name });
-          } else if ([...REALTIME_TOOL_DEFINITIONS, ...nodePreferenceTools].some((tool) => tool.name === call.name)) {
+          } else if ([...MAP_TOOL_DEFINITIONS, ...nodePreferenceTools].some((tool) => tool.name === call.name)) {
             const current = await store.get(id);
             const quote = args.quote ?? args.transcript_quote ?? args.source_quote;
             const source = quote ? resolveQuoteSpan(current, { ...args, quote }) : null;

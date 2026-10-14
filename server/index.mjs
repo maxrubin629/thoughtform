@@ -1,30 +1,14 @@
 import { sessionSnapshot } from "../shared/sessionSnapshot.mjs";
-import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import OpenAI from "openai";
-import {
-  COMPANION_SCHEMA,
-  COMPANION_SYSTEM,
-  DICTATE_SYSTEM,
-  DICTATION_SCHEMA,
-  PROPOSAL_SCHEMA,
-  PROPOSE_SYSTEM,
-  SYNTHESIZE_SYSTEM,
-} from "./prompts.mjs";
+import { SYNTHESIZE_SYSTEM } from "./prompts.mjs";
 import { createSessionStore } from "./sessionStore.mjs";
 import {
   RevisionConflictError,
   SessionOperationError,
   applyOperation,
-  resolveQuoteSpan,
 } from "./sessionOperations.mjs";
-import {
-  DEFAULT_REALTIME_MODEL,
-  buildRealtimeInstructions,
-  buildRealtimeSessionConfig,
-  forwardRealtimeSdp,
-} from "./realtime.mjs";
 import {
   DEFAULT_MAP_CONTROLLER_MODEL,
   createMapController,
@@ -37,26 +21,10 @@ import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig
 
 const PORT = Number(process.env.PORT ?? 8787);
 const MODEL = process.env.OPENAI_MODEL ?? DEFAULT_REASONING_MODEL;
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? DEFAULT_REALTIME_MODEL;
 const hasKey = Boolean(process.env.OPENAI_API_KEY);
 const client = hasKey ? new OpenAI() : null;
 
-const asJsonSchema = (name, schema) => ({
-  format: { type: "json_schema", name, strict: true, schema },
-});
-
-async function structuredCall({ system, payload, schemaName, schema }) {
-  const response = await client.responses.create({
-    model: MODEL,
-    reasoning: { effort: DEFAULT_REASONING_EFFORT },
-    instructions: system,
-    input: JSON.stringify(payload),
-    text: asJsonSchema(schemaName, schema),
-  });
-  return JSON.parse(response.output_text);
-}
-
-function classicGraphFromSession(session) {
+function synthesisGraph(session) {
   return {
     thoughts: session.nodes.map((node) => ({
       id: node.id,
@@ -217,22 +185,6 @@ export async function createThoughtformServer({
     return snapshot;
   };
 
-  const realtimeSnapshotFor = (snapshot) => ({
-    id: snapshot.id,
-    title: snapshot.title,
-    revision: snapshot.revision,
-    central_node_id: snapshot.nodes.find(({ depth }) => depth === 0)?.id ?? snapshot.nodes[0]?.id ?? null,
-    nodes: snapshot.nodes,
-    edges: snapshot.edges,
-    proposals: snapshot.proposals.filter((proposal) => proposal.status === "pending" || proposal.status === "stale"),
-    ui_context: snapshot.ui_context,
-  });
-
-  const functionOutputPayload = (payload) => ({
-    ...payload,
-    ...(payload.snapshot ? { snapshot: realtimeSnapshotFor(payload.snapshot) } : {}),
-  });
-
   const writeEvent = (response, chunk) => sseWriter.write(response, chunk);
 
   const publish = (session, event = "snapshot", detail = {}, publishedSnapshot = null) => {
@@ -383,16 +335,7 @@ export async function createThoughtformServer({
       }
       if (snapshot) snapshot = snapshotFor(snapshot);
       if (status >= 500 && !(error instanceof SessionOperationError)) console.error(error);
-      const payload = errorPayload(error, snapshot);
-      if (req.originalUrl?.endsWith("/tool-calls") && req.body?.call_id) {
-        const functionPayload = functionOutputPayload(payload);
-        payload.function_call_output = {
-          type: "function_call_output",
-          call_id: req.body.call_id,
-          output: JSON.stringify(functionPayload),
-        };
-      }
-      res.status(status).json(payload);
+      res.status(status).json(errorPayload(error, snapshot));
     }
   };
 
@@ -438,9 +381,7 @@ export async function createThoughtformServer({
     res.json({
       ok: true,
       model: env.OPENAI_MODEL ?? MODEL,
-      mock: !controllerConfigured,
       live: { configured: controllerConfigured, model: env.OPENAI_LIVE_MODEL ?? "gpt-live-1", backend_model: env.OPENAI_LIVE_BACKEND_MODEL ?? DEFAULT_REASONING_MODEL, reasoning_effort: DEFAULT_REASONING_EFFORT },
-      realtime: { configured: hasKey, model: REALTIME_MODEL },
       map_controller: {
         configured: controllerConfigured,
         enabled: Boolean(mapControllerScheduler),
@@ -537,66 +478,6 @@ export async function createThoughtformServer({
     return { ok: true, scheduled: true, snapshot };
   }));
 
-  app.post("/api/sessions/:id/tool-calls", jsonRoute(async (req) => {
-    const { name, call_id: callId } = req.body ?? {};
-    if (typeof name !== "string" || !name) {
-      throw new SessionOperationError("Tool name is required.", { code: "missing_tool_name" });
-    }
-    if (typeof callId !== "string" || !callId.trim()) {
-      throw new SessionOperationError("Realtime tool call_id is required.", { code: "missing_call_id" });
-    }
-    const session = await store.get(req.params.id);
-    if (name === "get_map") {
-      const payload = {
-        ok: true,
-        operation_id: null,
-        revision: session.revision,
-        affected_ids: [],
-        warnings: [],
-        snapshot: snapshotFor(session),
-      };
-      return {
-        ...payload,
-        function_call_output: {
-          type: "function_call_output",
-          call_id: callId,
-          output: JSON.stringify(functionOutputPayload(payload)),
-        },
-      };
-    }
-    const args = req.body?.arguments && typeof req.body.arguments === "object" ? req.body.arguments : {};
-    const quote = args.quote ?? args.transcript_quote ?? args.source_quote;
-    let resolvedProvenance = {};
-    if (typeof quote === "string" && quote.length) {
-      const source = resolveQuoteSpan(session, { ...args, quote });
-      const utterance = session.transcript.find(({ id }) => id === source.utterance_id);
-      resolvedProvenance = {
-        source,
-        ...(utterance?.realtime_item_id ? { realtime_item_id: utterance.realtime_item_id } : {}),
-      };
-    }
-    const operation = {
-      ...args,
-      ...resolvedProvenance,
-      type: name,
-      actor: "partner",
-      origin: "realtime",
-      call_id: callId,
-      // The model's tool argument describes the snapshot it reasoned from. A
-      // newer browser revision must never silently upgrade that stale intent.
-      expected_revision: args.expected_revision ?? req.body?.expected_revision,
-    };
-    const payload = await performOperation(req.params.id, operation);
-    return {
-      ...payload,
-      function_call_output: {
-        type: "function_call_output",
-        call_id: callId,
-        output: JSON.stringify(functionOutputPayload(payload)),
-      },
-    };
-  }));
-
   app.get("/api/sessions/:id/events", async (req, res) => {
     let sessionId = null;
     let heartbeat = null;
@@ -640,41 +521,6 @@ export async function createThoughtformServer({
     }
   });
 
-  app.post(
-    "/api/sessions/:id/realtime",
-    express.text({ type: "application/sdp", limit: "1mb" }),
-    async (req, res) => {
-      try {
-        const session = await store.get(req.params.id);
-        await store.setActive(session.id);
-        const controller = new AbortController();
-        req.once("aborted", () => controller.abort());
-        res.once("close", () => {
-          if (!res.writableEnded) controller.abort();
-        });
-        const voiceMode = req.query.voice_mode === "push-to-talk" ? "push-to-talk" : "vad";
-        const sessionConfig = buildRealtimeSessionConfig({
-          model: REALTIME_MODEL,
-          voiceMode,
-          instructions: buildRealtimeInstructions(),
-        });
-        const safetyIdentifier = createHash("sha256").update(`thoughtform:${session.id}`).digest("hex");
-        const answer = await forwardRealtimeSdp({
-          sdp: req.body,
-          fetchImpl,
-          sessionConfig,
-          safetyIdentifier,
-          signal: controller.signal,
-        });
-        res.status(201).type("application/sdp").send(answer);
-      } catch (error) {
-        const status = hasKey ? (error?.status ?? 502) : 503;
-        if (status >= 500) console.error(error);
-        res.status(status).json(errorPayload(error));
-      }
-    },
-  );
-
   app.post("/api/sessions/:id/synthesize", jsonRoute(async (req) => {
     const session = await store.get(req.params.id);
     const expected = req.body?.expected_revision;
@@ -689,7 +535,7 @@ export async function createThoughtformServer({
       model: env.OPENAI_MODEL ?? MODEL,
       reasoning: { effort: DEFAULT_REASONING_EFFORT },
       instructions: SYNTHESIZE_SYSTEM,
-      input: JSON.stringify({ graph: classicGraphFromSession(session), transcript: session.transcript }),
+      input: JSON.stringify({ graph: synthesisGraph(session), transcript: session.transcript }),
     });
     const text = response.output_text?.trim();
     if (!text) throw new SessionOperationError("The synthesis was empty. Please try again.", { code: "empty_synthesis", status: 502 });
@@ -699,43 +545,6 @@ export async function createThoughtformServer({
     }));
     const snapshot = await publishMapControllerSnapshot(session.id, saved);
     return { synthesis: text, revision: session.revision, snapshot };
-  }));
-
-  // Classic-mode endpoints remain unchanged and continue to operate on the
-  // browser-owned graph at ?mode=classic.
-  app.post("/api/propose", jsonRoute(async (req) => {
-    const { graph, prompt, selectedId } = req.body ?? {};
-    if (!graph?.thoughts?.length || !prompt) throw new Error("propose needs { graph, prompt }");
-    if (!hasKey) {
-      const parent = graph.thoughts.find((thought) => thought.id === selectedId) ?? graph.thoughts[0];
-      return { proposals: [{ parent_id: parent.id, text: `Mock suggestion for “${prompt.slice(0, 32)}”`, reason: "offline mock — set OPENAI_API_KEY" }] };
-    }
-    const { proposals } = await structuredCall({ system: PROPOSE_SYSTEM, payload: { graph, selected_id: selectedId, request: prompt }, schemaName: "proposals", schema: PROPOSAL_SCHEMA });
-    const validIds = new Set(graph.thoughts.map((thought) => thought.id));
-    return { proposals: proposals.filter((proposal) => validIds.has(proposal.parent_id) && proposal.text?.trim()).slice(0, 3) };
-  }));
-
-  app.post("/api/dictate", jsonRoute(async (req) => {
-    const { transcript } = req.body ?? {};
-    if (!transcript?.trim()) throw new Error("dictate needs { transcript }");
-    if (!hasKey) return { thought: transcript.trim() };
-    const { thought } = await structuredCall({ system: DICTATE_SYSTEM, payload: { transcript }, schemaName: "dictation", schema: DICTATION_SCHEMA });
-    return { thought };
-  }));
-
-  app.post("/api/companion", jsonRoute(async (req) => {
-    const { graph } = req.body ?? {};
-    if (!graph?.thoughts?.length) throw new Error("companion needs { graph }");
-    if (!hasKey) return { line: "Keep going, this is getting interesting…", followup: "What if we explored the flow a bit more?" };
-    return structuredCall({ system: COMPANION_SYSTEM, payload: { graph }, schemaName: "companion", schema: COMPANION_SCHEMA });
-  }));
-
-  app.post("/api/synthesize", jsonRoute(async (req) => {
-    const { graph } = req.body ?? {};
-    if (!graph?.thoughts?.length) throw new Error("synthesize needs { graph }");
-    if (!hasKey) return { synthesis: `Offline mock synthesis of ${graph.thoughts.length} thoughts — set OPENAI_API_KEY to enable ${MODEL}.` };
-    const response = await openaiClient.responses.create({ model: MODEL, reasoning: { effort: DEFAULT_REASONING_EFFORT }, instructions: SYNTHESIZE_SYSTEM, input: JSON.stringify({ graph }) });
-    return { synthesis: response.output_text.trim() };
   }));
 
   app.locals.sessionStore = store;
