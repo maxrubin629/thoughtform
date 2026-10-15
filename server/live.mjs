@@ -188,12 +188,15 @@ export function registerLiveRoutes(app, {
 
   async function runBackend({ id, liveId = null, requestId, sourceIds, latestText, beforeMutation = async () => {} }) {
     if (!openaiClient?.responses) throw new LiveError("Partner is unavailable until the local server has its OpenAI key.", "live_backend_unavailable", 503);
+    // Take the session's signal before any await so a deletion during context
+    // loading still cancels the model calls below.
+    const signal = signalFor(id);
     const session = await store.get(id);
     const uiContext = getUiContext(id) ?? {};
     const selectedIds = [...(uiContext.selected_node_ids ?? [])];
     const context = backendContext(session, uiContext);
     const isFresh = () => fresh(id, liveId, sourceIds, selectedIds);
-    const signal = signalFor(id);
+    signal.throwIfAborted();
     const decision = await openaiClient.responses.create({
       model, reasoning: { effort: DEFAULT_REASONING_EFFORT }, instructions: INTENT_INSTRUCTIONS,
       input: JSON.stringify({ latest_user_text: latestText, application: context }),
@@ -274,6 +277,7 @@ export function registerLiveRoutes(app, {
   }
 
   app.post("/api/sessions/:id/live", jsonRoute(async (req, res) => {
+    const mapSignal = signalFor(req.params.id);
     const session = await store.get(req.params.id);
     const controller = new AbortController();
     req.once?.("aborted", () => controller.abort());
@@ -281,9 +285,10 @@ export function registerLiveRoutes(app, {
     const answer = await forwardLiveSdp({
       sdp: req.body?.sdp,
       sessionConfig: buildLiveSessionConfig(session, { model: liveModel }),
-      apiKey, fetchImpl, signal: controller.signal,
+      apiKey, fetchImpl, signal: AbortSignal.any([controller.signal, mapSignal]),
       safetyIdentifier: createHash("sha256").update(`thoughtform:${session.id}`).digest("hex"),
     });
+    mapSignal.throwIfAborted();
     const updated = await store.transact(session.id, (current) => {
       const state = ensureLiveState(current);
       state.active_session_id = answer.session.id;

@@ -1,6 +1,8 @@
 /**
  * Per-session cancellation scopes for background model work. Deleting a
- * session aborts its scope; disposing the server aborts every scope.
+ * session aborts its scope; disposing the server aborts every scope. A
+ * cancelled scope stays aborted, so work that asks for a signal after the
+ * deletion (for example while it was still loading context) cannot start.
  */
 export class SessionCancelledError extends Error {
   constructor(message = "This session's work was cancelled.") {
@@ -30,8 +32,12 @@ export function createSessionJobs() {
   };
 
   const cancel = (sessionId) => {
-    scopes.get(sessionId)?.abort(new SessionCancelledError());
-    scopes.delete(sessionId);
+    let scope = scopes.get(sessionId);
+    if (!scope) {
+      scope = new AbortController();
+      scopes.set(sessionId, scope);
+    }
+    if (!scope.signal.aborted) scope.abort(new SessionCancelledError());
   };
 
   const dispose = () => {

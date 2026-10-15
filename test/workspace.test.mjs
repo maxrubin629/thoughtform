@@ -7,6 +7,7 @@ import { createSessionStore, SESSION_SCHEMA_VERSION } from "../server/sessionSto
 import { createThoughtformServer } from "../server/index.mjs";
 import { applyOperation } from "../server/sessionOperations.mjs";
 import { sessionMarkdown } from "../server/sessionExport.mjs";
+import { createSessionJobs } from "../server/sessionJobs.mjs";
 
 async function fixture(t, extra = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "thoughtform-workspace-"));
@@ -131,6 +132,59 @@ test("server configuration comes only from the injected environment", async (t) 
   assert.equal(configured.live.voice_configured, true);
   assert.equal(configured.live.model, "custom-live");
   assert.equal(configured.live.backend_model, "gpt-6-luna");
+});
+
+test("a synthesis requested after new conversation reads that conversation", async (t) => {
+  const pending = [];
+  const openaiClient = { responses: { create: (body) => new Promise((resolve) => pending.push({ body, resolve })) } };
+  const { request, store } = await fixture(t, { openaiClient });
+  const session = await store.create();
+  const said = (text) => store.transact(session.id, (s) => applyOperation(s, { type: "append_utterance", speaker: "you", actor: "you", text, expected_revision: s.revision }));
+  await said("First idea.");
+  const mapped = await store.transact(session.id, (s) => applyOperation(s, { type: "create_bubble", actor: "you", text: "A thought", expected_revision: s.revision }));
+  const first = request(`/sessions/${session.id}/synthesize`, { expected_revision: mapped.revision });
+  while (pending.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  const afterSecond = await said("Second idea.");
+  assert.equal(afterSecond.revision, mapped.revision, "transcript appends do not advance the map revision");
+  const second = request(`/sessions/${session.id}/synthesize`, { expected_revision: mapped.revision });
+  while (pending.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(JSON.parse(pending[1].body.input).transcript.length, 2);
+  pending[1].resolve({ output_text: "Includes both ideas." });
+  await second;
+  pending[0].resolve({ output_text: "Only the first idea." });
+  assert.equal((await first).data.synthesis, "Includes both ideas.");
+  assert.equal((await store.get(session.id)).synthesis.text, "Includes both ideas.");
+});
+
+test("a cancelled session stays cancelled for work that asks later", () => {
+  const jobs = createSessionJobs();
+  const early = jobs.signal("s1");
+  jobs.cancel("s1");
+  assert.equal(early.aborted, true);
+  assert.equal(jobs.signal("s1").aborted, true, "work that loaded context before deletion cannot start");
+  jobs.cancel("never-started");
+  assert.equal(jobs.signal("never-started").aborted, true);
+  assert.equal(jobs.signal("s2").aborted, false);
+  jobs.dispose();
+  assert.equal(jobs.signal("s2").aborted, true);
+});
+
+test("deleting a session cancels its voice connection setup", async (t) => {
+  let upstreamSignal;
+  let started;
+  const began = new Promise((resolve) => { started = resolve; });
+  const fetchImpl = (_url, options) => {
+    upstreamSignal = options.signal;
+    started();
+    return new Promise((_resolve, reject) => upstreamSignal.addEventListener("abort", () => reject(upstreamSignal.reason), { once: true }));
+  };
+  const { request, store } = await fixture(t, { fetchImpl, env: { THOUGHTFORM_MAP_CONTROLLER_ENABLED: "false", OPENAI_API_KEY: "test-key" } });
+  const session = await store.create();
+  const setup = request(`/sessions/${session.id}/live`, { sdp: "v=0\r\n" });
+  await began;
+  assert.equal((await request(`/sessions/${session.id}`, undefined, "DELETE")).status, 200);
+  assert.equal(upstreamSignal.aborted, true);
+  assert.equal((await setup).status, 410);
 });
 
 test("public session snapshots omit raw Live storage while export preserves it", async (t) => {

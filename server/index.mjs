@@ -139,6 +139,8 @@ export async function createThoughtformServer({
   const sseWriter = createSseEventWriter();
   const sessionJobs = createSessionJobs();
   const synthesisRuns = new Map();
+  const savedSynthesisOrder = new Map();
+  let synthesisOrder = 0;
   const controllerConfigured = Boolean(openaiClient);
   const controllerRuntimeEnabled = config.mapControllerEnabled && (
     controllerConfigured || suppliedMapController || suppliedMapControllerScheduler
@@ -422,6 +424,7 @@ export async function createThoughtformServer({
   app.delete("/api/sessions/:id", jsonRoute(async (req) => {
     sessionJobs.cancel(req.params.id);
     liveService.cancel(req.params.id);
+    savedSynthesisOrder.delete(req.params.id);
     mapControllerScheduler?.cancel(req.params.id);
     curatorScheduler?.cancel(req.params.id);
     uiContexts.delete(req.params.id);
@@ -538,8 +541,9 @@ export async function createThoughtformServer({
       throw new SessionOperationError("Add at least one bubble before synthesizing.", { code: "empty_map" });
     }
     if (!openaiClient) throw new SessionOperationError("Connect OpenAI to write a synthesis.", { code: "model_unavailable", status: 503 });
-    // Repeated requests for the same map revision share one model call.
-    const runKey = `${session.id}:${session.revision}`;
+    // Repeated requests over the same map and transcript share one model call.
+    // The transcript is append-only and does not advance the map revision.
+    const runKey = `${session.id}:${session.revision}:${session.transcript.length}`;
     if (!synthesisRuns.has(runKey)) {
       const run = synthesize(session).finally(() => synthesisRuns.delete(runKey));
       synthesisRuns.set(runKey, run);
@@ -548,6 +552,7 @@ export async function createThoughtformServer({
   }));
 
   const synthesize = async (session) => {
+    const order = ++synthesisOrder;
     const response = await openaiClient.responses.create({
       model: config.models.synthesis,
       reasoning: { effort: config.reasoningEffort },
@@ -556,13 +561,13 @@ export async function createThoughtformServer({
     }, { signal: sessionJobs.signal(session.id) });
     const text = response.output_text?.trim();
     if (!text) throw new SessionOperationError("The synthesis was empty. Please try again.", { code: "empty_synthesis", status: 502 });
-    // A synthesis of a newer map revision may finish first; never replace it
-    // with this older result.
-    const saved = await store.transact(session.id, (current) => (
-      current.synthesis?.revision > session.revision
-        ? current
-        : { ...current, synthesis: { text, revision: session.revision, created_at: new Date().toISOString() } }
-    ));
+    // A synthesis started later read a newer map or transcript and may finish
+    // first; never replace it with this older result.
+    const saved = await store.transact(session.id, (current) => {
+      if ((savedSynthesisOrder.get(session.id) ?? 0) > order || current.synthesis?.revision > session.revision) return current;
+      savedSynthesisOrder.set(session.id, order);
+      return { ...current, synthesis: { text, revision: session.revision, created_at: new Date().toISOString() } };
+    });
     const snapshot = await publishMapControllerSnapshot(session.id, saved);
     return { synthesis: saved.synthesis.text, revision: saved.synthesis.revision, snapshot };
   };
