@@ -74,29 +74,12 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(created.data.revision, 0);
   const id = created.data.id;
 
-  const getMap = await request(`/api/sessions/${id}/tool-calls`, {
+  const removedTool = await request(`/api/sessions/${id}/operations`, {
     method: "POST",
     body: {
-      name: "get_map",
-      call_id: "call-http-get-map",
-      arguments: {},
-    },
-  });
-  assert.equal(getMap.data.ok, true);
-  assert.equal(getMap.data.revision, 0);
-  assert.equal(getMap.data.snapshot.nodes.length, 0);
-  assert.equal(getMap.data.snapshot.history_length, 0);
-  assert.equal(
-    JSON.parse(getMap.data.function_call_output.output).snapshot.revision,
-    0,
-  );
-
-  const removedTool = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: {
-      name: "no_map_change",
+      expected_revision: 0,
       call_id: "call-http-removed-tool",
-      arguments: { expected_revision: 0 },
+      operation: { type: "no_map_change" },
     },
   });
   assert.equal(removedTool.response.status, 400);
@@ -119,17 +102,18 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(transcript.data.revision, 0, "transcript append is not a semantic map revision");
 
   const toolBody = {
-    name: "create_bubble",
     call_id: "call-http-1",
     expected_revision: 0,
-    arguments: {
+    actor: "partner",
+    operation: {
+      type: "create_bubble",
+      origin: "realtime",
       text: "Server owned maps",
       quote: "Server owned maps",
       parent_reference: null,
-      expected_revision: 0,
     },
   };
-  const createdBubble = await request(`/api/sessions/${id}/tool-calls`, { method: "POST", body: toolBody });
+  const createdBubble = await request(`/api/sessions/${id}/operations`, { method: "POST", body: toolBody });
   assert.equal(createdBubble.data.revision, 1);
   assert.equal(createdBubble.data.snapshot.nodes.length, 1);
   assert.equal(createdBubble.data.snapshot.nodes[0].sources[0].quote, "Server owned maps");
@@ -142,14 +126,8 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.equal(sourceUtterance.realtime_item_id, "input-http-1");
   assert.equal(createdBubble.data.snapshot.operations.some((operation) => "change" in operation), false);
   assert.equal(createdBubble.data.snapshot.history_length, 1);
-  assert.equal(createdBubble.data.function_call_output.type, "function_call_output");
-  const modelOutput = JSON.parse(createdBubble.data.function_call_output.output);
-  assert.equal(modelOutput.snapshot.operations, undefined);
-  assert.equal(modelOutput.snapshot.transcript, undefined);
-  assert.equal(modelOutput.snapshot.nodes.length, 1);
-  assert.equal(modelOutput.snapshot.central_node_id, modelOutput.snapshot.nodes[0].id);
 
-  const replay = await request(`/api/sessions/${id}/tool-calls`, { method: "POST", body: toolBody });
+  const replay = await request(`/api/sessions/${id}/operations`, { method: "POST", body: toolBody });
   assert.equal(replay.data.replayed, true);
   assert.equal(replay.data.snapshot.nodes.length, 1);
 
@@ -161,44 +139,40 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   assert.deepEqual(selected.data.ui_context.selected_node_ids, [nodeId]);
   assert.equal(selected.data.snapshot.revision, 1);
 
-  const edited = await request(`/api/sessions/${id}/tool-calls`, {
+  const edited = await request(`/api/sessions/${id}/operations`, {
     method: "POST",
     body: {
-      name: "edit_bubble",
       call_id: "call-http-2",
       expected_revision: 1,
-      arguments: {
+      actor: "partner",
+      operation: {
+        type: "edit_bubble",
+        origin: "realtime",
         node_reference: "$selected",
         text: "Canonical server owned maps",
-        transcript_quote: null,
-        realtime_item_id: null,
-        expected_revision: 1,
       },
     },
   });
   assert.equal(edited.data.revision, 2);
   assert.equal(edited.data.snapshot.nodes[0].text, "Canonical server owned maps");
 
-  const staleToolIntent = await request(`/api/sessions/${id}/tool-calls`, {
+  const staleToolIntent = await request(`/api/sessions/${id}/operations`, {
     method: "POST",
     body: {
-      name: "edit_bubble",
       call_id: "call-http-stale",
-      expected_revision: 2,
-      arguments: {
+      expected_revision: 1,
+      actor: "partner",
+      operation: {
+        type: "edit_bubble",
+        origin: "realtime",
         node_reference: nodeId,
         text: "Must not overwrite newer state",
-        transcript_quote: null,
-        realtime_item_id: null,
-        expected_revision: 1,
       },
     },
   });
   assert.equal(staleToolIntent.response.status, 409);
   assert.equal(staleToolIntent.data.error.code, "revision_conflict");
   assert.equal(staleToolIntent.data.snapshot.nodes[0].text, "Canonical server owned maps");
-  assert.equal(staleToolIntent.data.function_call_output.type, "function_call_output");
-  assert.equal(JSON.parse(staleToolIntent.data.function_call_output.output).snapshot.revision, 2);
 
   const stale = await request(`/api/sessions/${id}/operations`, {
     method: "POST",
@@ -214,13 +188,6 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   const listed = await request("/api/sessions");
   assert.equal(listed.data.active_session_id, id);
   assert.equal(listed.data.sessions[0].thought_count, 1);
-
-  const missingCallId = await request(`/api/sessions/${id}/tool-calls`, {
-    method: "POST",
-    body: { name: "get_map", arguments: {} },
-  });
-  assert.equal(missingCallId.response.status, 400);
-  assert.equal(missingCallId.data.error.code, "missing_call_id");
 
   const directCuratorMutation = await request(`/api/sessions/${id}/operations`, {
     method: "POST",
@@ -256,17 +223,17 @@ test("session HTTP routes share the canonical reducer and revision contract", as
   });
   assert.deepEqual(deletedChild.data.snapshot.ui_context.selected_node_ids, []);
 
-  const staleSelection = await request(`/api/sessions/${id}/tool-calls`, {
+  const staleSelection = await request(`/api/sessions/${id}/operations`, {
     method: "POST",
     body: {
-      name: "edit_bubble",
       call_id: "call-after-delete",
-      arguments: {
+      expected_revision: 4,
+      actor: "partner",
+      operation: {
+        type: "edit_bubble",
+        origin: "realtime",
         node_reference: "$selected",
         text: "No stale selection",
-        transcript_quote: null,
-        realtime_item_id: null,
-        expected_revision: 4,
       },
     },
   });

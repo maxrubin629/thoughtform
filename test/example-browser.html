@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ThoughtForm browser persistence checks</title>
+<h1>Browser persistence checks</h1>
+<pre id="results">Running…</pre>
+<script type="module">
+import { createExampleStore } from '/src/exampleStore.js';
+import { createExampleWorkspace } from '/src/exampleWorkspace.js';
+const results = document.querySelector('#results');
+const lines = [];
+const assert = (value, label) => { if (!value) throw new Error(label); lines.push(`PASS ${label}`); results.textContent = lines.join('\n'); };
+const name = `thoughtform-test-${crypto.randomUUID()}`;
+const open = () => createExampleWorkspace({ store: createExampleStore({ name }), channel: null });
+let client = open();
+try {
+  let { snapshot } = await client.bootstrap();
+  const id = snapshot.id;
+  const source = JSON.parse((await client.exportSession(id)).text);
+  await client.applySessionOperation(id, {type:'accept_proposal', proposal_id:'trial_proposal'}, {expectedRevision:snapshot.revision});
+  snapshot = await client.getSession(id);
+  await client.applySessionOperation(id, {type:'undo_map_change'}, {expectedRevision:snapshot.revision});
+  const exported = JSON.parse((await client.exportSession(id)).text);
+  await client.dispose(); client = open();
+  snapshot = (await client.bootstrap()).snapshot;
+  assert(snapshot.id === id && snapshot.nodes.length === 5, 'close and reopen IndexedDB preserves the active map');
+  assert(snapshot.redo_label === 'Accept suggestion', 'the redo branch survives reopening');
+  const redo = await client.applySessionOperation(id, {type:'redo_map_change'}, {expectedRevision:snapshot.revision});
+  assert(redo.snapshot.nodes.length === 6, 'proposal redo restores the accepted bubble');
+  const imported = await client.importSession(exported);
+  const importedRedo = await client.applySessionOperation(imported.id, {type:'redo_map_change'}, {expectedRevision:imported.revision});
+  assert(importedRedo.snapshot.nodes.length === 6, 'JSON export/import preserves redo deltas');
+  assert(JSON.stringify(importedRedo.snapshot.transcript) === JSON.stringify(source.transcript), 'transcript and provenance remain exact');
+  const concurrent = open();
+  const [one, two] = await Promise.all([
+    client.applySessionOperation(id, {type:'create_bubble',text:'First concurrent thought',create_distinct:true}, {expectedRevision:redo.snapshot.revision}),
+    concurrent.applySessionOperation(id, {type:'create_bubble',text:'Second concurrent thought',create_distinct:true}, {expectedRevision:redo.snapshot.revision}),
+  ]);
+  snapshot = await client.getSession(id);
+  assert(snapshot.nodes.length === 8, 'independent clients serialize concurrent IndexedDB writes without losing thoughts');
+  await concurrent.dispose();
+  const store = createExampleStore({name});
+  const before = await store.read(state => JSON.stringify(state));
+  try { await store.write(state => { state.sessions = {}; throw new Error('intentional abort'); }); } catch {}
+  assert(await store.read(state => JSON.stringify(state)) === before, 'aborted transaction leaves saved state untouched');
+  await store.close();
+  let unavailable = createExampleWorkspace({store:createExampleStore({indexedDB:null}),channel:null});
+  try { await unavailable.bootstrap(); throw new Error('should reject unavailable storage'); } catch(error) { assert(error.message.includes('unavailable'), 'unavailable storage never silently falls back to unsaved memory'); }
+  results.dataset.status = 'passed';
+} catch(error) { results.dataset.status = 'failed'; results.textContent += '\nFAIL '+error.stack; }
+finally { await client.dispose(); indexedDB.deleteDatabase(name); }
+</script>

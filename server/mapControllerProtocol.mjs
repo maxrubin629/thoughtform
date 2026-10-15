@@ -1,4 +1,6 @@
-export const DEFAULT_MAP_CONTROLLER_MODEL = "gpt-5.6-sol";
+import { DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
+
+export const DEFAULT_MAP_CONTROLLER_MODEL = DEFAULT_REASONING_MODEL;
 
 export const MAP_CONTROLLER_SYSTEM = `You are Thoughtform's silent incremental map controller. You maintain a thinking map from completed conversation evidence and never address the user.
 
@@ -10,9 +12,14 @@ Security boundary:
 Map policy:
 - Work only from completed transcript evidence at or before transcript_watermark.
 - Incomplete fragments, greetings, filler, unintelligible speech, and non-map conversation require no_change.
+- Application-control requests belong exclusively to the foreground Partner, including requests to rename, connect, disconnect, delete, move, pin, keep aside, undo, redo, pause/resume mapping, or change suggestion settings. Do not execute those requests, turn their commands or replacement labels into bubbles, revisit existing bubbles because of them, or propose the requested action. This rule applies even when the foreground operation has not appeared yet. A delta containing only application controls requires no_change.
+- relevant_realtime_operations and each utterance's foreground_operation_ids identify foreground changes already handled for that speech. Never repeat, reinterpret, or counteract those changes. An explicit command is not permission for a second mapping interpretation.
+- A mixed utterance may contain both a control request and a substantive new idea. Ignore only the control clause and capture any independently meaningful idea, citing its exact substantive source span. Do not discard the entire utterance merely because foreground_operation_ids is non-empty. For example, “Rename this bubble to Voice capture” requires no_change; “Rename this bubble to Voice capture. Long pauses help me think” may capture “Long pauses help me think” without renaming or mapping “Voice capture” again. “The app needs a rename feature” is a product idea, not a command to operate this map.
 - A complete opening project, question, or main idea should establish the central idea. Preserve distinct opening ideas separately unless their relationship is clear.
 - Create concise faithful bubbles for distinct user ideas. Partner ideas become map content only after the user adopts them.
 - Repeated ideas revisit an existing bubble instead of creating a duplicate.
+- Parked bubbles have been deliberately kept aside. Preserve that choice; do not expand them or connect new material to them unless the user explicitly returns to them.
+- Distinguish examples and hypotheticals from the user's actual position. If the user says a thought was only an example, do not treat it as a new commitment or central idea; propose any uncertain correction to an existing bubble.
 - Condense one complete thought into no more than three concise bubbles.
 - Direct operations may create, revisit, edit, set the central idea, or make a confident connection. Use at most eight, in declared order.
 - Destructive work and uncertain interpretation must be placed in the single optional review proposal, never applied directly. A proposal may contain at most five constructive or destructive operations.
@@ -195,22 +202,28 @@ export function buildMapControllerEnvelope(snapshot, start, watermark) {
   const delta = transcript.slice(start, watermark);
   const deltaIds = new Set(delta.map(({ id }) => id));
   const deltaRealtimeIds = new Set(delta.map(({ realtime_item_id: id }) => id).filter(Boolean));
+  const foregroundOperations = (snapshot.operations ?? [])
+    .filter((operation) => operation.origin === "realtime"
+      && ((operation.source_utterance_ids ?? []).some((id) => deltaIds.has(id))
+        || deltaRealtimeIds.has(operation.source_realtime_item_id)));
   return {
     base_revision: snapshot.revision,
     transcript_watermark: watermark,
     preceding_utterances: transcript.slice(Math.max(0, start - 8), start).map(compactUtterance),
-    transcript_delta: delta.map(compactUtterance),
+    transcript_delta: delta.map((utterance) => ({
+      ...compactUtterance(utterance),
+      foreground_operation_ids: foregroundOperations
+        .filter((operation) => (operation.source_utterance_ids ?? []).includes(utterance.id)
+          || (utterance.realtime_item_id && operation.source_realtime_item_id === utterance.realtime_item_id))
+        .map(({ id }) => id),
+    })),
     map: {
       central_node_id: centralNodeId(snapshot),
       nodes: snapshot.nodes ?? [],
       edges: snapshot.edges ?? [],
       pending_proposals: (snapshot.proposals ?? []).filter(({ status }) => status === "pending"),
     },
-    relevant_realtime_operations: (snapshot.operations ?? [])
-      .filter((operation) => operation.origin === "realtime"
-        && ((operation.source_utterance_ids ?? []).some((id) => deltaIds.has(id))
-          || deltaRealtimeIds.has(operation.source_realtime_item_id)))
-      .map(compactOperation),
+    relevant_realtime_operations: foregroundOperations.map(compactOperation),
   };
 }
 

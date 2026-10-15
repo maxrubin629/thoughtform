@@ -1,58 +1,22 @@
-import { createHash } from "node:crypto";
+import { sessionSnapshot } from "../shared/sessionSnapshot.mjs";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import OpenAI from "openai";
-import {
-  COMPANION_SCHEMA,
-  COMPANION_SYSTEM,
-  DICTATE_SYSTEM,
-  DICTATION_SCHEMA,
-  PROPOSAL_SCHEMA,
-  PROPOSE_SYSTEM,
-  SYNTHESIZE_SYSTEM,
-} from "./prompts.mjs";
+import { SYNTHESIZE_SYSTEM } from "./prompts.mjs";
 import { createSessionStore } from "./sessionStore.mjs";
 import {
   RevisionConflictError,
   SessionOperationError,
   applyOperation,
-  resolveQuoteSpan,
 } from "./sessionOperations.mjs";
-import {
-  DEFAULT_REALTIME_MODEL,
-  buildRealtimeInstructions,
-  buildRealtimeSessionConfig,
-  forwardRealtimeSdp,
-} from "./realtime.mjs";
-import {
-  DEFAULT_MAP_CONTROLLER_MODEL,
-  createMapController,
-  createMapControllerScheduler,
-} from "./mapController.mjs";
-import { createCurator, createCuratorScheduler, isCuratorEnabled } from "./curator.mjs";
+import { createMapController, createMapControllerScheduler } from "./mapController.mjs";
+import { createCurator, createCuratorScheduler } from "./curator.mjs";
+import { resolveServerConfig } from "./config.mjs";
+import { registerLiveRoutes } from "./live.mjs";
+import { createSessionJobs, isCancellation } from "./sessionJobs.mjs";
+import { sessionMarkdown } from "./sessionExport.mjs";
 
-const PORT = Number(process.env.PORT ?? 8787);
-const MODEL = process.env.OPENAI_MODEL ?? "gpt-5.6";
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? DEFAULT_REALTIME_MODEL;
-const hasKey = Boolean(process.env.OPENAI_API_KEY);
-const client = hasKey ? new OpenAI() : null;
-
-const asJsonSchema = (name, schema) => ({
-  format: { type: "json_schema", name, strict: true, schema },
-});
-
-async function structuredCall({ system, payload, schemaName, schema }) {
-  const response = await client.responses.create({
-    model: MODEL,
-    reasoning: { effort: "low" },
-    instructions: system,
-    input: JSON.stringify(payload),
-    text: asJsonSchema(schemaName, schema),
-  });
-  return JSON.parse(response.output_text);
-}
-
-function classicGraphFromSession(session) {
+function synthesisGraph(session) {
   return {
     thoughts: session.nodes.map((node) => ({
       id: node.id,
@@ -150,10 +114,10 @@ export function createSseEventWriter() {
 }
 
 export async function createThoughtformServer({
-  store = createSessionStore(),
-  openaiClient = client,
-  fetchImpl = globalThis.fetch,
   env = process.env,
+  store: suppliedStore,
+  openaiClient: suppliedOpenaiClient,
+  fetchImpl = globalThis.fetch,
   controllerEventEpoch = Date.now(),
   mapController: suppliedMapController,
   mapControllerScheduler: suppliedMapControllerScheduler,
@@ -164,15 +128,21 @@ export async function createThoughtformServer({
   curatorFactory = createCurator,
   curatorSchedulerFactory = createCuratorScheduler,
 } = {}) {
+  const config = resolveServerConfig(env);
+  const store = suppliedStore ?? createSessionStore(config.dataDirectory ? { directory: config.dataDirectory } : {});
+  const openaiClient = suppliedOpenaiClient ?? (config.apiKey ? new OpenAI({ apiKey: config.apiKey }) : null);
   await store.init();
   const app = express();
   const uiContexts = new Map();
   const eventClients = new Map();
   const controllerEventSequences = new Map();
   const sseWriter = createSseEventWriter();
-  const controllerConfigured = Boolean(openaiClient ?? env.OPENAI_API_KEY);
-  const controllerRequested = env.THOUGHTFORM_MAP_CONTROLLER_ENABLED !== "false";
-  const controllerRuntimeEnabled = controllerRequested && (
+  const sessionJobs = createSessionJobs();
+  const synthesisRuns = new Map();
+  const savedSynthesisOrder = new Map();
+  let synthesisOrder = 0;
+  const controllerConfigured = Boolean(openaiClient);
+  const controllerRuntimeEnabled = config.mapControllerEnabled && (
     controllerConfigured || suppliedMapController || suppliedMapControllerScheduler
   );
   let mapController = null;
@@ -203,51 +173,15 @@ export async function createThoughtformServer({
   };
 
   const snapshotFor = (session) => {
-    const nodeIds = new Set(session.nodes.map((node) => node.id));
-    const storedContext = uiContexts.get(session.id) ?? {
-      selected_node_ids: [],
-      focus_id: null,
-      view_mode: "clusters",
-      voice_mode: "vad",
-    };
-    const context = {
-      ...storedContext,
-      selected_node_ids: (storedContext.selected_node_ids ?? []).filter((id) => nodeIds.has(id)),
-      focus_id: nodeIds.has(storedContext.focus_id) ? storedContext.focus_id : null,
-    };
-    uiContexts.set(session.id, context);
-    const history = [...session.operations].reverse()
-      .find((operation) => Array.isArray(operation.history_entry_ids))?.history_entry_ids ?? [];
-    const operations = session.operations.map(({ change: _change, history_entry_ids: _history, ...record }) => record);
-    return {
-      ...session,
-      controller_event_epoch: controllerEventEpoch,
-      controller_event_sequence: controllerEventSequenceFor(session.id),
-      map_controller: {
-        ...session.map_controller,
-        status: mapControllerStatusFor(session),
-      },
-      operations,
-      history_length: history.length,
-      ui_context: context,
-    };
+    const snapshot = sessionSnapshot(session, {
+      uiContext: uiContexts.get(session.id),
+      controllerEventEpoch,
+      controllerEventSequence: controllerEventSequenceFor(session.id),
+      controllerStatus: mapControllerStatusFor(session),
+    });
+    uiContexts.set(session.id, snapshot.ui_context);
+    return snapshot;
   };
-
-  const realtimeSnapshotFor = (snapshot) => ({
-    id: snapshot.id,
-    title: snapshot.title,
-    revision: snapshot.revision,
-    central_node_id: snapshot.nodes.find(({ depth }) => depth === 0)?.id ?? snapshot.nodes[0]?.id ?? null,
-    nodes: snapshot.nodes,
-    edges: snapshot.edges,
-    proposals: snapshot.proposals.filter((proposal) => proposal.status === "pending" || proposal.status === "stale"),
-    ui_context: snapshot.ui_context,
-  });
-
-  const functionOutputPayload = (payload) => ({
-    ...payload,
-    ...(payload.snapshot ? { snapshot: realtimeSnapshotFor(payload.snapshot) } : {}),
-  });
 
   const writeEvent = (response, chunk) => sseWriter.write(response, chunk);
 
@@ -302,7 +236,11 @@ export async function createThoughtformServer({
   };
 
   const commitCuratorProposal = async (sessionId, proposal) => {
-    const result = await store.transact(sessionId, (session) => applyOperation(session, {
+    const result = await store.transact(sessionId, (session) => {
+      if (session.preferences?.partner_mode === "quiet" || session.preferences?.mapping_paused) {
+        return { session, skipped: true };
+      }
+      return applyOperation(session, {
       type: "propose_changes",
       actor: "curator",
       origin: "ui",
@@ -313,7 +251,9 @@ export async function createThoughtformServer({
       rationale: proposal.rationale,
       evidence: proposal.evidence,
       operations: proposal.operations,
-    }));
+      });
+    });
+    if (result.skipped) return result;
     const snapshot = snapshotFor(result.session);
     publish(result.session, "operation", { operation_id: result.operation_id }, snapshot);
     return { ...result, snapshot };
@@ -323,6 +263,7 @@ export async function createThoughtformServer({
     mapController = suppliedMapController ?? mapControllerFactory({
       env,
       client: openaiClient ?? undefined,
+      model: config.models.mapController,
       loadSnapshot: (sessionId) => store.get(sessionId),
       transact: (sessionId, transform) => store.transact(sessionId, transform),
     });
@@ -340,13 +281,14 @@ export async function createThoughtformServer({
 
   const curatorRuntimeEnabled = Boolean(
     mapControllerScheduler
-    && isCuratorEnabled(env)
+    && config.curatorEnabled
     && (controllerConfigured || suppliedCurator || suppliedCuratorScheduler),
   );
   if (curatorRuntimeEnabled) {
     curator = suppliedCurator ?? curatorFactory({
       env,
       client: openaiClient ?? undefined,
+      model: config.models.curator,
     });
     curatorScheduler = suppliedCuratorScheduler ?? curatorSchedulerFactory({
       curator,
@@ -386,36 +328,71 @@ export async function createThoughtformServer({
       const value = await handler(req, res);
       if (!res.headersSent) res.json(value);
     } catch (error) {
-      const status = error?.status ?? (error instanceof RevisionConflictError ? 409 : 500);
+      const status = isCancellation(error) ? 410 : error?.status ?? (error instanceof RevisionConflictError ? 409 : 500);
       let snapshot = error?.snapshot ?? error?.details?.snapshot ?? null;
       if (!snapshot && req.params?.id) {
         snapshot = await store.get(req.params.id).catch(() => null);
       }
       if (snapshot) snapshot = snapshotFor(snapshot);
       if (status >= 500 && !(error instanceof SessionOperationError)) console.error(error);
-      const payload = errorPayload(error, snapshot);
-      if (req.originalUrl?.endsWith("/tool-calls") && req.body?.call_id) {
-        const functionPayload = functionOutputPayload(payload);
-        payload.function_call_output = {
-          type: "function_call_output",
-          call_id: req.body.call_id,
-          output: JSON.stringify(functionPayload),
-        };
-      }
-      res.status(status).json(payload);
+      res.status(status).json(errorPayload(error, snapshot));
     }
   };
+
+  const updatePreferences = async (sessionId, patch = {}) => {
+    const allowed = new Set(["mapping_paused", "partner_mode"]);
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)
+      || Object.keys(patch).some((key) => !allowed.has(key))
+      || (patch.mapping_paused !== undefined && typeof patch.mapping_paused !== "boolean")
+      || (patch.partner_mode !== undefined && !["quiet", "proactive"].includes(patch.partner_mode))) {
+      throw new SessionOperationError("Choose a valid mapping or Partner setting.", { code: "invalid_preferences" });
+    }
+    const updated = await store.transact(sessionId, (session) => ({
+      ...session,
+      preferences: { mapping_paused: false, partner_mode: "proactive", ...session.preferences, ...patch },
+      updated_at: new Date().toISOString(),
+    }));
+    await mapControllerScheduler?.preferencesChanged?.(sessionId);
+    if (updated.preferences.partner_mode === "quiet" || updated.preferences.mapping_paused) curatorScheduler?.cancel(sessionId);
+    const snapshot = await publishMapControllerSnapshot(sessionId);
+    return { ok: true, snapshot };
+  };
+
+  const liveService = registerLiveRoutes(app, {
+    store, openaiClient, fetchImpl, jsonRoute,
+    apiKey: config.apiKey, liveModel: config.models.live, backendModel: config.models.liveBackend, publish, snapshotFor, performOperation,
+    updatePreferences, sessionSignal: sessionJobs.signal,
+    getUiContext: (sessionId) => uiContexts.get(sessionId) ?? {},
+    mapControllerScheduler,
+    onTranscriptCommitted: async (sessionId, utterance) => {
+      if (mapControllerScheduler?.notify(sessionId, utterance)) await publishMapControllerSnapshot(sessionId);
+    },
+  });
+
+  app.patch("/api/sessions/:id/preferences", jsonRoute((req) => updatePreferences(req.params.id, req.body)));
+
+  app.get("/api/sessions/:id/export", jsonRoute(async (req, res) => {
+    const session = await store.get(req.params.id);
+    const markdown = req.query.format === "markdown";
+    res.set("Content-Disposition", `attachment; filename="thoughtform-${session.id}.${markdown ? "md" : "json"}"`);
+    res.type(markdown ? "text/markdown" : "application/json").send(markdown ? sessionMarkdown(session) : JSON.stringify(session, null, 2));
+  }));
 
   app.get("/api/health", (req, res) => {
     res.json({
       ok: true,
-      model: MODEL,
-      mock: !hasKey,
-      realtime: { configured: hasKey, model: REALTIME_MODEL },
+      model: config.models.synthesis,
+      live: {
+        configured: controllerConfigured,
+        voice_configured: Boolean(config.apiKey),
+        model: config.models.live,
+        backend_model: config.models.liveBackend,
+        reasoning_effort: config.reasoningEffort,
+      },
       map_controller: {
         configured: controllerConfigured,
         enabled: Boolean(mapControllerScheduler),
-        model: mapController?.model ?? env.OPENAI_MAP_CONTROLLER_MODEL ?? DEFAULT_MAP_CONTROLLER_MODEL,
+        model: mapController?.model ?? config.models.mapController,
       },
       ...(curator ? {
         curator: {
@@ -436,6 +413,7 @@ export async function createThoughtformServer({
     const session = await store.get(req.params.id);
     await store.setActive(session.id);
     recoverMapController(session);
+    liveService.recoverCapture(session);
     return snapshotFor(session);
   }));
 
@@ -444,6 +422,9 @@ export async function createThoughtformServer({
   )));
 
   app.delete("/api/sessions/:id", jsonRoute(async (req) => {
+    sessionJobs.cancel(req.params.id);
+    liveService.cancel(req.params.id);
+    savedSynthesisOrder.delete(req.params.id);
     mapControllerScheduler?.cancel(req.params.id);
     curatorScheduler?.cancel(req.params.id);
     uiContexts.delete(req.params.id);
@@ -464,6 +445,7 @@ export async function createThoughtformServer({
       selected_node_ids: Array.isArray(req.body?.selected_node_ids)
         ? [...new Set(req.body.selected_node_ids.filter((id) => nodeIds.has(id)))]
         : [],
+      selected_proposal_id: session.proposals.some((proposal) => proposal.id === req.body?.selected_proposal_id && ["pending", "stale"].includes(proposal.status)) ? req.body.selected_proposal_id : null,
       focus_id: nodeIds.has(req.body?.focus_id) ? req.body.focus_id : null,
       view_mode: req.body?.view_mode === "hierarchy" ? "hierarchy" : "clusters",
       voice_mode: req.body?.voice_mode === "push-to-talk" ? "push-to-talk" : "vad",
@@ -504,66 +486,6 @@ export async function createThoughtformServer({
     mapControllerScheduler.retry(session.id);
     const snapshot = await publishMapControllerSnapshot(session.id, session);
     return { ok: true, scheduled: true, snapshot };
-  }));
-
-  app.post("/api/sessions/:id/tool-calls", jsonRoute(async (req) => {
-    const { name, call_id: callId } = req.body ?? {};
-    if (typeof name !== "string" || !name) {
-      throw new SessionOperationError("Tool name is required.", { code: "missing_tool_name" });
-    }
-    if (typeof callId !== "string" || !callId.trim()) {
-      throw new SessionOperationError("Realtime tool call_id is required.", { code: "missing_call_id" });
-    }
-    const session = await store.get(req.params.id);
-    if (name === "get_map") {
-      const payload = {
-        ok: true,
-        operation_id: null,
-        revision: session.revision,
-        affected_ids: [],
-        warnings: [],
-        snapshot: snapshotFor(session),
-      };
-      return {
-        ...payload,
-        function_call_output: {
-          type: "function_call_output",
-          call_id: callId,
-          output: JSON.stringify(functionOutputPayload(payload)),
-        },
-      };
-    }
-    const args = req.body?.arguments && typeof req.body.arguments === "object" ? req.body.arguments : {};
-    const quote = args.quote ?? args.transcript_quote ?? args.source_quote;
-    let resolvedProvenance = {};
-    if (typeof quote === "string" && quote.length) {
-      const source = resolveQuoteSpan(session, { ...args, quote });
-      const utterance = session.transcript.find(({ id }) => id === source.utterance_id);
-      resolvedProvenance = {
-        source,
-        ...(utterance?.realtime_item_id ? { realtime_item_id: utterance.realtime_item_id } : {}),
-      };
-    }
-    const operation = {
-      ...args,
-      ...resolvedProvenance,
-      type: name,
-      actor: "partner",
-      origin: "realtime",
-      call_id: callId,
-      // The model's tool argument describes the snapshot it reasoned from. A
-      // newer browser revision must never silently upgrade that stale intent.
-      expected_revision: args.expected_revision ?? req.body?.expected_revision,
-    };
-    const payload = await performOperation(req.params.id, operation);
-    return {
-      ...payload,
-      function_call_output: {
-        type: "function_call_output",
-        call_id: callId,
-        output: JSON.stringify(functionOutputPayload(payload)),
-      },
-    };
   }));
 
   app.get("/api/sessions/:id/events", async (req, res) => {
@@ -609,41 +531,6 @@ export async function createThoughtformServer({
     }
   });
 
-  app.post(
-    "/api/sessions/:id/realtime",
-    express.text({ type: "application/sdp", limit: "1mb" }),
-    async (req, res) => {
-      try {
-        const session = await store.get(req.params.id);
-        await store.setActive(session.id);
-        const controller = new AbortController();
-        req.once("aborted", () => controller.abort());
-        res.once("close", () => {
-          if (!res.writableEnded) controller.abort();
-        });
-        const voiceMode = req.query.voice_mode === "push-to-talk" ? "push-to-talk" : "vad";
-        const sessionConfig = buildRealtimeSessionConfig({
-          model: REALTIME_MODEL,
-          voiceMode,
-          instructions: buildRealtimeInstructions(),
-        });
-        const safetyIdentifier = createHash("sha256").update(`thoughtform:${session.id}`).digest("hex");
-        const answer = await forwardRealtimeSdp({
-          sdp: req.body,
-          fetchImpl,
-          sessionConfig,
-          safetyIdentifier,
-          signal: controller.signal,
-        });
-        res.status(201).type("application/sdp").send(answer);
-      } catch (error) {
-        const status = hasKey ? (error?.status ?? 502) : 503;
-        if (status >= 500) console.error(error);
-        res.status(status).json(errorPayload(error));
-      }
-    },
-  );
-
   app.post("/api/sessions/:id/synthesize", jsonRoute(async (req) => {
     const session = await store.get(req.params.id);
     const expected = req.body?.expected_revision;
@@ -653,54 +540,37 @@ export async function createThoughtformServer({
     if (!session.nodes.length) {
       throw new SessionOperationError("Add at least one bubble before synthesizing.", { code: "empty_map" });
     }
-    if (!hasKey) {
-      return { synthesis: `Offline mock synthesis of ${session.nodes.length} thoughts — set OPENAI_API_KEY to enable ${MODEL}.`, revision: session.revision };
+    if (!openaiClient) throw new SessionOperationError("Connect OpenAI to write a synthesis.", { code: "model_unavailable", status: 503 });
+    // Repeated requests over the same map and transcript share one model call.
+    // The transcript is append-only and does not advance the map revision.
+    const runKey = `${session.id}:${session.revision}:${session.transcript.length}`;
+    if (!synthesisRuns.has(runKey)) {
+      const run = synthesize(session).finally(() => synthesisRuns.delete(runKey));
+      synthesisRuns.set(runKey, run);
     }
+    return synthesisRuns.get(runKey);
+  }));
+
+  const synthesize = async (session) => {
+    const order = ++synthesisOrder;
     const response = await openaiClient.responses.create({
-      model: MODEL,
-      reasoning: { effort: "low" },
+      model: config.models.synthesis,
+      reasoning: { effort: config.reasoningEffort },
       instructions: SYNTHESIZE_SYSTEM,
-      input: JSON.stringify({ graph: classicGraphFromSession(session), transcript: session.transcript }),
+      input: JSON.stringify({ graph: synthesisGraph(session), transcript: session.transcript }),
+    }, { signal: sessionJobs.signal(session.id) });
+    const text = response.output_text?.trim();
+    if (!text) throw new SessionOperationError("The synthesis was empty. Please try again.", { code: "empty_synthesis", status: 502 });
+    // A synthesis started later read a newer map or transcript and may finish
+    // first; never replace it with this older result.
+    const saved = await store.transact(session.id, (current) => {
+      if ((savedSynthesisOrder.get(session.id) ?? 0) > order || current.synthesis?.revision > session.revision) return current;
+      savedSynthesisOrder.set(session.id, order);
+      return { ...current, synthesis: { text, revision: session.revision, created_at: new Date().toISOString() } };
     });
-    return { synthesis: response.output_text.trim(), revision: session.revision };
-  }));
-
-  // Classic-mode endpoints remain unchanged and continue to operate on the
-  // browser-owned graph at ?mode=classic.
-  app.post("/api/propose", jsonRoute(async (req) => {
-    const { graph, prompt, selectedId } = req.body ?? {};
-    if (!graph?.thoughts?.length || !prompt) throw new Error("propose needs { graph, prompt }");
-    if (!hasKey) {
-      const parent = graph.thoughts.find((thought) => thought.id === selectedId) ?? graph.thoughts[0];
-      return { proposals: [{ parent_id: parent.id, text: `Mock proposal for “${prompt.slice(0, 32)}”`, reason: "offline mock — set OPENAI_API_KEY" }] };
-    }
-    const { proposals } = await structuredCall({ system: PROPOSE_SYSTEM, payload: { graph, selected_id: selectedId, request: prompt }, schemaName: "proposals", schema: PROPOSAL_SCHEMA });
-    const validIds = new Set(graph.thoughts.map((thought) => thought.id));
-    return { proposals: proposals.filter((proposal) => validIds.has(proposal.parent_id) && proposal.text?.trim()).slice(0, 3) };
-  }));
-
-  app.post("/api/dictate", jsonRoute(async (req) => {
-    const { transcript } = req.body ?? {};
-    if (!transcript?.trim()) throw new Error("dictate needs { transcript }");
-    if (!hasKey) return { thought: transcript.trim() };
-    const { thought } = await structuredCall({ system: DICTATE_SYSTEM, payload: { transcript }, schemaName: "dictation", schema: DICTATION_SCHEMA });
-    return { thought };
-  }));
-
-  app.post("/api/companion", jsonRoute(async (req) => {
-    const { graph } = req.body ?? {};
-    if (!graph?.thoughts?.length) throw new Error("companion needs { graph }");
-    if (!hasKey) return { line: "Keep going, this is getting interesting…", followup: "What if we explored the flow a bit more?" };
-    return structuredCall({ system: COMPANION_SYSTEM, payload: { graph }, schemaName: "companion", schema: COMPANION_SCHEMA });
-  }));
-
-  app.post("/api/synthesize", jsonRoute(async (req) => {
-    const { graph } = req.body ?? {};
-    if (!graph?.thoughts?.length) throw new Error("synthesize needs { graph }");
-    if (!hasKey) return { synthesis: `Offline mock synthesis of ${graph.thoughts.length} thoughts — set OPENAI_API_KEY to enable ${MODEL}.` };
-    const response = await openaiClient.responses.create({ model: MODEL, reasoning: { effort: "low" }, instructions: SYNTHESIZE_SYSTEM, input: JSON.stringify({ graph }) });
-    return { synthesis: response.output_text.trim() };
-  }));
+    const snapshot = await publishMapControllerSnapshot(session.id, saved);
+    return { synthesis: saved.synthesis.text, revision: saved.synthesis.revision, snapshot };
+  };
 
   app.locals.sessionStore = store;
   app.locals.mapController = mapController;
@@ -708,6 +578,8 @@ export async function createThoughtformServer({
   if (curator) app.locals.curator = curator;
   if (curatorScheduler) app.locals.curatorScheduler = curatorScheduler;
   app.locals.dispose = () => {
+    sessionJobs.dispose();
+    liveService?.dispose?.();
     mapControllerScheduler?.dispose();
     curatorScheduler?.dispose();
     eventClients.forEach((listeners) => listeners.forEach((response) => {
@@ -721,9 +593,13 @@ export async function createThoughtformServer({
 
 const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isEntrypoint) {
-  const app = await createThoughtformServer();
-  const server = app.listen(PORT, "127.0.0.1", () => {
-    console.log(`thoughtform server on http://localhost:${PORT} (model: ${MODEL}${hasKey ? `, realtime: ${REALTIME_MODEL}` : ", MOCK MODE — no OPENAI_API_KEY"})`);
+  const config = resolveServerConfig(process.env);
+  const app = await createThoughtformServer({ env: process.env });
+  const server = app.listen(config.port, "127.0.0.1", () => {
+    const { models, reasoningEffort, apiKey } = config;
+    console.log(`thoughtform server on http://localhost:${config.port} (${apiKey
+      ? `live: ${models.live}, backend: ${models.liveBackend} / ${reasoningEffort}`
+      : "no OPENAI_API_KEY: editing only, model features unavailable"})`);
   });
   const shutdown = () => {
     app.locals.dispose?.();

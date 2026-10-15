@@ -1,7 +1,9 @@
 node_modules/
 dist/
+dist-example/
 .npm-cache/
 .DS_Store
 qa/
 .env
 data/sessions/
+sites/fluid-bubble-lab/

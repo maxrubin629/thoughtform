@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:client": "vite",
+    "dev:example": "vite --mode example",
     "build": "vite build",
+    "build:example": "vite build --mode example --outDir dist-example",
+    "preview:example": "vite preview --mode example --outDir dist-example",
     "preview": "vite preview",
     "server": "node --env-file-if-exists=.env server/index.mjs",
     "test": "node --test test/*.test.mjs src/*.test.js"

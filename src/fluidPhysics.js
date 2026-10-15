@@ -113,11 +113,11 @@ export function stepFluidPhysics(
             : 0;
         if (boundaryStretch !== 0) {
           const springForce = boundaryStretch * (0.0025 + settings.elasticity * 0.013);
-          if (!a.dragging) {
+          if (!a.dragging && !a.pinned) {
             a.vx += ux * springForce * boundedStep;
             a.vy += uy * springForce * boundedStep;
           }
-          if (!b.dragging) {
+          if (!b.dragging && !b.pinned) {
             b.vx -= ux * springForce * boundedStep;
             b.vy -= uy * springForce * boundedStep;
           }
@@ -129,11 +129,11 @@ export function stepFluidPhysics(
       if (distance < minimumDistance) {
         const repel =
           (minimumDistance - distance) * (0.008 + settings.repulsion * 0.032);
-        if (!a.dragging) {
+        if (!a.dragging && !a.pinned) {
           a.vx -= ux * repel * boundedStep;
           a.vy -= uy * repel * boundedStep;
         }
-        if (!b.dragging) {
+        if (!b.dragging && !b.pinned) {
           b.vx += ux * repel * boundedStep;
           b.vy += uy * repel * boundedStep;
         }
@@ -171,16 +171,16 @@ export function stepFluidPhysics(
 
       const overlap = clearanceDistance - nearest.distance;
       const separationForce = overlap * (0.003 + settings.repulsion * 0.012);
-      if (!node.dragging) {
+      if (!node.dragging && !node.pinned) {
         node.vx += nx * separationForce * boundedStep;
         node.vy += ny * separationForce * boundedStep;
       }
       const endpointShare = separationForce * 0.22 * boundedStep;
-      if (!a.dragging) {
+      if (!a.dragging && !a.pinned) {
         a.vx -= nx * endpointShare;
         a.vy -= ny * endpointShare;
       }
-      if (!b.dragging) {
+      if (!b.dragging && !b.pinned) {
         b.vx -= nx * endpointShare;
         b.vy -= ny * endpointShare;
       }
@@ -189,7 +189,7 @@ export function stepFluidPhysics(
 
   const dampingFactor = Math.pow(1 - settings.damping * 0.085, boundedStep);
   physicalNodes.forEach((node) => {
-    if (node.dragging) {
+    if (node.dragging || node.pinned) {
       node.vx = 0;
       node.vy = 0;
       return;

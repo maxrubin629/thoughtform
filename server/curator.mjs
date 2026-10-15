@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
-import { PROPOSAL_OPERATION_SCHEMA } from "./realtime.mjs";
+import { DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_MODEL } from "./modelConfig.mjs";
+import { PROPOSAL_OPERATION_SCHEMA } from "./mapTools.mjs";
+import { resolveQuoteSpan } from "./sessionOperations.mjs";
 
 export const CURATOR_SYSTEM = `You are Thoughtform's silent creative curator. You inspect the current canonical mind map and a bounded window of recent conversation, then decide whether one genuinely useful new direction is worth the user's attention.
 
@@ -13,6 +15,7 @@ Rules:
 - Ground the direction in actual map content. Transcript evidence identifies the recent context that inspired it; it does not mean the proposed idea must repeat that text.
 - Use create_bubble, edit_bubble, revisit_bubble, connect_bubbles, delete_bubble, or delete_connection. Fill irrelevant nullable fields with null and excluded with false.
 - Do not duplicate an existing node or connection. Do not target missing endpoints, a pending/ghost node, or the protected starting anchor for deletion.
+- Parked bubbles were deliberately kept aside. Do not propose changes to them or new connections to them.
 - Treat deletion and reinterpretation conservatively. If evidence is weak or ambiguous, omit that operation.
 - Every evidence entry must pair a completed utterance id with one exact quote from that utterance. The server resolves its character span.
 - Rationale should be one concise user-facing sentence and should not mention internal orchestration, schemas, revisions, or model names.`;
@@ -62,8 +65,13 @@ export function isCuratorEnabled(env = process.env) {
   return String(env.THOUGHTFORM_CURATOR_ENABLED ?? "true").toLowerCase() === "true";
 }
 
+function preferencesAllowCurator(snapshot) {
+  return snapshot?.preferences?.partner_mode !== "quiet" && !snapshot?.preferences?.mapping_paused;
+}
+
 export function shouldRunCurator(snapshot, { minimumUserTurns = 2, maximumSurfacedProposals = 3 } = {}) {
   if (!snapshot || !Number.isInteger(snapshot.revision)) return false;
+  if (!preferencesAllowCurator(snapshot)) return false;
   const completedUserTurns = (snapshot.transcript ?? [])
     .filter((utterance) => utterance?.speaker === "you" && utterance?.text?.trim())
     .length;
@@ -125,36 +133,41 @@ function normalizeOperation(operation, idFactory) {
   return normalized;
 }
 
-function resolveEvidence(evidence, transcript) {
-  const utterances = new Map((transcript ?? []).map((utterance) => [utterance.id, utterance]));
+// Evidence uses the canonical resolver, so the curator cannot cite a quote
+// the reducer would reject. Invalid entries are dropped; a suggestion left
+// with no valid evidence is discarded rather than shown as an unsupported card.
+function resolveEvidence(evidence, snapshot) {
   const seen = new Set();
   return (evidence ?? []).flatMap((item) => {
-    const utterance = utterances.get(item?.utterance_id);
-    const quote = typeof item?.quote === "string" ? item.quote : "";
-    if (!utterance || !quote) return [];
-    const start = utterance.text.indexOf(quote);
-    if (start < 0 || utterance.text.indexOf(quote, start + 1) >= 0) return [];
-    const key = `${utterance.id}:${start}:${quote.length}`;
+    if (typeof item?.utterance_id !== "string" || typeof item?.quote !== "string") return [];
+    let span;
+    try {
+      span = resolveQuoteSpan(snapshot, { utterance_id: item.utterance_id, quote: item.quote });
+    } catch {
+      return [];
+    }
+    const key = `${span.utterance_id}:${span.start}:${span.end}`;
     if (seen.has(key)) return [];
     seen.add(key);
-    return [{
-      utterance_id: utterance.id,
-      start,
-      end: start + quote.length,
-      quote,
-    }];
+    return [span];
   });
 }
 
 function normalizeProposal(result, snapshot, { now, idFactory }) {
   if (!Array.isArray(result?.operations) || result.operations.length === 0) return null;
+  const parked = new Set((snapshot.nodes ?? []).filter((node) => node.parked).map((node) => node.id));
+  if (result.operations.some((operation) => (
+    [operation.node_id, operation.from, operation.to, operation.parent].some((id) => parked.has(id))
+  ))) return null;
+  const evidence = resolveEvidence(result.evidence, snapshot);
+  if (!evidence.length) return null;
   return {
     id: idFactory("proposal"),
     status: "pending",
     base_revision: snapshot.revision,
     actor: "curator",
     rationale: String(result.rationale ?? "A possible map refinement").trim(),
-    evidence: resolveEvidence(result.evidence, snapshot.transcript),
+    evidence,
     operations: result.operations.slice(0, 3).map((operation) => normalizeOperation(operation, idFactory)),
     created_at: now().toISOString(),
   };
@@ -163,19 +176,19 @@ function normalizeProposal(result, snapshot, { now, idFactory }) {
 export function createCurator({
   env = process.env,
   client,
+  model = env.OPENAI_CURATOR_MODEL ?? DEFAULT_REASONING_MODEL,
   now = () => new Date(),
   idFactory = (prefix) => `${prefix}_${randomUUID()}`,
   minimumUserTurns = 2,
 } = {}) {
   const enabled = isCuratorEnabled(env);
-  const model = env.OPENAI_CURATOR_MODEL ?? "gpt-5.6-sol";
   let openai = client;
 
   return {
     enabled,
     model,
     shouldRun: (snapshot) => enabled && shouldRunCurator(snapshot, { minimumUserTurns }),
-    async propose(snapshot) {
+    async propose(snapshot, { signal } = {}) {
       if (!enabled || !shouldRunCurator(snapshot, { minimumUserTurns })) return null;
       if (!openai) {
         if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required when the curator is enabled");
@@ -184,7 +197,7 @@ export function createCurator({
 
       const response = await openai.responses.create({
         model,
-        reasoning: { effort: "low" },
+        reasoning: { effort: DEFAULT_REASONING_EFFORT },
         instructions: CURATOR_SYSTEM,
         input: JSON.stringify(compactSnapshot(snapshot)),
         text: {
@@ -195,7 +208,7 @@ export function createCurator({
             schema: CURATOR_PROPOSAL_SCHEMA,
           },
         },
-      });
+      }, { signal });
 
       return normalizeProposal(parseOutput(response), snapshot, { now, idFactory });
     },
@@ -223,6 +236,9 @@ export function createCuratorScheduler({
   const lastRunUserTurnCount = new Map();
   const active = new Set();
   const queued = new Set();
+  const generations = new Map();
+  const runControllers = new Map();
+  let disposed = false;
 
   const userTurnCount = (snapshot) => (snapshot.transcript ?? [])
     .filter((utterance) => utterance?.speaker === "you" && utterance?.text?.trim())
@@ -236,15 +252,21 @@ export function createCuratorScheduler({
   };
 
   const cancel = (sessionId) => {
+    generations.set(sessionId, (generations.get(sessionId) ?? 0) + 1);
     const timer = timers.get(sessionId);
     if (timer !== undefined) clearTimer(timer);
     timers.delete(sessionId);
     queued.delete(sessionId);
+    runControllers.get(sessionId)?.abort(new Error("Suggestion run cancelled."));
+    runControllers.delete(sessionId);
   };
 
   const schedule = (sessionId) => {
+    if (disposed) return false;
     cancel(sessionId);
+    const generation = generations.get(sessionId);
     const timer = setTimer(async () => {
+      if (disposed || generation !== generations.get(sessionId)) return;
       timers.delete(sessionId);
       if (await isBlocked(sessionId)) {
         schedule(sessionId);
@@ -255,20 +277,36 @@ export function createCuratorScheduler({
         return;
       }
       active.add(sessionId);
+      const runController = new AbortController();
       try {
         const snapshot = await loadSnapshot(sessionId);
+        if (disposed || generation !== generations.get(sessionId)) return;
         const fingerprint = snapshotFingerprint(snapshot);
-        if (!curator.shouldRun(snapshot) || lastRunFingerprint.get(sessionId) === fingerprint) return;
+        if (!preferencesAllowCurator(snapshot) || !curator.shouldRun(snapshot) || lastRunFingerprint.get(sessionId) === fingerprint) return;
         const turns = userTurnCount(snapshot);
         const previousTurns = lastRunUserTurnCount.get(sessionId);
         if (previousTurns !== undefined && turns - previousTurns < minimumUserTurnsBetweenRuns) return;
-        const proposal = await curator.propose(snapshot);
+        runControllers.set(sessionId, runController);
+        const proposal = await curator.propose(snapshot, { signal: runController.signal });
+        if (disposed || generation !== generations.get(sessionId)) return;
         lastRunFingerprint.set(sessionId, fingerprint);
         lastRunUserTurnCount.set(sessionId, turns);
-        if (proposal) await onProposal(sessionId, proposal);
+        if (proposal) {
+          const latest = await loadSnapshot(sessionId);
+          if (disposed || generation !== generations.get(sessionId)
+            || !preferencesAllowCurator(latest) || !curator.shouldRun(latest)) return;
+          if (await isBlocked(sessionId) || snapshotFingerprint(latest) !== fingerprint) {
+            queued.add(sessionId);
+            // Discard stale work and wait for the controller again. This
+            // evaluation still counts toward the three-user-turn budget.
+            return;
+          }
+          await onProposal(sessionId, proposal);
+        }
       } catch (error) {
-        onError(error, sessionId);
+        if (!disposed && generation === generations.get(sessionId)) onError(error, sessionId);
       } finally {
+        if (runControllers.get(sessionId) === runController) runControllers.delete(sessionId);
         active.delete(sessionId);
         if (queued.delete(sessionId)) schedule(sessionId);
       }
@@ -278,7 +316,7 @@ export function createCuratorScheduler({
   };
 
   const notify = (sessionId) => {
-    if (!curator.enabled) return false;
+    if (disposed || !curator.enabled) return false;
     if (active.has(sessionId)) {
       queued.add(sessionId);
       return true;
@@ -287,7 +325,9 @@ export function createCuratorScheduler({
   };
 
   const dispose = () => {
+    disposed = true;
     [...timers.keys()].forEach(cancel);
+    [...active.keys()].forEach(cancel);
     queued.clear();
   };
 
