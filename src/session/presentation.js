@@ -208,7 +208,7 @@ export function proposalVisuals(proposals = [], nodes = [], localPositions = new
         y: position.y,
         r: radius,
         depth: clamp((parent?.depth ?? 1) + 1, 1, 4),
-        lines: wrapThought(operation.text ?? "Partner suggestion"),
+        lines: wrapThought(operation.text ?? "Suggestion"),
         ghost: true,
         proposalId: proposal.id,
         vx: Number.isFinite(local?.vx) ? local.vx : 0,

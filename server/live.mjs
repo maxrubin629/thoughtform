@@ -50,7 +50,7 @@ export function buildLiveSessionConfig(session, { model = DEFAULT_LIVE_MODEL } =
 
 export async function forwardLiveSdp({ sdp, sessionConfig, apiKey, fetchImpl = globalThis.fetch, signal, safetyIdentifier }) {
   if (typeof sdp !== "string" || !sdp.trim() || sdp.length > 65_536) throw new LiveError("A valid SDP offer is required.", "invalid_sdp");
-  if (!apiKey) throw new LiveError("Partner needs the existing OpenAI key on the local server.", "api_key_missing", 503);
+  if (!apiKey) throw new LiveError("Voice and AI features need an OpenAI key on the local server.", "api_key_missing", 503);
   const response = await fetchImpl("https://api.openai.com/v1/live/sessions", {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", ...(safetyIdentifier ? { "OpenAI-Safety-Identifier": safetyIdentifier } : {}) },
@@ -187,7 +187,7 @@ export function registerLiveRoutes(app, {
   };
 
   async function runBackend({ id, liveId = null, requestId, sourceIds, latestText, beforeMutation = async () => {} }) {
-    if (!openaiClient?.responses) throw new LiveError("Partner is unavailable until the local server has its OpenAI key.", "live_backend_unavailable", 503);
+    if (!openaiClient?.responses) throw new LiveError("Voice and AI features need an OpenAI key on the local server.", "live_backend_unavailable", 503);
     // Take the session's signal before any await so a deletion during context
     // loading still cancels the model calls below.
     const signal = signalFor(id);

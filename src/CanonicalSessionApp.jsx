@@ -1438,7 +1438,7 @@ export function CanonicalSessionApp({ client = liveWorkspaceClient }) {
     conversation: { eyebrow: "Session", title: "Conversation", icon: IconMessageCircle },
     activity: { eyebrow: "Timeline", title: "Map activity", icon: IconClock },
     search: { eyebrow: "Find", title: "Search this map", icon: IconSearch },
-    proposals: { eyebrow: "Partner", title: "Suggestions", icon: IconSparkles },
+    proposals: { eyebrow: "Review", title: "Suggestions", icon: IconSparkles },
     layouts: { eyebrow: "One graph", title: "Switch the view", icon: IconHierarchy2 },
     overview: { eyebrow: "Your thinking, together", title: "Synthesis", icon: IconGridDots },
     layers: { eyebrow: "Visibility", title: "Canvas layers", icon: IconStack2 },
@@ -1704,7 +1704,7 @@ export function CanonicalSessionApp({ client = liveWorkspaceClient }) {
               </div>
               {chatFailure?.sessionId === canonical?.id && <p className="session-recovery-note" role="status">{chatFailure.message}</p>}
               {!example && <form className="session-chat" onSubmit={submitChat}>
-                <input ref={chatInputRef} value={chatValue} onChange={(event) => { chatSubmissions.edit(sessionIdRef.current, event.target.value); setChatFailure(null); setChatValue(event.target.value); }} aria-label="Message Partner" placeholder={selected ? "Talk about the selected thought…" : "Think aloud with Partner…"} />
+                <input ref={chatInputRef} value={chatValue} onChange={(event) => { chatSubmissions.edit(sessionIdRef.current, event.target.value); setChatFailure(null); setChatValue(event.target.value); }} aria-label="Message" placeholder={selected ? "Talk about the selected thought…" : "Type a thought…"} />
                 <IconButton type="submit" label="Send" disabled={!chatValue.trim() || busy}><IconSend /></IconButton>
               </form>}
             </>
@@ -1744,7 +1744,7 @@ export function CanonicalSessionApp({ client = liveWorkspaceClient }) {
               {!pendingProposals.length && <p className="empty-state">No suggestions.</p>}
               {pendingProposals.map((proposal) => (
                 <article key={proposal.id} className={`session-proposal ${proposal.status === "stale" ? "is-stale" : ""}`} data-testid="partner-proposal">
-                  <header><i className="session-proposal-mark"><IconSparkles /></i><span>Partner suggests</span></header>
+                  <header><i className="session-proposal-mark"><IconSparkles /></i><span>Suggestion</span></header>
                   <p>{proposal.rationale}</p>
                   {proposal.status === "stale" && <small>This suggestion no longer fits the current map.</small>}
                   <div className="session-proposal-operations">{(proposal.operations ?? []).map((operation) => <div key={operation.id} className={operation.excluded ? "is-excluded" : ""}><span>{proposalOperationLabel(operation)}</span>{proposal.status === "pending" && !operation.excluded && <IconButton label="Exclude this change" onClick={() => excludeProposalOperation(proposal, operation)}><IconX /></IconButton>}</div>)}</div>
@@ -1785,7 +1785,7 @@ export function CanonicalSessionApp({ client = liveWorkspaceClient }) {
             <div className="session-profile-panel"><div className="profile-card"><span>{example ? "TF" : "MR"}</span><div><strong>{example ? "Example workspace" : "Solo workspace"}</strong><small>{example ? "Saved only in this browser" : "Private by default"}</small></div></div><div className="panel-note"><IconUser /><span>The transcript and accepted map stay together in this local session.</span></div></div>
           ) : (
             <div className="session-settings-panel">
-              {!example && <><div className="session-voice-mode"><span><strong>Partner’s initiative</strong><small>Quiet keeps conversation and mapping active. Proactive also offers new angles.</small></span><div className="segmented-control"><button type="button" disabled={preferenceBusy} className={partnerMode === "quiet" ? "is-active" : ""} onClick={() => setPreferences({ partner_mode: "quiet" })}>Quiet</button><button type="button" disabled={preferenceBusy} className={partnerMode === "proactive" ? "is-active" : ""} onClick={() => setPreferences({ partner_mode: "proactive" })}>Proactive</button></div></div><label className="session-setting-row"><span><strong>Pause mapping</strong><small>Keep talking; your full conversation is still saved</small></span><input type="checkbox" checked={mappingPaused} disabled={preferenceBusy} onChange={(event) => setPreferences({ mapping_paused: event.target.checked })} /></label></>}
+              {!example && <><div className="session-voice-mode"><span><strong>Suggestions</strong><small>Quiet keeps conversation and mapping active. Proactive also offers new angles.</small></span><div className="segmented-control"><button type="button" disabled={preferenceBusy} className={partnerMode === "quiet" ? "is-active" : ""} onClick={() => setPreferences({ partner_mode: "quiet" })}>Quiet</button><button type="button" disabled={preferenceBusy} className={partnerMode === "proactive" ? "is-active" : ""} onClick={() => setPreferences({ partner_mode: "proactive" })}>Proactive</button></div></div><label className="session-setting-row"><span><strong>Pause mapping</strong><small>Keep talking; your full conversation is still saved</small></span><input type="checkbox" checked={mappingPaused} disabled={preferenceBusy} onChange={(event) => setPreferences({ mapping_paused: event.target.checked })} /></label></>}
               <label className="session-setting-row"><span><strong>Reduced motion</strong><small>Freeze deformation cues and reveal connections immediately</small></span><input type="checkbox" checked={reducedMotion} onChange={(event) => setReducedMotion(event.target.checked)} /></label>
               <label className="session-setting-row"><span><strong>Suggestions</strong><small>Show on canvas</small></span><input type="checkbox" checked={showSuggestions} onChange={(event) => setShowSuggestions(event.target.checked)} /></label>
             </div>
@@ -1827,8 +1827,8 @@ export function CanonicalSessionApp({ client = liveWorkspaceClient }) {
       </div>}
 
       {!example && <div className="session-conversation-controls">
-        <div className="session-presence-controls" aria-label="Partner and mapping preferences">
-          <button type="button" title={partnerMode === "quiet" ? "Quiet: conversation and capture, without unsolicited suggestions" : "Proactive: Partner may suggest useful new angles"} disabled={preferenceBusy} onClick={() => setPreferences({ partner_mode: partnerMode === "quiet" ? "proactive" : "quiet" })}><IconSparkles /><span>{partnerMode === "quiet" ? "Quiet" : "Proactive"}</span></button>
+        <div className="session-presence-controls" aria-label="Suggestion and mapping preferences">
+          <button type="button" title={partnerMode === "quiet" ? "Quiet: conversation and capture, without unsolicited suggestions" : "Proactive: suggests useful new angles"} disabled={preferenceBusy} onClick={() => setPreferences({ partner_mode: partnerMode === "quiet" ? "proactive" : "quiet" })}><IconSparkles /><span>{partnerMode === "quiet" ? "Quiet" : "Proactive"}</span></button>
           <button type="button" className={mappingPaused ? "is-paused" : ""} title={mappingPaused ? "Resume mapping completed thoughts" : "Pause mapping; keep the conversation going"} aria-pressed={mappingPaused} disabled={preferenceBusy} onClick={() => setPreferences({ mapping_paused: !mappingPaused })}>{mappingPaused ? <IconPlayerPlay /> : <IconPlayerPause />}<span>{mappingPaused ? "Mapping paused" : "Mapping on"}</span></button>
         </div>
         <div className="session-backend-status" role="status" aria-live="polite">

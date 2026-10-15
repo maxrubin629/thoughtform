@@ -108,7 +108,7 @@ export function createLiveCapture({ store, openaiClient, model = DEFAULT_LIVE_BA
   let disposed = false;
 
   const classifyFragments = classify ?? (async ({ fragments, transcript, activity, ended, signal }) => {
-    if (!openaiClient?.responses) throw new LiveError("Partner is not configured.", "live_backend_unavailable", 503);
+    if (!openaiClient?.responses) throw new LiveError("Voice and AI features need an OpenAI key on the local server.", "live_backend_unavailable", 503);
     const response = await openaiClient.responses.create({
       model,
       reasoning: { effort: DEFAULT_REASONING_EFFORT },
